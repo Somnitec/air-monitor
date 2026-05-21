@@ -43,8 +43,12 @@
 #define PIN_SD_CS             5
 
 // ---- Analog (ADC1) ----
-// Keyestudio capacitive soil moisture — analog out into input-only GPIO34.
-#define PIN_SOIL_ADC         34
+// All analog sensors must live on ADC1 (GPIO32-39) so they stay readable
+// while Wi-Fi is active. Use 11 dB attenuation for 0–~3.3 V input range.
+#define PIN_SOIL_ADC         32   // Keyestudio capacitive soil moisture
+#define PIN_GAS_CO_ADC       34   // DFRobot Gravity CO  (analog out)
+#define PIN_GAS_HCHO_ADC     35   // DFRobot Gravity HCHO (analog out)
+#define GAS_ADC_OVERSAMPLE   32   // average N samples per reading to fight ADC noise
 
 // ---- Interrupts ----
 // ADXL345 INT1 → wake/log on rumble events (configure FIFO + activity int).
