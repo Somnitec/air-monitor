@@ -14,13 +14,18 @@
 // =========================================================================
 
 // ---- I2C bus (sensors + RTC) ----
-// ADXL345 0x53 | BH1750 0x23 | BME280 0x76 | SEN66 0x6B
-// DS3231  0x68 | DFRobot CO 0x74 (default) | DFRobot HCHO 0x75 (set via dip)
-// IMPORTANT: the two DFRobot gas boards ship at the same default address —
-// set them to different addresses via their on-board DIP/jumper before wiring.
+// SEN66 0x6B | ADXL345 0x53 | BH1750/GY-30 0x23 | (optional) BME280 0x76, DS3231 0x68
+// All distinct — no address conflicts. The DFRobot CO/HCHO sensors here are the
+// ANALOG Fermion MEMS boards (SEN0564 / SEN0563), not the I2C gas boards.
 #define PIN_I2C_SDA          16
 #define PIN_I2C_SCL          17
 #define I2C_FREQ_HZ          400000
+
+// Expected I2C addresses (used by the boot self-test).
+#define ADDR_SEN66           0x6B
+#define ADDR_ADXL345         0x53
+#define ADDR_BH1750          0x23
+#define ADXL345_DEVID        0xE5   // DEVID register (0x00) must read this
 
 // ---- Wi-Fi / time sync ----
 #define WIFI_SSID            "YOUR_SSID"
@@ -31,31 +36,57 @@
 
 // ---- I2S microphone (INMP441) ----
 // Mic L/R pin: tie to GND for left channel (we read one mono channel).
+// SCK(BCLK)=26, WS(LRCLK)=25, SD(DOUT)=33. See docs/SENSORS.md for the
+// dBFS->SPL anchor and A-weighting math.
 #define PIN_I2S_BCLK         26
 #define PIN_I2S_LRCLK        25
 #define PIN_I2S_DIN          33
-#define I2S_SAMPLE_RATE_HZ   16000
+// 48 kHz gives clean coverage of all octave bands up to 8 kHz (Nyquist 24 kHz).
+// Drop to 16000 if you only care about levels below ~4 kHz and want less CPU.
+#define I2S_SAMPLE_RATE_HZ   48000
+#define MIC_FFT_SAMPLES      2048    // power of two; ~43 ms window @ 48 kHz
+// INMP441 sensitivity anchor: -26 dBFS @ 94 dB SPL  =>  SPL ~= dBFS + 120.
+// UNCALIBRATED — calibrate this offset against a reference meter for absolute dB.
+#define MIC_DBFS_TO_SPL_DB   120.0f
+#define MIC_NOISE_FLOOR_DBA  33.0f   // datasheet equiv. input noise; can't read quieter
 
 // ---- SD card (VSPI defaults) ----
 #define PIN_SD_SCK           18
 #define PIN_SD_MISO          19
 #define PIN_SD_MOSI          23
-#define PIN_SD_CS             5
+#define PIN_SD_CS            13   // moved from 5 — GPIO5 is battery sense on this board
 
 // ---- Analog (ADC1) ----
 // All analog sensors must live on ADC1 (GPIO32-39) so they stay readable
 // while Wi-Fi is active. Use 11 dB attenuation for 0–~3.3 V input range.
-#define PIN_SOIL_ADC         32   // Keyestudio capacitive soil moisture
-#define PIN_GAS_CO_ADC       34   // DFRobot Gravity CO  (analog out)
-#define PIN_GAS_HCHO_ADC     35   // DFRobot Gravity HCHO (analog out)
+#define PIN_SOIL_ADC         34   // generic capacitive soil moisture (analog out)
+#define PIN_GAS_CO_ADC       39   // DFRobot Fermion MEMS CO  SEN0564 (VN pin)
+#define PIN_GAS_HCHO_ADC     32   // DFRobot Fermion MEMS HCHO SEN0563 (analog out)
+#define PIN_BATTERY_ADC      35   // voltage divider tap: R2~1.8MΩ to GND confirmed by multimeter
+                                  // GPIO35 is ADC1_CH7, input-only — ideal for passive divider
+#define BAT_DIVIDER_FACTOR  4.4f  // empirical — calibrate: Vbat_true / (analogReadMilliVolts(35)/1000)
 #define GAS_ADC_OVERSAMPLE   32   // average N samples per reading to fight ADC noise
+#define GAS_CO_RL_OHMS       4700.0f  // RL on SEN0564 CO board
+#define GAS_HCHO_RL_OHMS    10000.0f  // RL on SEN0563 HCHO board (different!)
+#define GAS_VCC_MV           3300.0f  // divider supply; set to actual AOUT rail
+
+// Analog "present?" heuristic for the self-test: a floating ADC pin reads near 0
+// or pinned to the rail. We flag a reading as plausibly-connected if it sits
+// inside this window (in mV). Tune to your sensors' real idle voltages.
+#define ANALOG_PRESENT_MIN_MV   60
+#define ANALOG_PRESENT_MAX_MV   3200
+
+// Soil calibration endpoints (mV). Measure yours: V_dry in air, V_wet in water.
+#define SOIL_DRY_MV          2600
+#define SOIL_WET_MV          1200
 
 // ---- Interrupts ----
 // ADXL345 INT1 → wake/log on rumble events (configure FIFO + activity int).
 #define PIN_ADXL_INT1        27
 
 // ---- Status ----
-#define PIN_STATUS_LED        2   // many boards have on-board LED here
+#define PIN_STATUS_LED        2   // on-board LED (tied to charge circuit on this board — not reliable)
+#define PIN_EXT_LED          13   // external LED: GPIO13 → 330Ω → LED → GND
 
 // =========================================================================
 // Sample cadence (ms) — tune later, these are reasonable defaults.
