@@ -6,3 +6,5 @@
 .DS_Store
 *.swp
 build/
+.claude/settings.local.json
+/src/secrets.h
