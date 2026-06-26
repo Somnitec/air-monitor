@@ -53,6 +53,13 @@
   /* toggle buttons: dim when off, green when on */
   button.toggle { background:#222633; color:var(--mut); border:1px solid var(--line); font-weight:600; }
   button.toggle.on { background:#1f7a44; color:#eafff1; border-color:#2ecc71; }
+  /* ventilation slider: large touch target */
+  input.slider { -webkit-appearance:none; appearance:none; width:100%; height:14px; padding:0;
+                 border:none; border-radius:8px; background:#222633; margin:6px 0; }
+  input.slider::-webkit-slider-thumb { -webkit-appearance:none; width:30px; height:30px; border-radius:50%;
+                 background:var(--accent); border:3px solid #0e1117; cursor:pointer; }
+  input.slider::-moz-range-thumb { width:30px; height:30px; border-radius:50%;
+                 background:var(--accent); border:3px solid #0e1117; cursor:pointer; }
   .stat { font-size:13px; color:var(--mut); margin-top:8px; min-height:18px; }
 
   /* backdrop shown when drawer is open on small screens */
@@ -125,6 +132,8 @@
     <section>
       <h2>Home state</h2>
       <div class="events-grid" id="toggles"></div>
+      <label style="margin-top:14px">💨 Ventilation — <span id="ventVal">0%</span></label>
+      <input type="range" id="vent" min="0" max="100" step="5" value="0" class="slider" />
       <div class="stat" id="evstat"></div>
     </section>
 
@@ -148,8 +157,11 @@
 const META = {
   pm1:{g:'Particulates (µg/m³)',n:'PM1'}, pm25:{g:'Particulates (µg/m³)',n:'PM2.5'},
   pm4:{g:'Particulates (µg/m³)',n:'PM4'}, pm10:{g:'Particulates (µg/m³)',n:'PM10'},
-  co2:{g:'CO₂ (ppm)',n:'CO₂'},
-  voc:{g:'Gas indices',n:'VOC index'}, nox:{g:'Gas indices',n:'NOx index'},
+  // All gases on one chart: levels/indices/mV on the left, Rs (Ω) on the right.
+  co2:{g:'Gases',n:'CO₂ ppm'},
+  voc:{g:'Gases',n:'VOC index'}, nox:{g:'Gases',n:'NOx index'},
+  co_mv:{g:'Gases',n:'CO mV'}, hcho_mv:{g:'Gases',n:'HCHO mV'},
+  co_rs:{g:'Gases',n:'CO Rs',a:2}, hcho_rs:{g:'Gases',n:'HCHO Rs',a:2},
   temp:{g:'Temp / Humidity',n:'Temp °C'}, rh:{g:'Temp / Humidity',n:'RH %'},
   bme_temp:{g:'Temp / Humidity',n:'BME temp °C'}, bme_rh:{g:'Temp / Humidity',n:'BME RH %'},
   pressure_hpa:{g:'Pressure (hPa)',n:'Pressure'},
@@ -159,23 +171,20 @@ const META = {
   // Motion: rumble (left) + accel magnitude (right) on one chart
   rumble:{g:'Motion (m/s²)',n:'Rumble RMS'}, rumble_peak:{g:'Motion (m/s²)',n:'Rumble peak'},
   accel_mag:{g:'Motion (m/s²)',n:'|a| magnitude',a:2},
-  // Gas: raw mV (left) + Rs Ω (right) on one chart
-  co_mv:{g:'Gas (CO / HCHO)',n:'CO mV'}, hcho_mv:{g:'Gas (CO / HCHO)',n:'HCHO mV'},
-  co_rs:{g:'Gas (CO / HCHO)',n:'CO Rs',a:2}, hcho_rs:{g:'Gas (CO / HCHO)',n:'HCHO Rs',a:2},
   // Soil: moisture % (left) + raw mV (right) on one chart
   soil_pct:{g:'Soil',n:'Soil %'}, soil_mv:{g:'Soil',n:'Soil mV',a:2},
   bat_raw_mv:{g:'Battery',n:'Bat raw mV'}, bat_v:{g:'Battery',n:'Bat V'}, bat_pct:{g:'Battery',n:'Bat %'},
 };
 // Per-chart axis titles for the dual-axis groups (left = y, right = y2).
 const GROUP_AXES = {
-  'Gas (CO / HCHO)': { y:'mV', y2:'Rs (Ω)' },
-  'Motion (m/s²)':   { y:'rumble m/s²', y2:'|a| m/s²' },
-  'Soil':            { y:'%', y2:'mV' },
+  'Gases':         { y:'ppm / index / mV', y2:'Rs (Ω)' },
+  'Motion (m/s²)': { y:'rumble m/s²', y2:'|a| m/s²' },
+  'Soil':          { y:'%', y2:'mV' },
 };
 // Chart stacking order (top→bottom). Battery is always forced last regardless.
 const GROUP_ORDER = [
-  'Particulates (µg/m³)','CO₂ (ppm)','Gas indices','Temp / Humidity','Pressure (hPa)',
-  'Light (lux)','Noise (dB)','Noise (dBFS)','Gas (CO / HCHO)','Soil','Motion (m/s²)',
+  'Particulates (µg/m³)','Gases','Temp / Humidity','Pressure (hPa)',
+  'Light (lux)','Noise (dB)','Noise (dBFS)','Soil','Motion (m/s²)',
 ];
 function groupRank(g) {
   if (g === 'Battery') return 1e6;        // always at the bottom
@@ -310,6 +319,7 @@ function connectWS() {
       // reflect a toggle flipped from another client/device
       const t = TOGGLES.find(t => t.kind === msg.data.kind);
       if (t) { toggleState[t.kind] = (msg.data.label === t.on); renderToggles(); }
+      if (msg.data.kind === 'ventilation') restoreVent();
     }
   };
 }
@@ -322,7 +332,6 @@ function trimToWindow() {
 // Each toggle flips between two states and logs an event with the new label.
 const TOGGLES = [
   { kind:'door',        on:'open',  off:'close', onTxt:'🚪 Door open',  offTxt:'🚪 Door closed' },
-  { kind:'ventilation', on:'on',    off:'off',   onTxt:'💨 Vent on',    offTxt:'💨 Vent off' },
   { kind:'occupancy',   on:'home',  off:'away',  onTxt:'🏠 Home',       offTxt:'🚶 Away' },
   { kind:'heating',     on:'on',    off:'off',   onTxt:'🔥 Heating on', offTxt:'🔥 Heating off' },
   { kind:'pc',          on:'on',    off:'off',   onTxt:'💻 PC on',      offTxt:'💻 PC off' },
@@ -359,7 +368,25 @@ function restoreToggleStates() {
     toggleState[t.kind] = last ? (last.label === t.on) : false;
   });
   renderToggles();
+  restoreVent();
 }
+
+// ---- ventilation slider (0–100%) ------------------------------------------
+function restoreVent() {
+  const last = eventsCache.filter(e => e.kind === 'ventilation').sort((a,b) => b.ts - a.ts)[0];
+  const pct = last ? parseInt(last.label) || 0 : 0;
+  $('#vent').value = pct;
+  $('#ventVal').textContent = pct + '%';
+}
+$('#vent').addEventListener('input',  () => { $('#ventVal').textContent = $('#vent').value + '%'; });
+$('#vent').addEventListener('change', async () => {        // fires on release → one event
+  const pct = $('#vent').value;
+  const ev = await (await fetch('/api/event', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ kind:'ventilation', label: pct + '%' }),
+  })).json();
+  $('#evstat').textContent = `vent: ${ev.label} @ ${new Date(ev.ts*1000).toLocaleTimeString()}`;
+});
 
 // ---- custom text marker ---------------------------------------------------
 async function addMarker() {

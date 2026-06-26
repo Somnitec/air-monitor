@@ -8,6 +8,14 @@
 
 ---
 
+## TO DO
+
+- fifo in firmware, maybe optimize so that we can be reading values for longer (now only 2 days of reading without being read out it seems)
+- weather-station feature (Open-Meteo + WU PWS) 
+- always-on collector app on android and dashboard there (then export for more advanced data analysis on a pc)
+
+---
+
 ## System Architecture
 
 ```
