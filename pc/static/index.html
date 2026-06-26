@@ -6,44 +6,85 @@
 <title>Air Monitor</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
 <style>
-  :root { --bg:#0f1115; --panel:#171a21; --line:#252a35; --fg:#e6e9ef; --mut:#8b93a7; --accent:#4ea1ff; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
-  header { padding:12px 18px; border-bottom:1px solid var(--line); display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
-  h1 { font-size:16px; margin:0; font-weight:600; }
-  .pill { font-size:12px; color:var(--mut); }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#c0392b; margin-right:6px; vertical-align:middle; }
+  /* Tuned for the LattePanda's small touch screen: large tap targets (>=44px),
+     a slide-in controls drawer so charts get the full width, and big fonts. */
+  :root { --bg:#0f1115; --panel:#171a21; --line:#252a35; --fg:#e6e9ef; --mut:#8b93a7; --accent:#4ea1ff; --tap:46px; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; }
+  body { background:var(--bg); color:var(--fg); font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         -webkit-user-select:none; user-select:none; overscroll-behavior:none; }
+
+  header { position:sticky; top:0; z-index:30; padding:8px 12px; border-bottom:1px solid var(--line);
+           display:flex; gap:12px; align-items:center; background:var(--bg); }
+  h1 { font-size:16px; margin:0; font-weight:600; white-space:nowrap; }
+  .grow { flex:1; }
+  .pill { font-size:12px; color:var(--mut); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#c0392b; margin-right:6px; vertical-align:middle; }
   .dot.live { background:#2ecc71; }
-  .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; flex-wrap:wrap; }
-  .controls { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; width:280px; flex:0 0 auto; }
+
+  /* icon buttons in the header */
+  .iconbtn { min-width:var(--tap); height:var(--tap); border:1px solid var(--line); border-radius:10px;
+             background:#222633; color:var(--fg); font-size:20px; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+  .iconbtn:active { background:#2c3243; }
+
+  /* layout */
+  .wrap { display:flex; gap:14px; padding:14px; align-items:flex-start; }
+  #charts { flex:1; min-width:0; }
+  .chart { background:var(--panel); border:1px solid var(--line); border-radius:12px; margin-bottom:12px; }
+
+  /* controls become a slide-in drawer */
+  .controls { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; width:300px; flex:0 0 auto; }
   .controls h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 8px; }
-  .controls section { margin-bottom:18px; }
-  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
-  select, input, button { background:#0e1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:13px; width:100%; }
-  button { cursor:pointer; background:var(--accent); color:#06203f; border:none; font-weight:600; }
+  .controls section { margin-bottom:20px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:10px 0 4px; }
+  select, input, button { background:#0e1117; color:var(--fg); border:1px solid var(--line); border-radius:10px;
+                          padding:0 12px; font-size:15px; width:100%; min-height:var(--tap); }
+  button { cursor:pointer; background:var(--accent); color:#06203f; border:none; font-weight:700; }
   button.sec { background:#222633; color:var(--fg); }
-  button:hover { filter:brightness(1.08); }
-  .row { display:flex; gap:6px; }
+  button:active { filter:brightness(1.15); }
+  .row { display:flex; gap:8px; }
   .row > * { flex:1; }
-  .metrics { max-height:230px; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:6px; }
-  .metrics label { display:flex; align-items:center; gap:7px; margin:2px 0; color:var(--fg); cursor:pointer; }
-  .metrics input { width:auto; }
-  .events-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
-  .events-grid button { font-size:12px; padding:6px; }
-  #charts { flex:1 1 520px; min-width:480px; }
-  .chart { background:var(--panel); border:1px solid var(--line); border-radius:10px; margin-bottom:14px; }
-  .stat { font-size:12px; color:var(--mut); margin-top:6px; }
+  .metrics { max-height:42vh; overflow:auto; border:1px solid var(--line); border-radius:10px; padding:4px; -webkit-overflow-scrolling:touch; }
+  .metrics label { display:flex; align-items:center; gap:12px; margin:0; padding:11px 8px; color:var(--fg); cursor:pointer; border-radius:8px; font-size:15px; }
+  .metrics label:active { background:#222633; }
+  .metrics input { width:24px; height:24px; min-height:0; flex:0 0 auto; }
+  .events-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .events-grid button { font-size:14px; min-height:var(--tap); padding:0 6px; }
+  .stat { font-size:13px; color:var(--mut); margin-top:8px; min-height:18px; }
+
+  /* backdrop shown when drawer is open on small screens */
+  .backdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:18; display:none; }
+
+  /* --- small screen (the LattePanda touch panel) --- */
+  @media (max-width: 820px) {
+    .wrap { padding:10px; }
+    .controls {
+      position:fixed; top:0; left:0; bottom:0; width:min(86vw, 340px); z-index:20;
+      border-radius:0 14px 14px 0; overflow-y:auto; -webkit-overflow-scrolling:touch;
+      transform:translateX(-105%); transition:transform .22s ease;
+    }
+    body.drawer-open .controls { transform:translateX(0); }
+    body.drawer-open .backdrop { display:block; }
+    .hide-sm { display:none; }
+  }
+  /* on wide screens the menu button is unnecessary */
+  @media (min-width: 821px) { #menu { display:none; } .backdrop { display:none !important; } }
 </style>
 </head>
 <body>
 <header>
+  <button id="menu" class="iconbtn" aria-label="Menu">☰</button>
   <h1>🌫️ Air Monitor</h1>
-  <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt">connecting…</span></span>
-  <span class="pill" id="stats"></span>
+  <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt" class="hide-sm">connecting…</span></span>
+  <span class="grow"></span>
+  <span class="pill hide-sm" id="stats"></span>
+  <button id="fs" class="iconbtn" aria-label="Fullscreen">⛶</button>
 </header>
 
+<div class="backdrop" id="backdrop"></div>
+
 <div class="wrap">
-  <div class="controls">
+  <div class="controls" id="drawer">
     <section>
       <h2>Time range</h2>
       <label>Window</label>
@@ -241,16 +282,40 @@ document.querySelectorAll('.events-grid button').forEach(b => {
 $('#range').onchange = () => {
   $('#customRange').style.display = $('#range').value === 'custom' ? 'block' : 'none';
 };
-$('#refresh').onclick = query;
+$('#refresh').onclick = () => { query(); closeDrawer(); };
 $('#livebtn').onclick = () => {
   live = !live;
   $('#livebtn').textContent = live ? 'Live: on' : 'Live: off';
 };
 
+// ---- touch drawer + fullscreen + screen wake-lock -------------------------
+function openDrawer()  { document.body.classList.add('drawer-open'); }
+function closeDrawer() { document.body.classList.remove('drawer-open'); }
+$('#menu').onclick = () =>
+  document.body.classList.contains('drawer-open') ? closeDrawer() : openDrawer();
+$('#backdrop').onclick = closeDrawer;
+
+$('#fs').onclick = () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen?.();
+};
+
+// Keep the panel awake while the dashboard is on screen, and re-acquire the
+// lock when the display returns from sleep after a touch (wake-on-touch is an
+// OS setting — see pc/README.md — this just stops the *browser* from dimming).
+let wakeLock = null;
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') keepAwake();
+});
+
 (async function init(){
   await loadMetrics();
   await query();
   connectWS();
+  keepAwake();
   // refresh the metric list occasionally in case new fields appear
   setInterval(loadMetrics, 60000);
 })();

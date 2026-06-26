@@ -41,6 +41,40 @@ dashboard work before flashing the ESP32:
 python simulate.py --backfill 24      # 24 h of history, then live 1/sec
 ```
 
+## Running on the LattePanda touch screen (kiosk)
+
+The dashboard is built for the small touch panel: large tap targets, a slide-in
+controls drawer (tap **☰**) so charts get the full width, a fullscreen button
+(**⛶**), and a screen wake-lock so the browser won't dim while it's showing.
+
+**Auto-start in fullscreen Chromium on boot** (Debian, X11). Create
+`~/.config/autostart/air-monitor.desktop`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Air Monitor
+Exec=chromium --kiosk --app=http://localhost:8000 --start-fullscreen --noerrdialogs --disable-translate
+X-GNOME-Autostart-enabled=true
+```
+
+(Use `chromium-browser` if that's the binary name on your install.)
+
+**Wake the display on touch.** Letting the screen sleep but waking on a tap is an
+OS power setting, not something the page controls. On X11, touch input wakes the
+display from DPMS standby by default — just set a blank timeout and make sure DPMS
+is on:
+
+```bash
+xset s 300         # blank after 5 min idle
+xset +dpms         # enable display power management (wakes on input)
+xset dpms 0 0 600  # standby/suspend off, power-off after 10 min
+```
+
+Put those `xset` lines in `~/.xprofile` (or the autostart) so they apply on login.
+If a tap doesn't wake it, your panel may need `xserver-xorg-input-libinput` and a
+quick check that the touch device shows up in `xinput list`.
+
 ## Point the ESP32 at this server
 
 In `src/secrets.h` on the firmware side set:
