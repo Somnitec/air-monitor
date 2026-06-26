@@ -21,6 +21,11 @@
   .pill { font-size:12px; color:var(--mut); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#c0392b; margin-right:6px; vertical-align:middle; }
   .dot.live { background:#2ecc71; }
+  .badge { font-size:11px; font-weight:700; padding:3px 8px; border-radius:8px; white-space:nowrap; }
+  .badge.normal  { background:#1f3a5f; color:#bcd7ff; }
+  .badge.testing { background:#1f7a44; color:#eafff1; }
+  .badge.offline { background:#3a1f23; color:#ffb3bd; }
+  .badge.pending { outline:1px dashed #ffce6b; }
 
   /* icon buttons in the header */
   .iconbtn { min-width:var(--tap); height:var(--tap); border:1px solid var(--line); border-radius:10px;
@@ -93,6 +98,7 @@
   <button id="menu" class="iconbtn" aria-label="Menu">☰</button>
   <h1>🌫️ Air Monitor</h1>
   <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt" class="hide-sm">connecting…</span></span>
+  <span class="pill" id="devmode" title="Sensor device mode"></span>
   <span class="grow"></span>
   <span class="pill hide-sm" id="stats"></span>
   <button id="fs" class="iconbtn" aria-label="Fullscreen">⛶</button>
@@ -135,6 +141,15 @@
       <label style="margin-top:14px">💨 Ventilation — <span id="ventVal">0%</span></label>
       <input type="range" id="vent" min="0" max="100" step="5" value="0" class="slider" />
       <div class="stat" id="evstat"></div>
+    </section>
+
+    <section>
+      <h2>Sensor device</h2>
+      <div class="stat" id="devstat">no device seen yet</div>
+      <div class="row" style="margin-top:10px">
+        <button id="testBtn" class="sec">Enter testing mode</button>
+      </div>
+      <div class="stat" id="devpending"></div>
     </section>
 
     <section>
@@ -314,6 +329,7 @@ function connectWS() {
     const msg = JSON.parse(ev.data);
     if (!live) return;
     if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); checkBattery(); loadStats(); }
+    if (msg.type === 'device')  { deviceState = msg.data; renderDevice(); }
     if (msg.type === 'event')   {
       eventsCache.push(msg.data); render();
       // reflect a toggle flipped from another client/device
@@ -452,10 +468,44 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') keepAwake();
 });
 
+// ---- sensor-device mode badge + testing toggle ----------------------------
+let deviceState = null;   // {dev,mode,last_seen,buffered,pending}
+const OFFLINE_AFTER = 35 * 60;   // > 2x the 15-min sync interval
+
+function renderDevice() {
+  const el = $('#devmode'), st = $('#devstat'), pend = $('#devpending'), btn = $('#testBtn');
+  if (!deviceState) { el.textContent = ''; return; }
+  const age = Math.floor(Date.now()/1000) - (deviceState.last_seen || 0);
+  const offline = age > OFFLINE_AFTER;
+  const mode = offline ? 'offline' : (deviceState.mode || 'normal');
+  el.className = 'pill';
+  el.innerHTML = `<span class="badge ${mode}${deviceState.pending ? ' pending' : ''}">${mode.toUpperCase()}</span>`;
+  st.textContent = `${deviceState.dev} · ${deviceState.buffered ?? '?'} buffered · seen ${age}s ago`;
+  const wantTesting = (deviceState.mode !== 'testing');
+  btn.textContent = wantTesting ? 'Enter testing mode' : 'Stop testing mode';
+  pend.textContent = deviceState.pending
+    ? `pending: switch to ${deviceState.pending} (applies at next sync)` : '';
+}
+
+async function loadDevices() {
+  const devs = await (await fetch('/api/devices')).json();
+  if (devs.length) { deviceState = devs[0]; renderDevice(); }
+}
+
+$('#testBtn').onclick = async () => {
+  if (!deviceState) return;
+  const target = (deviceState.mode === 'testing') ? 'normal' : 'testing';
+  await fetch(`/api/device/${encodeURIComponent(deviceState.dev)}/mode`,
+    { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ mode: target }) });
+  deviceState.pending = target; renderDevice();
+};
+
 (async function init(){
   renderToggles();
   await loadMetrics();
   await query();
+  await loadDevices();
+  setInterval(loadDevices, 30000);   // re-poll device state (also drives offline detection)
   connectWS();
   keepAwake();
   // refresh the metric list occasionally in case new fields appear
