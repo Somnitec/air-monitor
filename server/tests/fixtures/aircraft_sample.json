@@ -1,0 +1,12 @@
+{
+  "now": 1719400000.0,
+  "messages": 1234567,
+  "aircraft": [
+    {"hex":"484abc","flight":"KLM31G  ","t":"B738","r":"PH-BXA","lat":52.20,"lon":5.10,"alt_baro":3000,"gs":280.0,"track":230.0,"baro_rate":-1216,"category":"A3","rssi":-13.2,"seen":0.2,"seen_pos":0.3},
+    {"hex":"4ca7b1","flight":"RYR15P ","t":"B38M","r":"EI-HEN","lat":52.05,"lon":5.30,"alt_baro":8000,"gs":340.0,"track":40.0,"baro_rate":1856,"rssi":-20.1,"seen":0.5,"seen_pos":0.6},
+    {"hex":"40621d","flight":"BAW7XY","t":"A320","r":"G-EUYB","lat":52.30,"lon":4.95,"alt_baro":"ground","gs":12.0,"track":110.0,"rssi":-8.4,"seen":1.0,"seen_pos":1.2},
+    {"hex":"3c6abc","flight":"DLH9LH ","t":"A359","r":"D-AIXA","lat":51.50,"lon":6.20,"alt_baro":37000,"gs":480.0,"track":95.0,"baro_rate":0,"rssi":-28.0,"seen":2.0,"seen_pos":2.1},
+    {"hex":"abcdef","flight":"NOPOS  ","seen":3.0,"rssi":-30.0},
+    {"hex":"deadbe","flight":"STALE  ","lat":52.18,"lon":5.28,"alt_baro":5000,"seen":120.0}
+  ]
+}

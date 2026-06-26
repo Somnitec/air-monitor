@@ -152,14 +152,28 @@
 #define ACCEL_RUMBLE_SAMPLES   128      // samples per rumble window
 #define ACCEL_RUMBLE_GAP_US   1500      // ~us between samples (~660 Hz attempt; I2C-limited)
 
-// --- Durable queue on flash (LittleFS) ---
-// Records are appended as newline-delimited JSON (NDJSON). A persisted byte
-// cursor marks how far the PC has acknowledged. Survives power loss.
-#define QUEUE_PATH           "/queue.ndjson"
-#define QUEUE_CURSOR_PATH    "/cursor.txt"
-#define QUEUE_COMPACT_BYTES  (64 * 1024)   // once fully-synced and bigger than this, truncate
-#define SYNC_BATCH_MAX        20           // records POSTed per HTTP request
-#define SYNC_BATCH_MAX_BYTES  4096         // ...or this many bytes, whichever first
+// --- Binary FIFO ring buffer on flash (LittleFS) ---
+// Fixed-size packed records (see record.h, RECORD_SIZE=71). Drop-oldest when
+// full. Pointers persisted in a double-buffered, CRC'd meta file.
+#define RING_PATH            "/ring.bin"
+#define RING_META_PATH       "/ring.meta"
+#define RING_CAPACITY        18000U          // 18000*71B ~= 1.28 MB ~= ~12.5 days @ 60s
+#define SYNC_BATCH_MAX       20              // records POSTed per HTTP request
+#define SYNC_BATCH_MAX_BYTES 4096            // ...or this many bytes, whichever first
+
+// Legacy NDJSON queue paths — removed on boot if present (no migration needed).
+#define LEGACY_QUEUE_PATH    "/queue.ndjson"
+#define LEGACY_CURSOR_PATH   "/cursor.txt"
+
+// --- Duty-cycled sync + modes ---
+// NORMAL: WiFi off between sessions; attempt to offload every SYNC_ATTEMPT_INTERVAL_MS,
+//         or early once SYNC_THRESHOLD_RECORDS are buffered.
+// TESTING: WiFi stays on, every record pushed live. Entered/left via dashboard command.
+// BOOT_WINDOW: after every power-on WiFi is up for this long so a dashboard
+//              "enter testing" press lands immediately.
+#define SYNC_ATTEMPT_INTERVAL_MS  (15UL * 60UL * 1000UL)   // 15 min
+#define SYNC_THRESHOLD_RECORDS    120                       // early-trigger for bursts
+#define BOOT_WINDOW_MS            (5UL * 60UL * 1000UL)      // 5 min
 
 // --- Time ---
 #define NTP_SERVER_1         "pool.ntp.org"

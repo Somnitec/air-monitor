@@ -12,6 +12,7 @@ build/
 # server/ runtime artifacts
 server/.venv/
 server/data/
+server/.env
 __pycache__/
 *.db
 *.db-wal

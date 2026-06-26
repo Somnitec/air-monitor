@@ -1,4 +1,4 @@
 fastapi>=0.115
 uvicorn[standard]>=0.32
-requests>=2.32
+requests>=2.32           # also used by the weather importer (run off-thread in asyncio)
 zeroconf>=0.131          # advertises the server on the LAN so the ESP32 finds it by name

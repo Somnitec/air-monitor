@@ -110,7 +110,48 @@ avahi-browse -r _airmon._tcp
 | GET | `/api/stats` | Count + time span |
 | POST | `/api/event` | Log a home-mode event `{kind,label,note,ts?}` |
 | GET | `/api/events?since=&until=` | Query events |
-| WS | `/ws` | Live push of new readings + events |
+| GET | `/api/weather?since=&until=&source=&variable=` | External weather/air-quality series |
+| GET | `/api/weather/sources` | Active sources, last fetch, nearest station |
+| GET | `/api/weather/metrics` | Weather variables available + units |
+| WS | `/ws` | Live push of new readings + events + weather |
+
+## Weather & air-quality integration
+
+A background importer pulls **current observed** outdoor conditions from nearby
+official + community sources and stores them in a sibling `weather` table, joinable
+to sensor readings by timestamp (`weather.valid_ts` ↔ `readings.ts`). This is also
+where **barometric pressure and wind** come from — the station has no onboard
+barometer.
+
+It polls every `WEATHER_POLL_SEC` (default 10 min), fans out to all enabled providers
+concurrently (one dead API never blocks the rest), and **backfills gaps** via
+Open-Meteo's ERA5/CAMS history when the PC has been offline.
+
+**Sources** — the four keyless ones run with no setup; the rest self-enable when their
+secrets are present in `.env`:
+
+| Source | Auth | Gives |
+|--------|------|-------|
+| Open-Meteo (weather) | keyless | pressure, wind, temp, humidity, precip, cloud, radiation, visibility, boundary-layer height |
+| Open-Meteo (air quality) | keyless | PM2.5/PM10, NO₂, O₃, SO₂, CO, AOD, dust, UV, European AQI |
+| RIVM Luchtmeetnet | keyless | official outdoor NO₂/PM/O₃ (sensor validation) |
+| sensor.community | keyless | dense community PM2.5/PM10 |
+| KNMI De Bilt 06260 | free API key | official 10-min station obs |
+| Netatmo | OAuth | community PWS pressure/temp/RH/wind |
+| Weather Underground | API key | community PWS observations |
+
+Configure via `server/.env` (copy from `.env.example`):
+
+```bash
+cp .env.example .env      # fill in any keyed sources you've collected
+```
+
+> The keyed providers (KNMI / Netatmo / WU) are parsed to each API's documented JSON
+> shape and unit-tested, but have **not** been smoke-tested against a live key yet —
+> verify once you've added credentials.
+
+Design rationale lives in
+[`docs/superpowers/specs/2026-06-26-weather-integration-design.md`](../docs/superpowers/specs/2026-06-26-weather-integration-design.md).
 
 ## Data model
 

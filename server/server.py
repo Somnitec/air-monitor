@@ -35,6 +35,10 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from weather import config as weather_config
+from weather import scheduler as weather_scheduler
+from weather import store as weather_store
+
 # --------------------------------------------------------------------------- #
 # Storage
 # --------------------------------------------------------------------------- #
@@ -80,6 +84,7 @@ def _init_db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE readings ADD COLUMN ts_status TEXT DEFAULT 'ok'")
         conn.execute("UPDATE readings SET ts_status='provisional' WHERE ts_ok=0")
     conn.commit()
+    weather_store.init_weather_table(conn)   # external weather/air-quality series
     return conn
 
 
@@ -212,13 +217,44 @@ async def _start_mdns():
 # --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
+async def _broadcast_weather(observations) -> None:
+    """Push freshly-stored weather obs to any open dashboards."""
+    for o in observations:
+        await hub.broadcast({"type": "weather", "data": {
+            "valid_ts": o.valid_ts, "source": o.source, "station_id": o.station_id,
+            "kind": o.kind, "distance_km": o.distance_km, **o.values,
+        }})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _conn
     _conn = _init_db()
     print(f"[air-monitor] DB: {DB_PATH}")
     aiozc, info = await _start_mdns()
+
+    # Weather/air-quality importer: a background poll loop alongside mDNS.
+    weather_config.load_dotenv(Path(__file__).parent / ".env")
+    wsettings = weather_config.settings()
+    weather_task = None
+    if wsettings["enabled"]:
+        providers = weather_config.build_providers()
+        active = [p.name for p in providers if p.enabled()]
+        print(f"[weather] {len(active)} provider(s) active: {', '.join(active)} "
+              f"(poll {wsettings['poll_sec']}s)")
+        weather_task = asyncio.create_task(weather_scheduler.run_loop(
+            providers, _conn, _db_lock,
+            poll_sec=wsettings["poll_sec"], on_stored=_broadcast_weather,
+        ))
+
     yield
+
+    if weather_task is not None:
+        weather_task.cancel()
+        try:
+            await weather_task
+        except asyncio.CancelledError:
+            pass
     if aiozc is not None:
         await aiozc.async_unregister_service(info)
         await aiozc.async_close()
@@ -335,6 +371,50 @@ async def stats():
         ).fetchone()
         nev = _conn.execute("SELECT COUNT(*) n FROM events").fetchone()["n"]
     return {"readings": row["n"], "first_ts": row["lo"], "last_ts": row["hi"], "events": nev}
+
+
+# ---- weather / air quality ------------------------------------------------- #
+@app.get("/api/weather")
+async def get_weather(
+    since: int | None = None,
+    until: int | None = None,
+    source: str | None = None,
+    variable: str | None = None,
+    limit: int = 20000,
+):
+    """Time-range query over the external weather/air-quality series. `valid_ts` is
+    the join key against /api/readings `ts`."""
+    async with _db_lock:
+        rows = weather_store.query(_conn, since=since, until=until,
+                                   source=source, variable=variable, limit=limit)
+    return JSONResponse(rows)
+
+
+@app.get("/api/weather/sources")
+async def weather_sources():
+    """Active sources with last-fetch time and nearest-station distance."""
+    async with _db_lock:
+        rows = _conn.execute(
+            "SELECT source, MAX(valid_ts) AS last_valid, MAX(fetched_at) AS last_fetch, "
+            "COUNT(*) AS rows, MIN(distance_km) AS nearest_km "
+            "FROM weather GROUP BY source ORDER BY source"
+        ).fetchall()
+    return JSONResponse([dict(r) for r in rows])
+
+
+@app.get("/api/weather/metrics")
+async def weather_metrics():
+    """Numeric weather variables seen recently, each with a best-effort unit."""
+    async with _db_lock:
+        rows = _conn.execute(
+            "SELECT payload FROM weather ORDER BY valid_ts DESC LIMIT 500"
+        ).fetchall()
+    keys: set[str] = set()
+    for r in rows:
+        for k, v in json.loads(r["payload"]).items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                keys.add(k)
+    return [{"name": k, "unit": weather_config.UNITS.get(k, "")} for k in sorted(keys)]
 
 
 # ---- events (home mode) ---------------------------------------------------- #
