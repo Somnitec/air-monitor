@@ -7,11 +7,11 @@
 *.swp
 build/
 .claude/settings.local.json
-/src/secrets.h
+/firmware/src/secrets.h
 
-# PC-side (pc/) runtime artifacts
-pc/.venv/
-pc/data/
+# server/ runtime artifacts
+server/.venv/
+server/data/
 __pycache__/
 *.db
 *.db-wal

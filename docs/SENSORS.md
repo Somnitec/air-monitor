@@ -11,7 +11,7 @@ ESP32 target: **ESP32-D0WDQ6** (classic ESP32, 2× ADC, 240 MHz, no USB-native).
 
 ## Wiring summary (which pin goes where)
 
-All pins below match [`include/config.h`](../include/config.h). Power: every
+All pins below match [`firmware/include/config.h`](../firmware/include/config.h). Power: every
 sensor here runs from **3V3** and **GND** (the ESP32 is a 3.3 V part — do **not**
 feed sensor signals from 5 V even though the gas/soil boards *accept* 5 V supply;
 see the per-sensor notes).
@@ -263,7 +263,7 @@ Wiring: SCK→GPIO26, WS→GPIO25, SD→GPIO33, L/R→GND (left).
    the offset against a reference SPL meter and store it.
 4. **A-weighting** for `dB(A)` (what regulations use): weight each FFT bin by the
    IEC 61672 A-curve, sum the weighted energy, convert back to dB. The firmware does
-   this per FFT bin (`micA_weight()` in [`src/mic.cpp`](../src/mic.cpp)).
+   this per FFT bin (`micA_weight()` in [`firmware/src/mic.cpp`](../firmware/src/mic.cpp)).
 
 ### Frequency bands
 The firmware bins the FFT into standard **octave bands** centred at

@@ -311,7 +311,7 @@ Chosen for portability across the user's machines (**macOS dev, Fedora laptop, W
 
 ## Secret Configuration
 
-**File:** `include/secrets.h` (already in .gitignore)
+**File:** `firmware/src/secrets.h` (already in .gitignore; copy from `secrets.example.h`)
 - WiFi SSID, password
 - Sensor calibration constants (R0 for gas sensors, BAT_FACTOR, soil calibration)
 - (Later) API keys for weather/flight data, location coordinates (52.179722, 5.284722)

@@ -82,7 +82,7 @@ The server advertises itself on the LAN over **mDNS/zeroconf** as
 IP + port automatically — so when the station roams to a different network, it
 just re-discovers the server. No IP to hardcode or update.
 
-`SYNC_HOST`/`SYNC_PORT` in `src/secrets.h` are only a **fallback** used if mDNS
+`SYNC_HOST`/`SYNC_PORT` in `firmware/src/secrets.h` are only a **fallback** used if mDNS
 discovery turns up nothing (e.g. a network that blocks multicast). You can leave
 them at the defaults unless you hit that case.
 

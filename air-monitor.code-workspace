@@ -1,0 +1,15 @@
+{
+  // Open this file (File > Open Workspace from File…) instead of the bare folder.
+  // It exposes both components as workspace roots so the PlatformIO extension
+  // activates on firmware/ (where platformio.ini lives) and you still see the
+  // Python server and top-level docs.
+  "folders": [
+    { "name": "firmware", "path": "firmware" },
+    { "name": "server", "path": "server" },
+    { "name": "air-monitor (docs/root)", "path": "." }
+  ],
+  "settings": {
+    // Use the server's venv for Python work without re-selecting each time.
+    "python.defaultInterpreterPath": "${workspaceFolder:server}/.venv/bin/python"
+  }
+}
