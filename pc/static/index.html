@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Air Monitor</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#252a35; --fg:#e6e9ef; --mut:#8b93a7; --accent:#4ea1ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:12px 18px; border-bottom:1px solid var(--line); display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; font-weight:600; }
+  .pill { font-size:12px; color:var(--mut); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#c0392b; margin-right:6px; vertical-align:middle; }
+  .dot.live { background:#2ecc71; }
+  .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; flex-wrap:wrap; }
+  .controls { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; width:280px; flex:0 0 auto; }
+  .controls h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 8px; }
+  .controls section { margin-bottom:18px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
+  select, input, button { background:#0e1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:13px; width:100%; }
+  button { cursor:pointer; background:var(--accent); color:#06203f; border:none; font-weight:600; }
+  button.sec { background:#222633; color:var(--fg); }
+  button:hover { filter:brightness(1.08); }
+  .row { display:flex; gap:6px; }
+  .row > * { flex:1; }
+  .metrics { max-height:230px; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:6px; }
+  .metrics label { display:flex; align-items:center; gap:7px; margin:2px 0; color:var(--fg); cursor:pointer; }
+  .metrics input { width:auto; }
+  .events-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+  .events-grid button { font-size:12px; padding:6px; }
+  #charts { flex:1 1 520px; min-width:480px; }
+  .chart { background:var(--panel); border:1px solid var(--line); border-radius:10px; margin-bottom:14px; }
+  .stat { font-size:12px; color:var(--mut); margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌫️ Air Monitor</h1>
+  <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt">connecting…</span></span>
+  <span class="pill" id="stats"></span>
+</header>
+
+<div class="wrap">
+  <div class="controls">
+    <section>
+      <h2>Time range</h2>
+      <label>Window</label>
+      <select id="range">
+        <option value="3600">Last hour</option>
+        <option value="21600">Last 6 hours</option>
+        <option value="86400" selected>Last 24 hours</option>
+        <option value="604800">Last 7 days</option>
+        <option value="2592000">Last 30 days</option>
+        <option value="custom">Custom…</option>
+      </select>
+      <div id="customRange" style="display:none">
+        <label>From</label><input type="datetime-local" id="from" />
+        <label>To</label><input type="datetime-local" id="to" />
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="refresh">Query</button>
+        <button class="sec" id="livebtn">Live: on</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Metrics</h2>
+      <div class="metrics" id="metrics"></div>
+    </section>
+
+    <section>
+      <h2>Log event (home mode)</h2>
+      <div class="events-grid">
+        <button class="sec" data-kind="door" data-label="open">Door open</button>
+        <button class="sec" data-kind="door" data-label="close">Door close</button>
+        <button class="sec" data-kind="ventilation" data-label="on">Vent on</button>
+        <button class="sec" data-kind="ventilation" data-label="off">Vent off</button>
+        <button class="sec" data-kind="occupancy" data-label="home">Home</button>
+        <button class="sec" data-kind="occupancy" data-label="away">Away</button>
+        <button class="sec" data-kind="device" data-label="heating">Heating</button>
+        <button class="sec" data-kind="device" data-label="PC">PC</button>
+        <button class="sec" data-kind="device" data-label="sound">Sound sys</button>
+        <button class="sec" data-kind="sleep" data-label="sleep">Sleep</button>
+      </div>
+      <div class="stat" id="evstat"></div>
+    </section>
+  </div>
+
+  <div id="charts"></div>
+</div>
+
+<script>
+// ---- friendly labels + grouping so related metrics share a chart ----------
+const META = {
+  pm1:{g:'Particulates (µg/m³)',n:'PM1'}, pm25:{g:'Particulates (µg/m³)',n:'PM2.5'},
+  pm4:{g:'Particulates (µg/m³)',n:'PM4'}, pm10:{g:'Particulates (µg/m³)',n:'PM10'},
+  co2:{g:'CO₂ (ppm)',n:'CO₂'},
+  voc:{g:'Gas indices',n:'VOC index'}, nox:{g:'Gas indices',n:'NOx index'},
+  temp:{g:'Temp / Humidity',n:'Temp °C'}, rh:{g:'Temp / Humidity',n:'RH %'},
+  lux:{g:'Light (lux)',n:'Light'},
+  noise_dba:{g:'Noise (dB)',n:'dB(A)'}, noise_spl:{g:'Noise (dB)',n:'SPL'},
+  noise_dbfs:{g:'Noise (dBFS)',n:'dBFS'},
+  rumble:{g:'Ground rumble (m/s²)',n:'Rumble RMS'}, rumble_peak:{g:'Ground rumble (m/s²)',n:'Rumble peak'},
+  accel_mag:{g:'Accel magnitude (m/s²)',n:'|a|'},
+  co_mv:{g:'Gas raw (mV)',n:'CO mV'}, hcho_mv:{g:'Gas raw (mV)',n:'HCHO mV'},
+  co_rs:{g:'Gas Rs (Ω)',n:'CO Rs'}, hcho_rs:{g:'Gas Rs (Ω)',n:'HCHO Rs'},
+  soil_pct:{g:'Soil moisture (%)',n:'Soil'}, soil_mv:{g:'Soil raw (mV)',n:'Soil mV'},
+  bat_raw_mv:{g:'Battery',n:'Bat raw mV'}, bat_v:{g:'Battery',n:'Bat V'}, bat_pct:{g:'Battery',n:'Bat %'},
+};
+const DEFAULT_ON = new Set(['pm25','co2','voc','nox','temp','noise_dba','rumble','lux']);
+
+let live = true, selected = new Set(), allMetrics = [];
+let dataCache = [];   // current query result (array of flat records)
+let eventsCache = [];
+
+const $ = s => document.querySelector(s);
+
+function fmtRange() {
+  const sel = $('#range').value;
+  if (sel === 'custom') {
+    const f = $('#from').value ? Math.floor(new Date($('#from').value).getTime()/1000) : null;
+    const t = $('#to').value ? Math.floor(new Date($('#to').value).getTime()/1000) : null;
+    return { since: f, until: t };
+  }
+  return { since: Math.floor(Date.now()/1000) - parseInt(sel), until: null };
+}
+
+async function loadMetrics() {
+  allMetrics = await (await fetch('/api/metrics')).json();
+  if (selected.size === 0)
+    allMetrics.forEach(m => { if (DEFAULT_ON.has(m)) selected.add(m); });
+  const box = $('#metrics'); box.innerHTML = '';
+  allMetrics.forEach(m => {
+    const lbl = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = selected.has(m);
+    cb.onchange = () => { cb.checked ? selected.add(m) : selected.delete(m); render(); };
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode((META[m]?.n || m)));
+    box.appendChild(lbl);
+  });
+}
+
+async function query() {
+  const { since, until } = fmtRange();
+  const qs = new URLSearchParams();
+  if (since) qs.set('since', since);
+  if (until) qs.set('until', until);
+  dataCache = await (await fetch('/api/readings?' + qs)).json();
+  eventsCache = await (await fetch('/api/events?' + qs)).json();
+  render();
+  loadStats();
+}
+
+async function loadStats() {
+  const s = await (await fetch('/api/stats')).json();
+  const span = (s.first_ts && s.last_ts)
+    ? `${new Date(s.first_ts*1000).toLocaleString()} → ${new Date(s.last_ts*1000).toLocaleString()}`
+    : 'no data yet';
+  $('#stats').textContent = `${s.readings} readings · ${s.events} events · ${span}`;
+}
+
+// group selected metrics by their chart group, one Plotly chart per group
+function render() {
+  const groups = {};
+  [...selected].forEach(m => {
+    const g = META[m]?.g || m;
+    (groups[g] ||= []).push(m);
+  });
+
+  const host = $('#charts');
+  // remove charts no longer needed
+  [...host.children].forEach(c => { if (!groups[c.dataset.group]) c.remove(); });
+
+  Object.entries(groups).forEach(([g, metrics]) => {
+    let div = [...host.children].find(c => c.dataset.group === g);
+    if (!div) {
+      div = document.createElement('div');
+      div.className = 'chart'; div.dataset.group = g; div.style.height = '260px';
+      host.appendChild(div);
+    }
+    const traces = metrics.map(m => ({
+      x: dataCache.map(r => new Date(r.ts*1000)),
+      y: dataCache.map(r => r[m] ?? null),
+      name: META[m]?.n || m, mode:'lines', line:{width:1.6}, connectgaps:false,
+    }));
+    // event markers as vertical lines (shapes)
+    const shapes = eventsCache.map(e => ({
+      type:'line', x0:new Date(e.ts*1000), x1:new Date(e.ts*1000), yref:'paper', y0:0, y1:1,
+      line:{color:'rgba(255,200,80,.45)', width:1, dash:'dot'},
+    }));
+    const annotations = eventsCache.map(e => ({
+      x:new Date(e.ts*1000), y:1, yref:'paper', text:(e.label||e.kind), showarrow:false,
+      font:{size:9, color:'#ffce6b'}, textangle:-90, xanchor:'left', yanchor:'top',
+    }));
+    Plotly.react(div, traces, {
+      title:{text:g, font:{size:13, color:'#cfd5e3'}, x:0.01},
+      paper_bgcolor:'#171a21', plot_bgcolor:'#171a21',
+      font:{color:'#9aa3b5', size:11},
+      margin:{l:48, r:14, t:30, b:30}, height:260,
+      xaxis:{gridcolor:'#252a35'}, yaxis:{gridcolor:'#252a35'},
+      showlegend:true, legend:{orientation:'h', y:-0.18, font:{size:10}},
+      shapes, annotations,
+    }, {displayModeBar:false, responsive:true});
+  });
+}
+
+// ---- live updates over WebSocket ------------------------------------------
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen  = () => { $('#livedot').classList.add('live'); $('#livetxt').textContent = 'live'; };
+  ws.onclose = () => { $('#livedot').classList.remove('live'); $('#livetxt').textContent = 'reconnecting…'; setTimeout(connectWS, 2000); };
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (!live) return;
+    if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); loadStats(); }
+    if (msg.type === 'event')   { eventsCache.push(msg.data); render(); }
+  };
+}
+function trimToWindow() {
+  const { since } = fmtRange();
+  if (since) dataCache = dataCache.filter(r => r.ts >= since);
+}
+
+// ---- event logging --------------------------------------------------------
+document.querySelectorAll('.events-grid button').forEach(b => {
+  b.onclick = async () => {
+    const r = await fetch('/api/event', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ kind:b.dataset.kind, label:b.dataset.label }),
+    });
+    const ev = await r.json();
+    $('#evstat').textContent = `logged: ${ev.kind}/${ev.label} @ ${new Date(ev.ts*1000).toLocaleTimeString()}`;
+  };
+});
+
+// ---- wire up controls -----------------------------------------------------
+$('#range').onchange = () => {
+  $('#customRange').style.display = $('#range').value === 'custom' ? 'block' : 'none';
+};
+$('#refresh').onclick = query;
+$('#livebtn').onclick = () => {
+  live = !live;
+  $('#livebtn').textContent = live ? 'Live: on' : 'Live: off';
+};
+
+(async function init(){
+  await loadMetrics();
+  await query();
+  connectWS();
+  // refresh the metric list occasionally in case new fields appear
+  setInterval(loadMetrics, 60000);
+})();
+</script>
+</body>
+</html>

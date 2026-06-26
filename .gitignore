@@ -8,3 +8,11 @@
 build/
 .claude/settings.local.json
 /src/secrets.h
+
+# PC-side (pc/) runtime artifacts
+pc/.venv/
+pc/data/
+__pycache__/
+*.db
+*.db-wal
+*.db-shm

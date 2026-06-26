@@ -28,8 +28,24 @@
 #define ADXL345_DEVID        0xE5   // DEVID register (0x00) must read this
 
 // ---- Wi-Fi / time sync ----
+// Real values live in src/secrets.h (gitignored). These #ifndef fallbacks let the
+// file compile if secrets.h is missing, but sync won't work until you fill it in.
+// Copy src/secrets.example.h -> src/secrets.h and edit.
+#ifndef WIFI_SSID
 #define WIFI_SSID            "YOUR_SSID"
+#endif
+#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD        "YOUR_PASSWORD"
+#endif
+#ifndef SYNC_HOST
+#define SYNC_HOST            "192.168.1.50"   // LattePanda IP running the FastAPI server
+#endif
+#ifndef SYNC_PORT
+#define SYNC_PORT            8000
+#endif
+#ifndef SYNC_PATH
+#define SYNC_PATH            "/ingest"
+#endif
 #define WIFI_CONNECT_TIMEOUT_MS 10000
 #define NTP_POOL             "pool.ntp.org"
 #define TZ_INFO              "UTC0"
@@ -62,9 +78,17 @@
 #define PIN_SOIL_ADC         34   // generic capacitive soil moisture (analog out)
 #define PIN_GAS_CO_ADC       39   // DFRobot Fermion MEMS CO  SEN0564 (VN pin)
 #define PIN_GAS_HCHO_ADC     32   // DFRobot Fermion MEMS HCHO SEN0563 (analog out)
-#define PIN_BATTERY_ADC      35   // voltage divider tap: R2~1.8MΩ to GND confirmed by multimeter
-                                  // GPIO35 is ADC1_CH7, input-only — ideal for passive divider
-#define BAT_DIVIDER_FACTOR  4.4f  // empirical — calibrate: Vbat_true / (analogReadMilliVolts(35)/1000)
+// ---- Battery sense (DOUBLE UNKNOWN — see DESIGN.md) ----
+// We do not yet know (1) which GPIO the board routes the battery divider to, nor
+// (2) the divider ratio. Everything here is therefore configurable + disableable.
+// Worst case: solder your own divider onto a free ADC1 pin and set it below.
+#define BATTERY_ENABLED         1     // 0 = skip battery entirely (logs nothing)
+#define PIN_BATTERY_ADC        35     // best current guess; ADC1_CH7, input-only
+#define BAT_DIVIDER_FACTOR    4.4f    // empirical — Vbat_true / (analogReadMilliVolts(pin)/1000)
+#define BAT_CALIBRATED          0     // 1 once you've verified factor with a multimeter.
+                                      // While 0: raw mV is logged; V/% are flagged uncalibrated.
+#define BAT_FULL_V            4.2f
+#define BAT_EMPTY_V           3.0f
 #define GAS_ADC_OVERSAMPLE   32   // average N samples per reading to fight ADC noise
 #define GAS_CO_RL_OHMS       4700.0f  // RL on SEN0564 CO board
 #define GAS_HCHO_RL_OHMS    10000.0f  // RL on SEN0563 HCHO board (different!)
@@ -104,3 +128,36 @@
 // =========================================================================
 #define LOG_FILENAME_FMT     "/log_%04d%02d%02d.csv"   // daily file via RTC
 #define LOG_FLUSH_EVERY_N    10                         // flush SD every N rows
+
+// =========================================================================
+// Phase 1 — baseline data collection, durable queue, WiFi sync
+// (See DESIGN.md "Implementation Plan / Phase 1".)
+// =========================================================================
+
+// --- Baseline sampling cadence ---
+// One full record of every sensor at this interval. Adaptive (5–10 s) sampling
+// is Phase 2; Phase 1 is fixed-cadence on purpose to gather a clean baseline.
+#define SAMPLE_BASELINE_MS   60000UL    // 60 s
+
+// --- Accelerometer ground-rumble capture (mic-style, coarser) ---
+// Capture a short burst, remove gravity (DC), report AC-magnitude RMS + peak.
+#define ACCEL_RUMBLE_SAMPLES   128      // samples per rumble window
+#define ACCEL_RUMBLE_GAP_US   1500      // ~us between samples (~660 Hz attempt; I2C-limited)
+
+// --- Durable queue on flash (LittleFS) ---
+// Records are appended as newline-delimited JSON (NDJSON). A persisted byte
+// cursor marks how far the PC has acknowledged. Survives power loss.
+#define QUEUE_PATH           "/queue.ndjson"
+#define QUEUE_CURSOR_PATH    "/cursor.txt"
+#define QUEUE_COMPACT_BYTES  (64 * 1024)   // once fully-synced and bigger than this, truncate
+#define SYNC_BATCH_MAX        20           // records POSTed per HTTP request
+#define SYNC_BATCH_MAX_BYTES  4096         // ...or this many bytes, whichever first
+
+// --- Time ---
+#define NTP_SERVER_1         "pool.ntp.org"
+#define NTP_SERVER_2         "time.google.com"
+// Epoch sanity floor: a timestamp below this means NTP never succeeded.
+#define EPOCH_VALID_AFTER    1735689600UL  // 2025-01-01; records before this are "unsynced time"
+
+// --- Device identity (shows up in the database `device` column) ---
+#define DEVICE_ID            "air-monitor-01"

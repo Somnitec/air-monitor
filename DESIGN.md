@@ -55,12 +55,12 @@
 | Sensor | Interface | Quantity | Raw Range / Units | Notes |
 |--------|-----------|----------|-------------------|-------|
 | **SEN66** (PM/RH-T/VOC/NOx/CO₂) | I²C 0x6B | 1 | PM: 0–1000 µg/m³, CO₂: 400–40000 ppm | ~1 Hz internal update; adaptive indices (VOC/NOx) need baseline settling (~hours) |
-| **ADXL345** (3-axis accelerometer) | I²C 0x53 | 1 | ±4 g (configurable), ~3.9 mg/LSB | Detects vibration; optional activity interrupt (INT1/GPIO27 unused currently) |
+| **ADXL345** (3-axis accelerometer) | I²C 0x53 | 1 | ±4 g (configurable), ~3.9 mg/LSB | **Ground-rumble analysis (mic-style):** capture a short burst of samples, remove gravity (DC), report AC-magnitude RMS + peak as a "rumble level" — coarser than the mic FFT but the accelerometer analogue of it. Optional activity interrupt (INT1/GPIO27 unused currently) |
 | **BH1750** (ambient light) | I²C 0x23 | 1 | 0–65536 lux | 1 lx resolution in HIGH_RES mode; ~120 ms per read |
 | **SEN0564** (CO) | ADC GPIO39 (VN) | 1 | Raw mV 0–3300; Rs/R0 ratio qualitative | MEMS MOS; qualitative trend only; R0≈41.9 kΩ (clean air baseline) |
 | **SEN0563** (HCHO/formaldehyde) | ADC GPIO32 | 1 | Raw mV 0–3300; Rs/R0 ratio; range 0–3 ppm qualitative | MEMS MOS; R0≈142.8 kΩ; cross-sensitive to other VOCs |
 | **Capacitive soil moisture** | ADC GPIO34 | 1 | Raw mV (map via calibration); 0–100 % | Supply-sensitive; calibrated per unit (dry=2600 mV, wet=1200 mV empirically) |
-| **Battery sense** | ADC GPIO35 (divider) | 1 | Raw mV 0–3300; maps to 3.0–4.2 V (empirical BAT_FACTOR=4.4) | **ASSUMPTION:** R1 unknown; calibration pending (email to vendor) |
+| **Battery sense** | ADC (pin TBD) | 1 | Raw mV 0–3300; maps to 3.0–4.2 V (empirical BAT_FACTOR=4.4) | **DOUBLE UNKNOWN:** (1) *which GPIO* the board routes the battery divider to is not confirmed, and (2) the divider ratio/R1 is unknown. Firmware treats battery as **fully configurable + disableable**: `BATTERY_ENABLED`, `BATTERY_ADC_PIN`, `BATTERY_DIVIDER_FACTOR`. Worst case the user adds an external divider on a known ADC1 pin. Until calibrated, raw mV is logged and the derived V/% are flagged uncalibrated. |
 | **INMP441** (I²S microphone) | I²S | 1 | 24-bit samples @ 44100 Hz; dBFS → SPL | Sensitivity −26 dBFS @ 94 dB SPL; noise floor ~33 dB(A); AOP 116 dB SPL |
 | **Status LED** | GPIO13 | 1 | On-board indicator | For boot/connectivity feedback |
 
@@ -283,15 +283,20 @@ Each record contains:
 
 ## PC-Side (LattePanda) Architecture
 
-### Software Stack (TBD)
+### Software Stack (DECIDED — Python, cross-platform)
+
+Chosen for portability across the user's machines (**macOS dev, Fedora laptop, Windows laptop, Debian LattePanda target**) with no native build step, and because pandas/scipy read SQLite directly for later analysis.
 
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
-| **Data collection** | Python script or Node.js | HTTP/MQTT listener, write to SQLite |
-| **Dashboard** | Flask/Django + Plotly/Grafana or web UI (React/Vue) | Interactive graphs, event logging, daily/weekly views |
-| **Weather fetch** | Python requests to OpenWeather/KNMI API | Hourly; store in same SQLite |
-| **ADS-B decode** | `dump1090` or `readsb` (RTL-SDR tools) | Runs continuously in aircraft mode |
+| **Data collection + API** | **FastAPI + uvicorn** | One app: HTTP ingest from ESP32, REST query API, *and* WebSocket live-push |
+| **Storage** | **SQLite (stdlib)** | Single file on USB stick; no server; ACID; pandas-readable |
+| **Dashboard** | **Plotly.js + vanilla HTML/JS** | Interactive zoomable graphs, live updates over WebSocket, in-page query |
+| **Weather fetch** | Python `requests` to KNMI/OpenWeather | Hourly; store in same SQLite (Phase 4) |
+| **ADS-B decode** | `dump1090` / `readsb` (RTL-SDR) | Runs continuously in aircraft mode (Phase 3) |
 | **Correlation engine** | Python (scipy, pandas) | Post-hoc analysis; generates reports |
+
+**Why FastAPI over Flask:** native async WebSocket support (for live data) and automatic OpenAPI docs at `/docs`, with the same simplicity as Flask for the REST routes.
 
 ### Dashboard Features
 
