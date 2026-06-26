@@ -50,10 +50,20 @@
   .metrics input { width:24px; height:24px; min-height:0; flex:0 0 auto; }
   .events-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
   .events-grid button { font-size:14px; min-height:var(--tap); padding:0 6px; }
+  /* toggle buttons: dim when off, green when on */
+  button.toggle { background:#222633; color:var(--mut); border:1px solid var(--line); font-weight:600; }
+  button.toggle.on { background:#1f7a44; color:#eafff1; border-color:#2ecc71; }
   .stat { font-size:13px; color:var(--mut); margin-top:8px; min-height:18px; }
 
   /* backdrop shown when drawer is open on small screens */
   .backdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:18; display:none; }
+
+  /* big low-battery warning across the top */
+  #batwarn { position:fixed; top:0; left:0; right:0; z-index:50; display:none;
+             background:#b3261e; color:#fff; font-size:18px; font-weight:800; letter-spacing:.02em;
+             text-align:center; padding:14px 16px; box-shadow:0 2px 14px rgba(0,0,0,.55); }
+  #batwarn.show { display:block; animation:batpulse 1.3s ease-in-out infinite; }
+  @keyframes batpulse { 0%,100%{ background:#b3261e; } 50%{ background:#e0392b; } }
 
   /* --- small screen (the LattePanda touch panel) --- */
   @media (max-width: 820px) {
@@ -82,6 +92,7 @@
 </header>
 
 <div class="backdrop" id="backdrop"></div>
+<div id="batwarn">🔋 Battery low</div>
 
 <div class="wrap">
   <div class="controls" id="drawer">
@@ -112,20 +123,18 @@
     </section>
 
     <section>
-      <h2>Log event (home mode)</h2>
-      <div class="events-grid">
-        <button class="sec" data-kind="door" data-label="open">Door open</button>
-        <button class="sec" data-kind="door" data-label="close">Door close</button>
-        <button class="sec" data-kind="ventilation" data-label="on">Vent on</button>
-        <button class="sec" data-kind="ventilation" data-label="off">Vent off</button>
-        <button class="sec" data-kind="occupancy" data-label="home">Home</button>
-        <button class="sec" data-kind="occupancy" data-label="away">Away</button>
-        <button class="sec" data-kind="device" data-label="heating">Heating</button>
-        <button class="sec" data-kind="device" data-label="PC">PC</button>
-        <button class="sec" data-kind="device" data-label="sound">Sound sys</button>
-        <button class="sec" data-kind="sleep" data-label="sleep">Sleep</button>
-      </div>
+      <h2>Home state</h2>
+      <div class="events-grid" id="toggles"></div>
       <div class="stat" id="evstat"></div>
+    </section>
+
+    <section>
+      <h2>Add marker</h2>
+      <label>Note (e.g. "fell on the ground", "moved 2 m")</label>
+      <input type="text" id="markerText" placeholder="type a note…" maxlength="200" />
+      <div class="row" style="margin-top:10px">
+        <button id="markerAdd">Add marker</button>
+      </div>
     </section>
   </div>
 
@@ -134,23 +143,45 @@
 
 <script>
 // ---- friendly labels + grouping so related metrics share a chart ----------
+// a:2 puts the metric on the chart's right-hand (secondary) y-axis — used when
+// two related series share a chart but have very different units/scales.
 const META = {
   pm1:{g:'Particulates (µg/m³)',n:'PM1'}, pm25:{g:'Particulates (µg/m³)',n:'PM2.5'},
   pm4:{g:'Particulates (µg/m³)',n:'PM4'}, pm10:{g:'Particulates (µg/m³)',n:'PM10'},
   co2:{g:'CO₂ (ppm)',n:'CO₂'},
   voc:{g:'Gas indices',n:'VOC index'}, nox:{g:'Gas indices',n:'NOx index'},
   temp:{g:'Temp / Humidity',n:'Temp °C'}, rh:{g:'Temp / Humidity',n:'RH %'},
+  bme_temp:{g:'Temp / Humidity',n:'BME temp °C'}, bme_rh:{g:'Temp / Humidity',n:'BME RH %'},
+  pressure_hpa:{g:'Pressure (hPa)',n:'Pressure'},
   lux:{g:'Light (lux)',n:'Light'},
   noise_dba:{g:'Noise (dB)',n:'dB(A)'}, noise_spl:{g:'Noise (dB)',n:'SPL'},
   noise_dbfs:{g:'Noise (dBFS)',n:'dBFS'},
-  rumble:{g:'Ground rumble (m/s²)',n:'Rumble RMS'}, rumble_peak:{g:'Ground rumble (m/s²)',n:'Rumble peak'},
-  accel_mag:{g:'Accel magnitude (m/s²)',n:'|a|'},
-  co_mv:{g:'Gas raw (mV)',n:'CO mV'}, hcho_mv:{g:'Gas raw (mV)',n:'HCHO mV'},
-  co_rs:{g:'Gas Rs (Ω)',n:'CO Rs'}, hcho_rs:{g:'Gas Rs (Ω)',n:'HCHO Rs'},
-  soil_pct:{g:'Soil moisture (%)',n:'Soil'}, soil_mv:{g:'Soil raw (mV)',n:'Soil mV'},
+  // Motion: rumble (left) + accel magnitude (right) on one chart
+  rumble:{g:'Motion (m/s²)',n:'Rumble RMS'}, rumble_peak:{g:'Motion (m/s²)',n:'Rumble peak'},
+  accel_mag:{g:'Motion (m/s²)',n:'|a| magnitude',a:2},
+  // Gas: raw mV (left) + Rs Ω (right) on one chart
+  co_mv:{g:'Gas (CO / HCHO)',n:'CO mV'}, hcho_mv:{g:'Gas (CO / HCHO)',n:'HCHO mV'},
+  co_rs:{g:'Gas (CO / HCHO)',n:'CO Rs',a:2}, hcho_rs:{g:'Gas (CO / HCHO)',n:'HCHO Rs',a:2},
+  // Soil: moisture % (left) + raw mV (right) on one chart
+  soil_pct:{g:'Soil',n:'Soil %'}, soil_mv:{g:'Soil',n:'Soil mV',a:2},
   bat_raw_mv:{g:'Battery',n:'Bat raw mV'}, bat_v:{g:'Battery',n:'Bat V'}, bat_pct:{g:'Battery',n:'Bat %'},
 };
-const DEFAULT_ON = new Set(['pm25','co2','voc','nox','temp','noise_dba','rumble','lux']);
+// Per-chart axis titles for the dual-axis groups (left = y, right = y2).
+const GROUP_AXES = {
+  'Gas (CO / HCHO)': { y:'mV', y2:'Rs (Ω)' },
+  'Motion (m/s²)':   { y:'rumble m/s²', y2:'|a| m/s²' },
+  'Soil':            { y:'%', y2:'mV' },
+};
+// Chart stacking order (top→bottom). Battery is always forced last regardless.
+const GROUP_ORDER = [
+  'Particulates (µg/m³)','CO₂ (ppm)','Gas indices','Temp / Humidity','Pressure (hPa)',
+  'Light (lux)','Noise (dB)','Noise (dBFS)','Gas (CO / HCHO)','Soil','Motion (m/s²)',
+];
+function groupRank(g) {
+  if (g === 'Battery') return 1e6;        // always at the bottom
+  const i = GROUP_ORDER.indexOf(g);
+  return i < 0 ? 5e5 : i;                  // unknown groups sit above Battery
+}
 
 let live = true, selected = new Set(), allMetrics = [];
 let dataCache = [];   // current query result (array of flat records)
@@ -171,7 +202,7 @@ function fmtRange() {
 async function loadMetrics() {
   allMetrics = await (await fetch('/api/metrics')).json();
   if (selected.size === 0)
-    allMetrics.forEach(m => { if (DEFAULT_ON.has(m)) selected.add(m); });
+    allMetrics.forEach(m => selected.add(m));   // everything on when you first arrive
   const box = $('#metrics'); box.innerHTML = '';
   allMetrics.forEach(m => {
     const lbl = document.createElement('label');
@@ -192,6 +223,8 @@ async function query() {
   dataCache = await (await fetch('/api/readings?' + qs)).json();
   eventsCache = await (await fetch('/api/events?' + qs)).json();
   render();
+  restoreToggleStates();
+  checkBattery();
   loadStats();
 }
 
@@ -222,10 +255,12 @@ function render() {
       div.className = 'chart'; div.dataset.group = g; div.style.height = '260px';
       host.appendChild(div);
     }
+    const hasRight = metrics.some(m => META[m]?.a === 2);
     const traces = metrics.map(m => ({
       x: dataCache.map(r => new Date(r.ts*1000)),
       y: dataCache.map(r => r[m] ?? null),
       name: META[m]?.n || m, mode:'lines', line:{width:1.6}, connectgaps:false,
+      yaxis: META[m]?.a === 2 ? 'y2' : 'y',
     }));
     // event markers as vertical lines (shapes)
     const shapes = eventsCache.map(e => ({
@@ -236,16 +271,28 @@ function render() {
       x:new Date(e.ts*1000), y:1, yref:'paper', text:(e.label||e.kind), showarrow:false,
       font:{size:9, color:'#ffce6b'}, textangle:-90, xanchor:'left', yanchor:'top',
     }));
-    Plotly.react(div, traces, {
+    const ax = GROUP_AXES[g] || {};
+    const layout = {
       title:{text:g, font:{size:13, color:'#cfd5e3'}, x:0.01},
       paper_bgcolor:'#171a21', plot_bgcolor:'#171a21',
       font:{color:'#9aa3b5', size:11},
-      margin:{l:48, r:14, t:30, b:30}, height:260,
-      xaxis:{gridcolor:'#252a35'}, yaxis:{gridcolor:'#252a35'},
+      margin:{l:48, r:hasRight ? 52 : 14, t:30, b:30}, height:260,
+      xaxis:{gridcolor:'#252a35'},
+      yaxis:{gridcolor:'#252a35', title:{text:ax.y || '', font:{size:10}}},
       showlegend:true, legend:{orientation:'h', y:-0.18, font:{size:10}},
       shapes, annotations,
-    }, {displayModeBar:false, responsive:true});
+    };
+    if (hasRight) {
+      layout.yaxis2 = { overlaying:'y', side:'right', gridcolor:'transparent',
+                        title:{text:ax.y2 || '', font:{size:10}} };
+    }
+    Plotly.react(div, traces, layout, {displayModeBar:false, responsive:true});
   });
+
+  // keep charts in a stable order, Battery always pinned to the bottom
+  [...host.children]
+    .sort((a, b) => groupRank(a.dataset.group) - groupRank(b.dataset.group))
+    .forEach(c => host.appendChild(c));
 }
 
 // ---- live updates over WebSocket ------------------------------------------
@@ -257,8 +304,13 @@ function connectWS() {
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
     if (!live) return;
-    if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); loadStats(); }
-    if (msg.type === 'event')   { eventsCache.push(msg.data); render(); }
+    if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); checkBattery(); loadStats(); }
+    if (msg.type === 'event')   {
+      eventsCache.push(msg.data); render();
+      // reflect a toggle flipped from another client/device
+      const t = TOGGLES.find(t => t.kind === msg.data.kind);
+      if (t) { toggleState[t.kind] = (msg.data.label === t.on); renderToggles(); }
+    }
   };
 }
 function trimToWindow() {
@@ -266,23 +318,85 @@ function trimToWindow() {
   if (since) dataCache = dataCache.filter(r => r.ts >= since);
 }
 
-// ---- event logging --------------------------------------------------------
-document.querySelectorAll('.events-grid button').forEach(b => {
-  b.onclick = async () => {
-    const r = await fetch('/api/event', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ kind:b.dataset.kind, label:b.dataset.label }),
-    });
-    const ev = await r.json();
-    $('#evstat').textContent = `logged: ${ev.kind}/${ev.label} @ ${new Date(ev.ts*1000).toLocaleTimeString()}`;
-  };
-});
+// ---- home-state toggles ---------------------------------------------------
+// Each toggle flips between two states and logs an event with the new label.
+const TOGGLES = [
+  { kind:'door',        on:'open',  off:'close', onTxt:'🚪 Door open',  offTxt:'🚪 Door closed' },
+  { kind:'ventilation', on:'on',    off:'off',   onTxt:'💨 Vent on',    offTxt:'💨 Vent off' },
+  { kind:'occupancy',   on:'home',  off:'away',  onTxt:'🏠 Home',       offTxt:'🚶 Away' },
+  { kind:'heating',     on:'on',    off:'off',   onTxt:'🔥 Heating on', offTxt:'🔥 Heating off' },
+  { kind:'pc',          on:'on',    off:'off',   onTxt:'💻 PC on',      offTxt:'💻 PC off' },
+  { kind:'soundsys',    on:'on',    off:'off',   onTxt:'🔊 Sound on',   offTxt:'🔊 Sound off' },
+  { kind:'sleep',       on:'sleep', off:'wake',  onTxt:'😴 Sleeping',   offTxt:'☀️ Awake' },
+];
+const toggleState = {};   // kind -> bool (on)
+
+function renderToggles() {
+  const grid = $('#toggles'); grid.innerHTML = '';
+  TOGGLES.forEach(t => {
+    const on = !!toggleState[t.kind];
+    const b = document.createElement('button');
+    b.className = 'toggle' + (on ? ' on' : '');
+    b.textContent = on ? t.onTxt : t.offTxt;
+    b.onclick = async () => {
+      const nowOn = !toggleState[t.kind];
+      toggleState[t.kind] = nowOn;
+      renderToggles();
+      const ev = await (await fetch('/api/event', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ kind:t.kind, label: nowOn ? t.on : t.off }),
+      })).json();
+      $('#evstat').textContent = `logged: ${ev.kind}/${ev.label} @ ${new Date(ev.ts*1000).toLocaleTimeString()}`;
+    };
+    grid.appendChild(b);
+  });
+}
+
+// Restore each toggle to whatever its most recent event in the window was.
+function restoreToggleStates() {
+  TOGGLES.forEach(t => {
+    const last = eventsCache.filter(e => e.kind === t.kind).sort((a,b) => b.ts - a.ts)[0];
+    toggleState[t.kind] = last ? (last.label === t.on) : false;
+  });
+  renderToggles();
+}
+
+// ---- custom text marker ---------------------------------------------------
+async function addMarker() {
+  const inp = $('#markerText');
+  const text = inp.value.trim();
+  if (!text) return;
+  const ev = await (await fetch('/api/event', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ kind:'note', label:text }),
+  })).json();
+  inp.value = '';
+  $('#evstat').textContent = `marker: "${ev.label}" @ ${new Date(ev.ts*1000).toLocaleTimeString()}`;
+}
+
+// ---- low-battery warning --------------------------------------------------
+const BAT_LOW_PCT = 15, BAT_LOW_V = 3.3;
+function checkBattery() {
+  let pct = null, v = null;
+  for (let i = dataCache.length - 1; i >= 0; i--) {     // newest reading with battery data
+    const r = dataCache[i];
+    if (r.bat_pct != null) { pct = r.bat_pct; v = r.bat_v ?? null; break; }
+    if (r.bat_v   != null) { v = r.bat_v; break; }
+  }
+  const low = (pct != null && pct < BAT_LOW_PCT) ||
+              (pct == null && v != null && v < BAT_LOW_V);
+  const el = $('#batwarn');
+  el.classList.toggle('show', low);
+  if (low) el.textContent = `🔋 Battery low — ${pct != null ? pct.toFixed(0) + '%' : v.toFixed(2) + ' V'} · charge soon`;
+}
 
 // ---- wire up controls -----------------------------------------------------
 $('#range').onchange = () => {
   $('#customRange').style.display = $('#range').value === 'custom' ? 'block' : 'none';
 };
 $('#refresh').onclick = () => { query(); closeDrawer(); };
+$('#markerAdd').onclick = addMarker;
+$('#markerText').addEventListener('keydown', e => { if (e.key === 'Enter') addMarker(); });
 $('#livebtn').onclick = () => {
   live = !live;
   $('#livebtn').textContent = live ? 'Live: on' : 'Live: off';
@@ -312,6 +426,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 (async function init(){
+  renderToggles();
   await loadMetrics();
   await query();
   connectWS();

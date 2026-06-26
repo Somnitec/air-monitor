@@ -25,7 +25,9 @@
 #define ADDR_SEN66           0x6B
 #define ADDR_ADXL345         0x53
 #define ADDR_BH1750          0x23
+#define ADDR_BME280          0x76   // SDO→GND; would be 0x77 with SDO→VCC
 #define ADXL345_DEVID        0xE5   // DEVID register (0x00) must read this
+#define BME280_CHIPID        0x60   // reg 0xD0 must read this (BME280, not BMP280=0x58)
 
 // ---- Wi-Fi / time sync ----
 // Real values live in src/secrets.h (gitignored). These #ifndef fallbacks let the
@@ -77,21 +79,21 @@
 // while Wi-Fi is active. Use 11 dB attenuation for 0–~3.3 V input range.
 #define PIN_SOIL_ADC         34   // generic capacitive soil moisture (analog out)
 #define PIN_GAS_CO_ADC       39   // DFRobot Fermion MEMS CO  SEN0564 (VN pin)
-#define PIN_GAS_HCHO_ADC     35   // DFRobot Fermion MEMS HCHO SEN0563 (analog out)
+#define PIN_GAS_HCHO_ADC     32   // DFRobot Fermion MEMS HCHO SEN0563 (analog out)
                                   // moved 32->35: GPIO32 now hosts the battery divider.
                                   // GPIO35 is input-only — fine for a sensor analog output.
 // ---- Battery sense (EXTERNAL divider — this board has no built-in sense pin) ----
 // External divider (user-built):  BAT+ --[1M]--+--[2M]-- GND ,  +--[0.1uF 104]-- GND
 //                                              |
-//                                            GPIO32 (ADC1_CH4)
+//                                            GPIO35 (ADC1_CH7)
 // Ratio = R2/(R1+R2) = 2/3, so Vpin = Vbat*0.667 (4.2V -> 2.8V, within ADC range).
 // Reconstruct Vbat = Vpin * (R1+R2)/R2 = Vpin * 1.5  => BAT_DIVIDER_FACTOR = 1.5.
 // The 0.1uF cap is REQUIRED: the ~0.67M source impedance is far above what the
 // ADC sample-hold likes; the cap is its charge reservoir (RC ~ 67ms, also filters).
 #define BATTERY_ENABLED         1     // 0 = skip battery entirely (logs nothing)
-#define PIN_BATTERY_ADC        32     // external 1M/2M divider tap (ADC1_CH4)
-#define BAT_DIVIDER_FACTOR    1.5f    // nominal for 1M/2M; calibrate: Vbat_true / (mV/1000)
-#define BAT_CALIBRATED          0     // 1 once you've verified factor with a multimeter.
+#define PIN_BATTERY_ADC        35     // external 1M/2M divider tap 
+#define BAT_DIVIDER_FACTOR    1.5f    // verified: 4.20V/2804mV=1.498, 4.05V/2690mV=1.506 -> 1.50
+#define BAT_CALIBRATED          1     // verified against multimeter (two points, both ~1.50).
                                       // While 0: raw mV is logged; V/% are flagged uncalibrated.
 #define BAT_FULL_V            4.2f
 #define BAT_EMPTY_V           3.0f

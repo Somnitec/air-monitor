@@ -57,6 +57,7 @@ def _init_db() -> sqlite3.Connection:
             ts          INTEGER NOT NULL,          -- sensor unix epoch (UTC)
             device      TEXT,
             ts_ok       INTEGER DEFAULT 1,         -- 0 = ESP32 clock was unsynced
+            ts_status   TEXT DEFAULT 'ok',         -- 'ok' | 'provisional' | 'corrected'
             received_at INTEGER NOT NULL,          -- server unix epoch when stored
             payload     TEXT NOT NULL              -- full JSON record, verbatim
         );
@@ -73,6 +74,11 @@ def _init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         """
     )
+    # Migrate older DBs that predate the ts_status column.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(readings)")}
+    if "ts_status" not in cols:
+        conn.execute("ALTER TABLE readings ADD COLUMN ts_status TEXT DEFAULT 'ok'")
+        conn.execute("UPDATE readings SET ts_status='provisional' WHERE ts_ok=0")
     conn.commit()
     return conn
 
@@ -89,11 +95,43 @@ def _dedupe_insert(rec: dict[str, Any]) -> bool:
     )
     if cur.fetchone() is not None:
         return False
+    status = "ok" if ts_ok else "provisional"
     _conn.execute(
-        "INSERT INTO readings (ts, device, ts_ok, received_at, payload) VALUES (?,?,?,?,?)",
-        (ts, device, ts_ok, int(time.time()), json.dumps(rec, separators=(",", ":"))),
+        "INSERT INTO readings (ts, device, ts_ok, ts_status, received_at, payload) "
+        "VALUES (?,?,?,?,?,?)",
+        (ts, device, ts_ok, status, int(time.time()),
+         json.dumps(rec, separators=(",", ":"))),
     )
     return True
+
+
+def _backfill_times(device: Any, boot: Any) -> int:
+    """Retroactively fix a boot's early records. The ESP32 logs with provisional
+    (uptime-based) timestamps until its clock is set; every record carries up_ms
+    and a per-boot id. Once any record of this boot has a reliable clock (ts_ok=1),
+    we know boot_epoch = ts - up_ms/1000, so each earlier record's true time is
+    boot_epoch + up_ms/1000. Only the db columns change; payload stays verbatim.
+    Returns the number of rows corrected."""
+    if boot is None:
+        return 0
+    row = _conn.execute(
+        "SELECT ts - json_extract(payload,'$.up_ms')/1000.0 "
+        "FROM readings "
+        "WHERE device IS ? AND json_extract(payload,'$.boot')=? AND ts_ok=1 "
+        "ORDER BY ts LIMIT 1",
+        (device, boot),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return 0
+    boot_epoch = row[0]
+    cur = _conn.execute(
+        "UPDATE readings "
+        "SET ts = CAST(? + json_extract(payload,'$.up_ms')/1000.0 AS INTEGER), "
+        "    ts_ok=1, ts_status='corrected' "
+        "WHERE device IS ? AND json_extract(payload,'$.boot')=? AND ts_ok=0",
+        (boot_epoch, device, boot),
+    )
+    return cur.rowcount
 
 
 # --------------------------------------------------------------------------- #
@@ -154,13 +192,16 @@ async def _start_mdns():
         print("[mdns] zeroconf not installed — ESP32 must use the static SYNC_HOST fallback")
         return None, None
     ip = _local_ip()
+    # Use a fixed hostname (not socket.gethostname(), which the ESP32 can't predict)
+    # so the device can resolve our A-record directly via MDNS.queryHost("airmon-server").
+    # zeroconf registers airmon-server.local. -> ip for us.
     info = ServiceInfo(
         "_airmon._tcp.local.",
         "air-monitor._airmon._tcp.local.",
         addresses=[socket.inet_aton(ip)],
         port=PORT,
         properties={"path": "/ingest"},
-        server=f"{socket.gethostname()}.local.",
+        server="airmon-server.local.",
     )
     aiozc = AsyncZeroconf()
     await aiozc.async_register_service(info)
@@ -195,6 +236,7 @@ def _flatten(row: sqlite3.Row) -> dict:
     out["ts"] = row["ts"]
     out["device"] = row["device"]
     out["ts_ok"] = bool(row["ts_ok"])
+    out["ts_status"] = row["ts_status"] if "ts_status" in row.keys() else "ok"
     return out
 
 
@@ -206,19 +248,31 @@ async def ingest(request: Request):
     records = body if isinstance(body, list) else [body]
 
     stored = []
+    corrected = 0
     async with _db_lock:
+        boots: set[tuple] = set()   # (device, boot) pairs that arrived with a good clock
         for rec in records:
             if not isinstance(rec, dict):
                 continue
             if _dedupe_insert(rec):
                 stored.append(rec)
+            if rec.get("ts_ok", True) and rec.get("boot") is not None:
+                boots.add((rec.get("dev") or rec.get("device"), rec.get("boot")))
+        # A reliably-timed record lets us back-fill that boot's earlier provisional ones.
+        for device, boot in boots:
+            corrected += _backfill_times(device, boot)
         _conn.commit()
+    if corrected:
+        print(f"[time] back-filled {corrected} record(s) with a corrected timestamp")
 
     # push the freshly stored ones to any open dashboards
     for rec in stored:
         await hub.broadcast({"type": "reading", "data": rec})
 
-    return {"ok": True, "received": len(records), "stored": len(stored)}
+    # Hand back our wall-clock epoch so an ESP32 whose NTP never succeeded can
+    # adopt an approximate time (good to ~network-latency, fine for timestamps).
+    return {"ok": True, "received": len(records), "stored": len(stored),
+            "server_time": int(time.time())}
 
 
 # ---- query ----------------------------------------------------------------- #
@@ -269,7 +323,7 @@ async def metrics():
         for k, v in json.loads(r["payload"]).items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 keys.add(k)
-    keys -= {"ts", "up_ms"}
+    keys -= {"ts", "up_ms", "boot"}   # bookkeeping fields, not real metrics
     return sorted(keys)
 
 

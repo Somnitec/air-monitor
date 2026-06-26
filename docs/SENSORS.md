@@ -16,22 +16,23 @@ sensor here runs from **3V3** and **GND** (the ESP32 is a 3.3 V part — do **no
 feed sensor signals from 5 V even though the gas/soil boards *accept* 5 V supply;
 see the per-sensor notes).
 
-| Sensor | Interface | Signal | ESP32 GPIO | Notes |
-|--------|-----------|--------|-----------|-------|
-| **SEN66** | I²C @0x6B | SDA | **GPIO16** | shared bus |
-| | | SCL | **GPIO17** | shared bus |
-| **ADXL345** | I²C @0x53 | SDA / SCL | 16 / 17 | SDO→GND sets 0x53 |
-| | | INT1 | **GPIO27** | optional motion interrupt |
-| **GY-30 / BH1750** | I²C @0x23 | SDA / SCL | 16 / 17 | ADDR→GND sets 0x23 |
-| **SEN0563 HCHO** | analog | AOUT | **GPIO35** (ADC1_CH7) | input-only pin, fine for ADC; moved 32→35 |
-| **Capacitive soil** | analog | AOUT | **GPIO34** (ADC1_CH6) | input-only pin, fine for ADC |
-| **SEN0564 CO** | analog | AOUT | **GPIO39 / VN** (ADC1_CH3) | input-only pin, fine for ADC |
-| **Battery divider** | analog | Vtap | **GPIO32** (ADC1_CH4) | external divider: BAT+→1M→tap→2M→GND, +0.1µF tap→GND; Vbat=Vpin×1.5 |
-| **INMP441** | I²S | SCK (BCLK) | **GPIO26** | |
-| | | WS (LRCLK) | **GPIO25** | |
-| | | SD (DOUT) | **GPIO33** | mic→ESP32 |
-| | | L/R | **GND** | GND = left channel |
-| Status LED | GPIO | — | **GPIO2** | on-board on many boards |
+| Sensor | Purpose | Interface | Signal | ESP32 GPIO | Notes |
+|--------|---------|-----------|--------|-----------|-------|
+| **SEN66** | Particulates (PM1–PM10), CO₂, VOC/NOx index, air temp & humidity | I²C @0x6B | SDA | **GPIO16** | shared bus |
+| | | | SCL | **GPIO17** | shared bus |
+| **ADXL345** | Vibration / ground-rumble & tilt (3-axis accel) | I²C @0x53 | SDA / SCL | 16 / 17 | SDO→GND sets 0x53 |
+| | | | INT1 | **GPIO27** | optional motion interrupt |
+| **GY-30 / BH1750** | Ambient light level (lux) | I²C @0x23 | SDA / SCL | 16 / 17 | ADDR→GND sets 0x23 |
+| **BME280** | Barometric pressure (+ backup temp/humidity) | I²C @0x76 | SDA / SCL | 16 / 17 | SDO→GND sets 0x76; shares bus |
+| **SEN0563 HCHO** | Formaldehyde level (analog MEMS) | analog | AOUT | **GPIO32** (ADC1_CH4) | |
+| **Capacitive soil** | Soil moisture (plant/substrate) | analog | AOUT | **GPIO34** (ADC1_CH6) | input-only pin, fine for ADC |
+| **SEN0564 CO** | Carbon-monoxide level (analog MEMS) | analog | AOUT | **GPIO39 / VN** (ADC1_CH3) | input-only pin, fine for ADC |
+| **Battery divider** | Li-ion pack voltage / state-of-charge | analog | Vtap | **GPIO35** (ADC1_CH7) | input-only pin; external divider: BAT+→1M→tap→2M→GND, +0.1µF tap→GND; Vbat=Vpin×1.5 |
+| **INMP441** | Sound-pressure level / noise (digital mic) | I²S | SCK (BCLK) | **GPIO26** | |
+| | | | WS (LRCLK) | **GPIO25** | |
+| | | | SD (DOUT) | **GPIO33** | mic→ESP32 |
+| | | | L/R | **GND** | GND = left channel |
+| Status LED | Sync/status indicator | GPIO | — | **GPIO2** | on-board on many boards |
 
 ### Why these pins (ESP32-D0WDQ6 gotchas)
 - **All three analog sensors are on ADC1 (GPIO32–39).** ADC2 pins cannot be read

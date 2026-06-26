@@ -24,10 +24,12 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <sys/time.h>    // settimeofday() — adopt the server's clock when NTP is unavailable
 
 #include <SensirionI2cSen66.h>
 #include <Adafruit_ADXL345_U.h>
 #include <BH1750.h>
+#include <Adafruit_BME280.h>
 
 #include "secrets.h"     // WIFI_*, SYNC_* (gitignored; see secrets.example.h)
 #include "config.h"
@@ -40,9 +42,10 @@
 static SensirionI2cSen66        sen66;
 static Adafruit_ADXL345_Unified adxl(12345);
 static BH1750                   bh1750(ADDR_BH1750);
+static Adafruit_BME280          bme;
 
 static struct {
-    bool sen66, adxl, bh1750, soil, co, hcho, mic, battery;
+    bool sen66, adxl, bh1750, bme, soil, co, hcho, mic, battery;
 } present;
 
 // ---------------------------------------------------------------------------
@@ -52,6 +55,10 @@ static struct {
 // to the single WIFI_SSID/WIFI_PASSWORD so the file still builds.
 // ---------------------------------------------------------------------------
 static WiFiMulti wifiMulti;
+
+// Random id regenerated every boot. Lets the server group a boot's records and
+// back-fill the ones logged before the clock was known (see adoptServerTime).
+static uint32_t g_bootId = 0;
 struct WifiCred { const char* ssid; const char* pass; };
 #ifdef WIFI_NETWORKS
 static const WifiCred kWifiNetworks[] = WIFI_NETWORKS;
@@ -97,6 +104,21 @@ static void syncTimeIfNeeded() {
     // brief, non-blocking-ish wait; we don't stall the loop for long
     for (int i = 0; i < 20 && !timeIsValid(); ++i) delay(100);
     if (timeIsValid()) Serial.printf("[time] NTP ok: %lu\n", (unsigned long)time(nullptr));
+}
+
+// If our own clock is still unsynced (no NTP reachable), adopt the approximate
+// time the server returns in its /ingest reply. Accurate to ~network latency,
+// which is plenty for record timestamps. NTP, if it ever succeeds, takes over.
+static void adoptServerTime(const String& resp) {
+    if (timeIsValid()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, resp)) return;            // not JSON / parse error
+    uint32_t st = doc["server_time"] | 0;
+    if (st > EPOCH_VALID_AFTER) {
+        struct timeval tv = { .tv_sec = (time_t)st, .tv_usec = 0 };
+        settimeofday(&tv, nullptr);
+        Serial.printf("[time] adopted server time: %lu\n", (unsigned long)st);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,12 +167,19 @@ static void discoverServer() {
 
     int n = MDNS.queryService("airmon", "tcp");        // looks up _airmon._tcp.local.
     if (n > 0) {
-        s_serverHost = MDNS.IP(0).toString();
-        s_serverPort = MDNS.port(0);
-        Serial.printf("[mdns] found server: %s:%u\n", s_serverHost.c_str(), s_serverPort);
-    } else {
-        Serial.println("[mdns] no _airmon server found — using fallback SYNC_HOST");
+        IPAddress ip = MDNS.IP(0);                     // queryService often returns 0.0.0.0...
+        if (ip == IPAddress(0, 0, 0, 0)) {             // ...so resolve the A-record directly.
+            ip = MDNS.queryHost("airmon-server");      // matches server.py ServiceInfo hostname
+        }
+        if (ip != IPAddress(0, 0, 0, 0)) {
+            s_serverHost = ip.toString();
+            s_serverPort = MDNS.port(0);
+            Serial.printf("[mdns] found server: %s:%u\n", s_serverHost.c_str(), s_serverPort);
+            return;
+        }
     }
+    // Keep any previously resolved host; otherwise the static SYNC_HOST fallback is used.
+    Serial.println("[mdns] no usable _airmon record — using fallback SYNC_HOST");
 }
 
 // ---------------------------------------------------------------------------
@@ -200,12 +229,14 @@ static String buildRecord() {
     doc["ts"]      = now;                 // unix epoch (UTC). < EPOCH_VALID_AFTER => clock unsynced
     doc["ts_ok"]   = timeIsValid();       // PC can quarantine records with a bad clock
     doc["dev"]     = DEVICE_ID;
-    doc["up_ms"]   = millis();            // uptime, for power/restart diagnostics
+    doc["up_ms"]   = millis();            // uptime; with boot, lets the PC back-fill ts
+    doc["boot"]    = g_bootId;            // per-boot id for retroactive time correction
 
     // ---- SEN66: PM / CO2 / VOC / NOx / T / RH ----
     if (present.sen66) {
         float pm1, pm25, pm4, pm10, t, rh, voc, nox; uint16_t co2;
-        if (sen66.readMeasuredValues(pm1, pm25, pm4, pm10, t, rh, voc, nox, co2) == 0) {
+        // NB: the SEN66 driver returns humidity *before* temperature.
+        if (sen66.readMeasuredValues(pm1, pm25, pm4, pm10, rh, t, voc, nox, co2) == 0) {
             doc["pm1"]  = pm1;  doc["pm25"] = pm25; doc["pm4"] = pm4; doc["pm10"] = pm10;
             doc["co2"]  = co2;  doc["voc"]  = voc;  doc["nox"] = nox;
             doc["temp"] = t;    doc["rh"]   = rh;
@@ -215,6 +246,13 @@ static String buildRecord() {
     // ---- BH1750: ambient light ----
     if (present.bh1750 && bh1750.measurementReady(true)) {
         doc["lux"] = bh1750.readLightLevel();
+    }
+
+    // ---- BME280: barometric pressure (+ backup temp/humidity) ----
+    if (present.bme) {
+        doc["pressure_hpa"] = bme.readPressure() / 100.0f;   // Pa -> hPa
+        doc["bme_temp"]     = bme.readTemperature();         // °C, secondary to SEN66
+        doc["bme_rh"]       = bme.readHumidity();            // %RH, secondary to SEN66
     }
 
     // ---- ADXL345: ground-rumble level (mic-style) ----
@@ -320,9 +358,11 @@ static bool syncQueue() {
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(8000);
     int code = http.POST(body);
+    String resp = http.getString();
     http.end();
 
     if (code == 200 || code == 201 || code == 204) {
+        adoptServerTime(resp);   // approximate clock from the PC when NTP is unavailable
         cursorWrite(newCursor);
         Serial.printf("[sync] %d records acked (cursor=%u/%u)\n",
                       n, (unsigned)newCursor, (unsigned)fileSize);
@@ -360,6 +400,11 @@ static void initSensors() {
     }
     Serial.printf("  BH1750:  %s\n", present.bh1750 ? "ok" : "absent");
 
+    if (i2cAck(ADDR_BME280) && i2cReadReg(ADDR_BME280, 0xD0) == BME280_CHIPID) {
+        present.bme = bme.begin(ADDR_BME280, &Wire);
+    }
+    Serial.printf("  BME280:  %s\n", present.bme ? "ok" : "absent");
+
     // Analog "presence" = plausible idle voltage (can't truly detect).
     auto plausible = [](int pin) {
         uint32_t mv = readAdcMv(pin);
@@ -391,7 +436,8 @@ void setup() {
 
     Serial.begin(115200);
     delay(300);
-    Serial.println("\n[boot] air-monitor phase 1");
+    g_bootId = esp_random();
+    Serial.printf("\n[boot] air-monitor phase 1 (boot=%lu)\n", (unsigned long)g_bootId);
 
     if (!LittleFS.begin(true)) {        // format on first boot if needed
         Serial.println("[fs] LittleFS mount failed!");
