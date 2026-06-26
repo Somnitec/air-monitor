@@ -100,6 +100,21 @@ static void syncTimeIfNeeded() {
 }
 
 // ---------------------------------------------------------------------------
+// Status LED (GPIO13). Idle = OFF. Blinks once at boot, then pulses briefly
+// each time a sync batch is acknowledged by the server.
+// ---------------------------------------------------------------------------
+static void ledBlink(int n, int on_ms = 80, int off_ms = 80) {
+    for (int i = 0; i < n; ++i) {
+        digitalWrite(PIN_EXT_LED, HIGH); delay(on_ms);
+        digitalWrite(PIN_EXT_LED, LOW);  if (i < n - 1) delay(off_ms);
+    }
+}
+static void ledPulse(int on_ms = 60) {
+    digitalWrite(PIN_EXT_LED, HIGH); delay(on_ms);
+    digitalWrite(PIN_EXT_LED, LOW);
+}
+
+// ---------------------------------------------------------------------------
 // WiFi: connect on demand, used both for NTP and for sync.
 // ---------------------------------------------------------------------------
 static bool wifiConnect() {
@@ -230,7 +245,7 @@ static String buildRecord() {
         doc["soil_pct"] = constrain(pct, 0.0f, 100.0f);
     }
 
-    // ---- Battery (double-unknown pin/ratio — log raw always; V/% only if calibrated) ----
+    // ---- Battery (external 1M/2M divider on GPIO32 — log raw always; V/% only if calibrated) ----
     if (present.battery) {
         uint32_t mv = readAdcMv(PIN_BATTERY_ADC);
         doc["bat_raw_mv"] = mv;                 // always trustworthy
@@ -311,6 +326,7 @@ static bool syncQueue() {
         cursorWrite(newCursor);
         Serial.printf("[sync] %d records acked (cursor=%u/%u)\n",
                       n, (unsigned)newCursor, (unsigned)fileSize);
+        ledPulse();          // visual confirm: values were sent successfully
         return true;
     }
     Serial.printf("[sync] POST failed code=%d (will retry)\n", code);
@@ -401,7 +417,8 @@ void setup() {
     // First WiFi + time sync + server discovery (all non-fatal if they fail).
     if (wifiConnect()) { syncTimeIfNeeded(); discoverServer(); }
 
-    digitalWrite(PIN_EXT_LED, HIGH);    // solid = ready
+    ledBlink(3);                        // boot done — three quick blinks
+    digitalWrite(PIN_EXT_LED, LOW);     // idle: LED off (pulses only on sync)
     Serial.println("[boot] ready — sampling every "
                    + String(SAMPLE_BASELINE_MS / 1000) + " s");
 }
@@ -423,9 +440,6 @@ void loop() {
         String rec = buildRecord();
         queueAppendLine(rec);
         Serial.printf("[rec] %s\n", rec.c_str());
-
-        // brief blink = a record was captured
-        digitalWrite(PIN_EXT_LED, LOW);  delay(20);  digitalWrite(PIN_EXT_LED, HIGH);
     }
 
     // --- drain the sync queue whenever WiFi is up (a few batches per pass) ---

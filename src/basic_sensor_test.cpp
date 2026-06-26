@@ -20,10 +20,10 @@
 #define I2S_SD_PIN          33
 #define I2S_SAMPLE_RATE     44100
 
-#define PIN_HCHO            32   // SEN0563 Fermion MEMS HCHO
+#define PIN_HCHO            35   // SEN0563 Fermion MEMS HCHO (moved 32->35)
 #define PIN_CO              39   // SEN0564 Fermion MEMS CO  (VN)
 #define PIN_SOIL            34   // capacitive soil moisture
-#define PIN_BATTERY         35   // battery sense divider → GPIO35 = ADC1_CH7 (confirmed: 1.8MΩ to GND)
+#define PIN_BATTERY         32   // external divider BAT+→1M→GPIO32→2M→GND (+0.1µF tap→GND)
 
 // External status LED: GPIO13 → 330Ω → LED anode → cathode → GND
 // GPIO12 is MTDI strapping pin (avoid); GPIO13 is safe.
@@ -239,8 +239,8 @@ static void readBattery() {
     // R2=2.5MΩ confirmed. R1 unknown (diode in series, reading was still rising).
     // Calibrate: read raw_mV below, measure Vbat with a multimeter, then:
     //   BAT_FACTOR = Vbat_measured / (raw_mV / 1000.0)
-    // The diode drop and R1 uncertainty are absorbed into BAT_FACTOR empirically.
-    const float BAT_FACTOR = 4.4f;   // <-- replace with your calibrated value
+    // External 1M/2M divider → nominal 1.5; calibrate to absorb resistor tolerances.
+    const float BAT_FACTOR = 1.5f;   // <-- replace with your calibrated value
     float vbat = mv_pin / 1000.0f * BAT_FACTOR;
     float pct  = constrain((vbat - 3.0f) / (4.2f - 3.0f) * 100.0f, 0.0f, 100.0f);
 

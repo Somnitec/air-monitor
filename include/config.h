@@ -70,21 +70,27 @@
 #define PIN_SD_SCK           18
 #define PIN_SD_MISO          19
 #define PIN_SD_MOSI          23
-#define PIN_SD_CS            13   // moved from 5 — GPIO5 is battery sense on this board
+#define PIN_SD_CS            13   // (SD unused in Phase 1; GPIO13 also drives the status LED)
 
 // ---- Analog (ADC1) ----
 // All analog sensors must live on ADC1 (GPIO32-39) so they stay readable
 // while Wi-Fi is active. Use 11 dB attenuation for 0–~3.3 V input range.
 #define PIN_SOIL_ADC         34   // generic capacitive soil moisture (analog out)
 #define PIN_GAS_CO_ADC       39   // DFRobot Fermion MEMS CO  SEN0564 (VN pin)
-#define PIN_GAS_HCHO_ADC     32   // DFRobot Fermion MEMS HCHO SEN0563 (analog out)
-// ---- Battery sense (DOUBLE UNKNOWN — see DESIGN.md) ----
-// We do not yet know (1) which GPIO the board routes the battery divider to, nor
-// (2) the divider ratio. Everything here is therefore configurable + disableable.
-// Worst case: solder your own divider onto a free ADC1 pin and set it below.
+#define PIN_GAS_HCHO_ADC     35   // DFRobot Fermion MEMS HCHO SEN0563 (analog out)
+                                  // moved 32->35: GPIO32 now hosts the battery divider.
+                                  // GPIO35 is input-only — fine for a sensor analog output.
+// ---- Battery sense (EXTERNAL divider — this board has no built-in sense pin) ----
+// External divider (user-built):  BAT+ --[1M]--+--[2M]-- GND ,  +--[0.1uF 104]-- GND
+//                                              |
+//                                            GPIO32 (ADC1_CH4)
+// Ratio = R2/(R1+R2) = 2/3, so Vpin = Vbat*0.667 (4.2V -> 2.8V, within ADC range).
+// Reconstruct Vbat = Vpin * (R1+R2)/R2 = Vpin * 1.5  => BAT_DIVIDER_FACTOR = 1.5.
+// The 0.1uF cap is REQUIRED: the ~0.67M source impedance is far above what the
+// ADC sample-hold likes; the cap is its charge reservoir (RC ~ 67ms, also filters).
 #define BATTERY_ENABLED         1     // 0 = skip battery entirely (logs nothing)
-#define PIN_BATTERY_ADC        35     // best current guess; ADC1_CH7, input-only
-#define BAT_DIVIDER_FACTOR    4.4f    // empirical — Vbat_true / (analogReadMilliVolts(pin)/1000)
+#define PIN_BATTERY_ADC        32     // external 1M/2M divider tap (ADC1_CH4)
+#define BAT_DIVIDER_FACTOR    1.5f    // nominal for 1M/2M; calibrate: Vbat_true / (mV/1000)
 #define BAT_CALIBRATED          0     // 1 once you've verified factor with a multimeter.
                                       // While 0: raw mV is logged; V/% are flagged uncalibrated.
 #define BAT_FULL_V            4.2f

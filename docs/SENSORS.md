@@ -23,10 +23,10 @@ see the per-sensor notes).
 | **ADXL345** | I²C @0x53 | SDA / SCL | 16 / 17 | SDO→GND sets 0x53 |
 | | | INT1 | **GPIO27** | optional motion interrupt |
 | **GY-30 / BH1750** | I²C @0x23 | SDA / SCL | 16 / 17 | ADDR→GND sets 0x23 |
-| **SEN0563 HCHO** | analog | AOUT | **GPIO32** (ADC1_CH4) | |
+| **SEN0563 HCHO** | analog | AOUT | **GPIO35** (ADC1_CH7) | input-only pin, fine for ADC; moved 32→35 |
 | **Capacitive soil** | analog | AOUT | **GPIO34** (ADC1_CH6) | input-only pin, fine for ADC |
 | **SEN0564 CO** | analog | AOUT | **GPIO39 / VN** (ADC1_CH3) | input-only pin, fine for ADC |
-| **Battery divider** | analog | Vtap | **GPIO35** (ADC1_CH7) | input-only pin; R2=2.5 MΩ to GND |
+| **Battery divider** | analog | Vtap | **GPIO32** (ADC1_CH4) | external divider: BAT+→1M→tap→2M→GND, +0.1µF tap→GND; Vbat=Vpin×1.5 |
 | **INMP441** | I²S | SCK (BCLK) | **GPIO26** | |
 | | | WS (LRCLK) | **GPIO25** | |
 | | | SD (DOUT) | **GPIO33** | mic→ESP32 |
@@ -177,7 +177,7 @@ this internally. Power board from 3V3; AOUT stays in the ADC range.
 
 ## SEN0563 — Fermion MEMS **HCHO / formaldehyde** (DFRobot, SMD1001 element)
 Datasheet: [`datasheets/SEN0563_HCHO_datasheet.pdf`](datasheets/SEN0563_HCHO_datasheet.pdf) ·
-analog, 3.3–5 V supply, **AOUT → GPIO32**, range **0–3 ppm**.
+analog, 3.3–5 V supply, **AOUT → GPIO35** (moved from GPIO32, now the battery tap), range **0–3 ppm**.
 
 Same MEMS MOS architecture as the CO sensor (Suzhou Huiwen Nanotech SMD1001 chip).
 Key differences:
@@ -213,7 +213,7 @@ Use the SEN66 VOC Index for a better VOC picture; use this for relative HCHO tre
 ---
 
 ## Capacitive soil moisture sensor (generic analog)
-No chip datasheet — these are unbranded capacitive probes. **AOUT → GPIO32**, 3V3.
+No chip datasheet — these are unbranded capacitive probes. **AOUT → GPIO34**, 3V3.
 
 - **Capacitive, not resistive:** measures the dielectric change of soil. Output is an
   analog voltage that **falls as moisture rises** (more water → higher capacitance →

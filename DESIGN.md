@@ -43,11 +43,11 @@
 | **RAM (SRAM)** | 520 KB | Shared program + data |
 | **Flash** | 4 MB | Code + small data structures |
 | **PSRAM** | None | No external PSRAM on this variant |
-| **Power** | Li-ion/Li-Po battery with onboard charge circuit | Connected to GPIO35 (ADC1_CH7) via divider (R2=2.5MΩ, R1=TBD) |
+| **Power** | Li-ion/Li-Po battery with onboard charge circuit | No built-in sense pin; **external divider** BAT+→1MΩ→GPIO32→2MΩ→GND with 0.1µF tap→GND. Vbat = Vpin × 1.5 |
 | **WiFi** | Yes (802.11 b/g/n, 2.4 GHz) | Active syncs only; off for low power |
 | **Bluetooth** | Yes (BLE 5.0) | Alternative to WiFi; TBD which is primary |
 | **I2C Pins** | SDA=GPIO16, SCL=GPIO17 | Shared bus for 3 sensors |
-| **ADC1 Pins** | GPIO32 (HCHO), GPIO34 (soil), GPIO35 (battery), GPIO39 (CO) | WiFi-safe (ADC2 not usable with WiFi) |
+| **ADC1 Pins** | GPIO32 (battery), GPIO34 (soil), GPIO35 (HCHO), GPIO39 (CO) | WiFi-safe (ADC2 not usable with WiFi) |
 | **I2S Pins** | GPIO26 (SCK), GPIO25 (WS), GPIO33 (SD) | Microphone input |
 
 ### Sensors (10 total)
@@ -58,9 +58,9 @@
 | **ADXL345** (3-axis accelerometer) | I²C 0x53 | 1 | ±4 g (configurable), ~3.9 mg/LSB | **Ground-rumble analysis (mic-style):** capture a short burst of samples, remove gravity (DC), report AC-magnitude RMS + peak as a "rumble level" — coarser than the mic FFT but the accelerometer analogue of it. Optional activity interrupt (INT1/GPIO27 unused currently) |
 | **BH1750** (ambient light) | I²C 0x23 | 1 | 0–65536 lux | 1 lx resolution in HIGH_RES mode; ~120 ms per read |
 | **SEN0564** (CO) | ADC GPIO39 (VN) | 1 | Raw mV 0–3300; Rs/R0 ratio qualitative | MEMS MOS; qualitative trend only; R0≈41.9 kΩ (clean air baseline) |
-| **SEN0563** (HCHO/formaldehyde) | ADC GPIO32 | 1 | Raw mV 0–3300; Rs/R0 ratio; range 0–3 ppm qualitative | MEMS MOS; R0≈142.8 kΩ; cross-sensitive to other VOCs |
+| **SEN0563** (HCHO/formaldehyde) | ADC GPIO35 | 1 | Raw mV 0–3300; Rs/R0 ratio; range 0–3 ppm qualitative | MEMS MOS; R0≈142.8 kΩ; cross-sensitive to other VOCs |
 | **Capacitive soil moisture** | ADC GPIO34 | 1 | Raw mV (map via calibration); 0–100 % | Supply-sensitive; calibrated per unit (dry=2600 mV, wet=1200 mV empirically) |
-| **Battery sense** | ADC (pin TBD) | 1 | Raw mV 0–3300; maps to 3.0–4.2 V (empirical BAT_FACTOR=4.4) | **DOUBLE UNKNOWN:** (1) *which GPIO* the board routes the battery divider to is not confirmed, and (2) the divider ratio/R1 is unknown. Firmware treats battery as **fully configurable + disableable**: `BATTERY_ENABLED`, `BATTERY_ADC_PIN`, `BATTERY_DIVIDER_FACTOR`. Worst case the user adds an external divider on a known ADC1 pin. Until calibrated, raw mV is logged and the derived V/% are flagged uncalibrated. |
+| **Battery sense** | ADC GPIO32 | 1 | Raw mV 0–3300; Vbat = Vpin × 1.5 → 3.0–4.2 V | This board has **no built-in battery-sense pin**, so we use an **external divider**: BAT+→1MΩ→GPIO32→2MΩ→GND, with a 0.1µF cap (tap→GND) as the ADC charge reservoir (the ~0.67MΩ source impedance needs it). Ratio 2/3 → 4.2V reads 2.8V. Firmware stays configurable/disableable (`BATTERY_ENABLED`, `PIN_BATTERY_ADC`, `BAT_DIVIDER_FACTOR`, `BAT_CALIBRATED`). Until calibrated against a multimeter, raw mV is logged and V/% are flagged uncalibrated. |
 | **INMP441** (I²S microphone) | I²S | 1 | 24-bit samples @ 44100 Hz; dBFS → SPL | Sensitivity −26 dBFS @ 94 dB SPL; noise floor ~33 dB(A); AOP 116 dB SPL |
 | **Status LED** | GPIO13 | 1 | On-board indicator | For boot/connectivity feedback |
 
@@ -329,7 +329,7 @@ Chosen for portability across the user's machines (**macOS dev, Fedora laptop, W
 
 | Item | Impact | Status | Owner |
 |------|--------|--------|-------|
-| **Battery pin (GPIO35) calibration** | Without this, battery % is meaningless | Awaiting vendor email | Arvid |
+| **Battery divider calibration (GPIO32)** | Without it, battery % is off (1M/2M tolerances) | External divider built; measure Vbat vs raw mV, set `BAT_DIVIDER_FACTOR` (~1.5), then `BAT_CALIBRATED=1` | Arvid |
 | **Power consumption model** | Affects battery life; shapes sync frequency | TBD; needs measurement | Dev |
 | **WiFi range / signal strength** | Determines if WiFi is viable for 10 m + insulation | TBD; site survey | Arvid |
 | **EEPROM/flash wear** | Frequent writes to flash may degrade it | TBD; research SPIFFS lifetime | Dev |
