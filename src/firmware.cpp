@@ -18,6 +18,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -42,6 +43,21 @@ static BH1750                   bh1750(ADDR_BH1750);
 static struct {
     bool sen66, adxl, bh1750, soil, co, hcho, mic, battery;
 } present;
+
+// ---------------------------------------------------------------------------
+// Known WiFi networks. WiFiMulti scans on connect and joins the strongest one
+// that's in range, so the station roams between locations without reflashing.
+// The list comes from secrets.h (WIFI_NETWORKS); if that's missing we fall back
+// to the single WIFI_SSID/WIFI_PASSWORD so the file still builds.
+// ---------------------------------------------------------------------------
+static WiFiMulti wifiMulti;
+struct WifiCred { const char* ssid; const char* pass; };
+#ifdef WIFI_NETWORKS
+static const WifiCred kWifiNetworks[] = WIFI_NETWORKS;
+#else
+static const WifiCred kWifiNetworks[] = { { WIFI_SSID, WIFI_PASSWORD } };
+#endif
+static const size_t kWifiCount = sizeof(kWifiNetworks) / sizeof(kWifiNetworks[0]);
 
 // ---------------------------------------------------------------------------
 // Small helpers (shared with the test sketches' approach)
@@ -87,15 +103,12 @@ static void syncTimeIfNeeded() {
 // ---------------------------------------------------------------------------
 static bool wifiConnect() {
     if (WiFi.status() == WL_CONNECTED) return true;
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
-        delay(200);
-    }
+    // wifiMulti.run() scans and connects to the strongest known network in range.
+    wifiMulti.run(WIFI_CONNECT_TIMEOUT_MS);
     bool ok = (WiFi.status() == WL_CONNECTED);
-    if (ok) Serial.printf("[wifi] connected: %s\n", WiFi.localIP().toString().c_str());
-    else    Serial.println("[wifi] connect failed (will retry next cycle)");
+    if (ok) Serial.printf("[wifi] connected: %s (%s, %d dBm)\n",
+                          WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    else    Serial.println("[wifi] no known network in range (will retry next cycle)");
     return ok;
 }
 
@@ -345,6 +358,12 @@ void setup() {
 #endif
 
     initSensors();
+
+    // Register every known network with WiFiMulti.
+    WiFi.mode(WIFI_STA);
+    for (size_t i = 0; i < kWifiCount; ++i)
+        wifiMulti.addAP(kWifiNetworks[i].ssid, kWifiNetworks[i].pass);
+    Serial.printf("[wifi] %u known network(s) registered\n", (unsigned)kWifiCount);
 
     // First WiFi + time sync attempt (non-fatal if it fails).
     if (wifiConnect()) syncTimeIfNeeded();
