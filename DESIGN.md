@@ -10,7 +10,7 @@
 
 ## TO DO
 
-- fifo in firmware, maybe optimize so that we can be reading values for longer (now only 2 days of reading without being read out it seems)
+- ~~fifo in firmware~~ → DONE: binary FIFO ring (~12 days, drop-oldest), duty-cycled 15-min sync (WiFi off between), dashboard-controlled testing mode + mode badge. See docs/superpowers/specs/2026-06-26-firmware-fifo-ring-buffer-design.md. Still needs on-hardware flash + field verification.
 - weather-station feature (Open-Meteo + WU PWS) 
 - always-on collector app on android and dashboard there (then export for more advanced data analysis on a pc)
 
