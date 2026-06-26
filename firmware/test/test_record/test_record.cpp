@@ -1,6 +1,7 @@
 #include <unity.h>
 #include <math.h>
 #include "record.h"
+#include "config.h"   // DEVICE_ID, GAS_CO_RL_OHMS, GAS_VCC_MV for the to_json checks
 
 void setUp() {}
 void tearDown() {}
@@ -61,11 +62,42 @@ void test_quantization_clamps_high_values() {
     TEST_ASSERT_EQUAL_UINT16(65535, r.pm25);                // clamped, no wrap
 }
 
+#include <ArduinoJson.h>
+
+void test_to_json_has_expected_keys_and_derived() {
+    RecordFields in = sample();
+    Record r = record_pack(in);
+    JsonDocument doc;
+    record_to_json(r, doc);
+
+    TEST_ASSERT_TRUE(doc["ts"].is<uint32_t>());
+    TEST_ASSERT_EQUAL_STRING(DEVICE_ID, doc["dev"]);
+    TEST_ASSERT_TRUE(doc["co_rs"].is<float>());          // derived from co_mv
+    TEST_ASSERT_TRUE(doc["soil_pct"].is<float>());       // derived from soil_mv
+    TEST_ASSERT_TRUE(doc["bat_v"].is<float>());          // derived (bat_cal=true)
+    TEST_ASSERT_TRUE(doc["noise_bands"].is<JsonArray>());
+    TEST_ASSERT_EQUAL_UINT(REC_NBANDS, doc["noise_bands"].as<JsonArray>().size());
+
+    // co_rs must equal RL*(Vcc-v)/v with v=410mV, RL=GAS_CO_RL_OHMS
+    float expect = GAS_CO_RL_OHMS * (GAS_VCC_MV - 410.0f) / 410.0f;
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, expect, doc["co_rs"].as<float>());
+}
+
+void test_to_json_omits_absent_sensor_keys() {
+    RecordFields in; in.seq = 1; in.ts = 1719400000;   // no sensors present
+    Record r = record_pack(in);
+    JsonDocument doc; record_to_json(r, doc);
+    TEST_ASSERT_FALSE(doc["pm25"].is<float>());
+    TEST_ASSERT_FALSE(doc["noise_bands"].is<JsonArray>());
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_size_is_71);
     RUN_TEST(test_roundtrip_preserves_within_quantization);
     RUN_TEST(test_absent_sensors_clear_present_bits);
     RUN_TEST(test_quantization_clamps_high_values);
+    RUN_TEST(test_to_json_has_expected_keys_and_derived);
+    RUN_TEST(test_to_json_omits_absent_sensor_keys);
     return UNITY_END();
 }
