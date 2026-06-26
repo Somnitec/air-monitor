@@ -39,6 +39,10 @@ from weather import config as weather_config
 from weather import scheduler as weather_scheduler
 from weather import store as weather_store
 
+from aircraft import config as aircraft_config
+from aircraft import scheduler as aircraft_scheduler
+from aircraft import store as aircraft_store
+
 # --------------------------------------------------------------------------- #
 # Storage
 # --------------------------------------------------------------------------- #
@@ -84,7 +88,8 @@ def _init_db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE readings ADD COLUMN ts_status TEXT DEFAULT 'ok'")
         conn.execute("UPDATE readings SET ts_status='provisional' WHERE ts_ok=0")
     conn.commit()
-    weather_store.init_weather_table(conn)   # external weather/air-quality series
+    weather_store.init_weather_table(conn)    # external weather/air-quality series
+    aircraft_store.init_aircraft_table(conn)  # ADS-B sightings (logged, throttled)
     return conn
 
 
@@ -168,6 +173,25 @@ hub = Hub()
 
 
 # --------------------------------------------------------------------------- #
+# Per-device live state + a one-shot command the dashboard can queue for a
+# device. The device reports its mode/buffered count on every /ingest; we return
+# any pending command in the reply and clear it once the device echoes the mode.
+# --------------------------------------------------------------------------- #
+DEVICE_STATE: dict[str, dict] = {}     # dev -> {mode,last_seen,buffered,boot,fw}
+PENDING_CMD: dict[str, str] = {}       # dev -> "testing" | "normal"
+
+
+def _update_device(dev: str, mode: str, buffered, boot, fw) -> None:
+    DEVICE_STATE[dev] = {
+        "dev": dev, "mode": mode, "buffered": buffered,
+        "boot": boot, "fw": fw, "last_seen": int(time.time()),
+    }
+    # Clear a pending command once the device reports the target mode.
+    if PENDING_CMD.get(dev) == mode:
+        PENDING_CMD.pop(dev, None)
+
+
+# --------------------------------------------------------------------------- #
 # mDNS / zeroconf advertisement — lets the ESP32 find us by service name on
 # whatever network we're on, instead of a hardcoded IP. Degrades gracefully if
 # the zeroconf package isn't installed.
@@ -226,6 +250,18 @@ async def _broadcast_weather(observations) -> None:
         }})
 
 
+# Aircraft: the current in-range snapshot (live only), refreshed by the poll loop.
+_aircraft_snapshot: list = []
+
+
+async def _on_aircraft_snapshot(records) -> None:
+    """Cache the latest snapshot for /api/aircraft and push it to dashboards."""
+    global _aircraft_snapshot
+    _aircraft_snapshot = records
+    await hub.broadcast({"type": "aircraft", "ts": int(time.time()),
+                         "data": [a.as_dict() for a in records]})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _conn
@@ -247,12 +283,28 @@ async def lifespan(app: FastAPI):
             poll_sec=wsettings["poll_sec"], on_stored=_broadcast_weather,
         ))
 
+    # Aircraft (ADS-B via readsb): its own background poll loop.
+    asettings = aircraft_config.settings()
+    aircraft_task = None
+    if asettings["enabled"]:
+        aircraft_task = asyncio.create_task(aircraft_scheduler.run_loop(
+            _conn, _db_lock, settings=asettings, on_snapshot=_on_aircraft_snapshot,
+        ))
+        print(f"[aircraft] polling {asettings['json_url'] or asettings['json_path']} "
+              f"every {asettings['poll_sec']}s; home=({asettings['lat']},{asettings['lon']})")
+
     yield
 
     if weather_task is not None:
         weather_task.cancel()
         try:
             await weather_task
+        except asyncio.CancelledError:
+            pass
+    if aircraft_task is not None:
+        aircraft_task.cancel()
+        try:
+            await aircraft_task
         except asyncio.CancelledError:
             pass
     if aiozc is not None:
@@ -279,9 +331,18 @@ def _flatten(row: sqlite3.Row) -> dict:
 # ---- ingest ---------------------------------------------------------------- #
 @app.post("/ingest")
 async def ingest(request: Request):
-    """Accept a single record object or a JSON array of records from the ESP32."""
+    """Accept an envelope {dev,mode,buffered,boot,fw,records:[...]} or, for
+    backward compatibility, a bare record dict or a list of records."""
     body = await request.json()
-    records = body if isinstance(body, list) else [body]
+
+    if isinstance(body, dict) and "records" in body:
+        records = body["records"]
+        dev = body.get("dev")
+        mode = body.get("mode", "normal")
+        if dev:
+            _update_device(dev, mode, body.get("buffered"), body.get("boot"), body.get("fw"))
+    else:
+        records = body if isinstance(body, list) else [body]
 
     stored = []
     corrected = 0
@@ -305,10 +366,18 @@ async def ingest(request: Request):
     for rec in stored:
         await hub.broadcast({"type": "reading", "data": rec})
 
+    # Tell dashboards about the device's current state.
+    dev = body.get("dev") if isinstance(body, dict) else None
+    if dev and dev in DEVICE_STATE:
+        await hub.broadcast({"type": "device", "data": DEVICE_STATE[dev]})
+
     # Hand back our wall-clock epoch so an ESP32 whose NTP never succeeded can
     # adopt an approximate time (good to ~network-latency, fine for timestamps).
-    return {"ok": True, "received": len(records), "stored": len(stored),
+    resp = {"ok": True, "received": len(records), "stored": len(stored),
             "server_time": int(time.time())}
+    if dev and dev in PENDING_CMD:
+        resp["command"] = {"set_mode": PENDING_CMD[dev]}
+    return resp
 
 
 # ---- query ----------------------------------------------------------------- #
@@ -373,6 +442,33 @@ async def stats():
     return {"readings": row["n"], "first_ts": row["lo"], "last_ts": row["hi"], "events": nev}
 
 
+# ---- device mode (testing) control --------------------------------------- #
+@app.get("/api/devices")
+async def get_devices():
+    """Current per-device state, with any pending command attached."""
+    out = []
+    for dev, st in DEVICE_STATE.items():
+        d = dict(st)
+        d["pending"] = PENDING_CMD.get(dev)
+        out.append(d)
+    return JSONResponse(out)
+
+
+@app.post("/api/device/{dev}/mode")
+async def set_device_mode(dev: str, request: Request):
+    """Queue a mode switch for a device. Applied next time it contacts /ingest
+    (immediately while it's online in the boot window or in testing mode)."""
+    body = await request.json()
+    mode = body.get("mode")
+    if mode not in ("testing", "normal"):
+        return JSONResponse({"error": "mode must be 'testing' or 'normal'"}, status_code=400)
+    PENDING_CMD[dev] = mode
+    if dev in DEVICE_STATE:
+        DEVICE_STATE[dev]["pending"] = mode
+        await hub.broadcast({"type": "device", "data": {**DEVICE_STATE[dev], "pending": mode}})
+    return {"ok": True, "dev": dev, "pending": mode}
+
+
 # ---- weather / air quality ------------------------------------------------- #
 @app.get("/api/weather")
 async def get_weather(
@@ -415,6 +511,24 @@ async def weather_metrics():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 keys.add(k)
     return [{"name": k, "unit": weather_config.UNITS.get(k, "")} for k in sorted(keys)]
+
+
+# ---- aircraft (ADS-B) ------------------------------------------------------ #
+@app.get("/api/config")
+async def get_config():
+    """Static-ish config the dashboard needs (home location for the map, etc.)."""
+    s = aircraft_config.settings()
+    return {"home": [s["lat"], s["lon"]], "aircraft_enabled": s["enabled"],
+            "max_range_km": s["max_range_km"]}
+
+
+@app.get("/api/aircraft")
+async def get_aircraft(range_km: float | None = None):
+    """Current in-range aircraft snapshot, nearest first. `range_km` optional."""
+    records = _aircraft_snapshot
+    if range_km is not None:
+        records = [a for a in records if a.distance_km <= range_km]
+    return JSONResponse([a.as_dict() for a in records])
 
 
 # ---- events (home mode) ---------------------------------------------------- #
