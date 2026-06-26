@@ -140,15 +140,53 @@ secrets are present in `.env`:
 | Netatmo | OAuth | community PWS pressure/temp/RH/wind |
 | Weather Underground | API key | community PWS observations |
 
-Configure via `server/.env` (copy from `.env.example`):
+The four keyless sources work out of the box — nothing to configure.
 
-```bash
-cp .env.example .env      # fill in any keyed sources you've collected
-```
+### Adding the keyed sources (KNMI / Netatmo / WU)
 
-> The keyed providers (KNMI / Netatmo / WU) are parsed to each API's documented JSON
-> shape and unit-tested, but have **not** been smoke-tested against a live key yet —
-> verify once you've added credentials.
+These three need credentials. They stay **dormant** until their vars are set, so the
+server runs fine without them; add whichever you've collected.
+
+1. **Get the keys:**
+   - **KNMI** — a free Open Data API key from <https://developer.dataplatform.knmi.nl>
+     (just a token, not OAuth). → `KNMI_API_KEY`
+   - **Netatmo** — create an app at <https://dev.netatmo.com> (scope `read_station`),
+     then do the one-time OAuth to mint a refresh token. → `NETATMO_CLIENT_ID`,
+     `NETATMO_CLIENT_SECRET`, `NETATMO_REFRESH_TOKEN`
+   - **Weather Underground** — an API key + a station id to query.
+     → `WU_API_KEY`, `WU_STATION_ID`. ⚠️ WU's free PWS key generally requires you to
+     *operate* a PWS that uploads data; if you don't, this one may be unobtainable.
+
+2. **Put them in `server/.env`** (gitignored — copy the template):
+
+   ```bash
+   cp .env.example .env      # then fill in the keyed sources you have
+   ```
+
+3. **Smoke-test them live** (hits each configured provider, writes nothing to the DB):
+
+   ```bash
+   python verify_weather_keys.py
+   ```
+
+   Result legend: `✓` working (prints a sample row) · `⚠` connected but 0 obs
+   (usually a wrong station id or too-tight `WEATHER_RADIUS_KM`) · `✗` error (prints
+   it) · `•` not configured. Once a provider shows `✓`, the running server picks it up
+   on its next poll — no restart needed beyond reloading `.env`.
+
+**Likely snags per provider** (these parsers are unit-tested against each API's
+documented shape but had no live key when written, so confirm with the smoke test):
+
+- **KNMI** — the unverified part is its EDR collection slug + parameter codes. A `✗`
+  404 or empty `ranges` means the collection name or `_CODE_MAP` in
+  [`weather/knmi.py`](weather/knmi.py) needs adjusting to what your key actually returns.
+- **Netatmo** — the refresh token rotates on each use; the provider keeps the rotated
+  one in memory for the process. The first OAuth mint is the fiddly step.
+- **WU** — a `•`/`✗` here is often the PWS-ownership requirement above, not a bug.
+
+If the smoke test prints a `✗`/`⚠`, paste the output to whoever's maintaining the
+weather code (or open an issue) — fixing a parser is a few-line change against the
+real response.
 
 Design rationale lives in
 [`docs/superpowers/specs/2026-06-26-weather-integration-design.md`](../docs/superpowers/specs/2026-06-26-weather-integration-design.md).
