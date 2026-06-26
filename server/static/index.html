@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Air Monitor</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   /* Tuned for the LattePanda's small touch screen: large tap targets (>=44px),
      a slide-in controls drawer so charts get the full width, and big fonts. */
@@ -91,6 +93,31 @@
   }
   /* on wide screens the menu button is unnecessary */
   @media (min-width: 821px) { #menu { display:none; } .backdrop { display:none !important; } }
+
+  /* --- aircraft panel (live map + table) --- */
+  .acpanel { background:var(--panel); border:1px solid var(--line); border-radius:12px; margin:14px 14px 0; overflow:hidden; }
+  .acpanel.collapsed .acbody { display:none; }
+  .achead { display:flex; align-items:center; gap:10px; padding:11px 14px; cursor:pointer; }
+  .achead h2 { font-size:14px; margin:0; font-weight:600; }
+  .achead .account { color:var(--accent); font-size:13px; font-weight:600; }
+  .achead .acrange { color:var(--mut); font-size:12px; }
+  .achead .acchev { margin-left:auto; color:var(--mut); transition:transform .2s; }
+  .acpanel.collapsed .acchev { transform:rotate(-90deg); }
+  .acbody { display:flex; flex-wrap:wrap; }
+  #acmap { height:360px; flex:2 1 360px; min-width:260px; background:#0e1117; }
+  .actablewrap { flex:1 1 300px; max-height:360px; overflow:auto; border-left:1px solid var(--line); -webkit-overflow-scrolling:touch; }
+  .actable { width:100%; border-collapse:collapse; font-size:13px; }
+  .actable th, .actable td { padding:7px 9px; text-align:left; white-space:nowrap; border-bottom:1px solid var(--line); }
+  .actable th { position:sticky; top:0; background:#1b1f28; color:var(--mut); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .actable tbody tr:hover { background:#1b1f28; }
+  .actable .up { color:#2ecc71; } .actable .down { color:#ff8c69; } .actable .lvl { color:var(--mut); }
+  /* leaflet dark tweaks + plane marker */
+  .leaflet-container { background:#0e1117; font:inherit; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background:#171a21; color:var(--fg); }
+  .leaflet-bar a { background:#222633; color:var(--fg); border-color:var(--line); }
+  .planeicon { font-size:17px; line-height:17px; filter:drop-shadow(0 0 2px #000); }
+  @media (max-width: 820px) { .acpanel { margin:10px 10px 0; } #acmap { flex-basis:100%; height:300px; }
+    .actablewrap { border-left:none; border-top:1px solid var(--line); } }
 </style>
 </head>
 <body>
@@ -106,6 +133,24 @@
 
 <div class="backdrop" id="backdrop"></div>
 <div id="batwarn">🔋 Battery low</div>
+
+<div id="aircraftPanel" class="acpanel">
+  <div class="achead" id="acHead">
+    <h2>✈ Aircraft</h2>
+    <span class="account" id="acCount">—</span>
+    <span class="acrange" id="acRangeLbl"></span>
+    <span class="acchev">▾</span>
+  </div>
+  <div class="acbody">
+    <div id="acmap"></div>
+    <div class="actablewrap">
+      <table class="actable">
+        <thead><tr><th>Flight</th><th>Type</th><th>Alt</th><th>Spd</th><th>Dist</th><th>Brg</th><th></th></tr></thead>
+        <tbody id="acRows"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
 
 <div class="wrap">
   <div class="controls" id="drawer">
@@ -128,6 +173,12 @@
         <button id="refresh">Query</button>
         <button class="sec" id="livebtn">Live: on</button>
       </div>
+    </section>
+
+    <section>
+      <h2>✈ Aircraft range</h2>
+      <label>Show planes within <span id="acRangeVal">40</span> km</label>
+      <input type="range" id="acRange" min="5" max="250" step="5" value="40" class="slider" />
     </section>
 
     <section>
@@ -327,6 +378,7 @@ function connectWS() {
   ws.onclose = () => { $('#livedot').classList.remove('live'); $('#livetxt').textContent = 'reconnecting…'; setTimeout(connectWS, 2000); };
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
+    if (msg.type === 'aircraft') { updateAircraft(msg.data); return; }   // live view, independent of the Live toggle
     if (!live) return;
     if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); checkBattery(); loadStats(); }
     if (msg.type === 'device')  { deviceState = msg.data; renderDevice(); }
@@ -500,12 +552,83 @@ $('#testBtn').onclick = async () => {
   deviceState.pending = target; renderDevice();
 };
 
+// ---- aircraft (ADS-B live map + table) ------------------------------------
+let acMap, acRing, acIcons = {}, acData = [], acHome = null;
+let acRange = parseInt(localStorage.getItem('acRange')) || 40;
+
+async function initAircraft() {
+  let cfg = {};
+  try { cfg = await (await fetch('/api/config')).json(); } catch (_) {}
+  acHome = (cfg && cfg.home) || [52.179722, 5.284722];
+
+  acMap = L.map('acmap', { zoomControl:true }).setView(acHome, 9);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    maxZoom:18, attribution:'&copy; OpenStreetMap, &copy; CARTO',
+  }).addTo(acMap);
+  L.circleMarker(acHome, { radius:5, color:'#4ea1ff', fillColor:'#4ea1ff', fillOpacity:1 })
+    .addTo(acMap).bindPopup('Home');
+  acRing = L.circle(acHome, { radius: acRange*1000, color:'#4ea1ff', weight:1, fill:false, dashArray:'4 4' }).addTo(acMap);
+
+  const sl = $('#acRange'); sl.value = acRange; $('#acRangeVal').textContent = acRange;
+  sl.addEventListener('input',  () => { $('#acRangeVal').textContent = sl.value; });
+  sl.addEventListener('change', () => setAcRange(parseInt(sl.value)));
+  $('#acHead').onclick = () => $('#aircraftPanel').classList.toggle('collapsed');
+
+  try { updateAircraft(await (await fetch('/api/aircraft')).json()); } catch (_) {}
+  setTimeout(() => acMap && acMap.invalidateSize(), 250);   // map needs a layout pass
+}
+
+function setAcRange(km) {
+  acRange = km; localStorage.setItem('acRange', km);
+  $('#acRangeVal').textContent = km; if (acRing) acRing.setRadius(km*1000);
+  renderAircraft();
+}
+
+function updateAircraft(list) { acData = Array.isArray(list) ? list : []; renderAircraft(); }
+
+function planeIcon(track) {
+  return L.divIcon({ className:'', iconSize:[20,20], iconAnchor:[10,10],
+    html:`<div class="planeicon" style="transform:rotate(${track || 0}deg)">✈️</div>` });
+}
+
+function renderAircraft() {
+  if (!acMap) return;
+  const inRange = acData.filter(a => a.distance_km != null && a.distance_km <= acRange);
+  $('#acCount').textContent = `${inRange.length} in range`;
+  $('#acRangeLbl').textContent = `· ≤ ${acRange} km`;
+
+  const seen = new Set();
+  inRange.forEach(a => {
+    if (a.lat == null || a.lon == null) return;
+    seen.add(a.hex);
+    const ll = [a.lat, a.lon];
+    if (acIcons[a.hex]) acIcons[a.hex].setLatLng(ll).setIcon(planeIcon(a.track));
+    else acIcons[a.hex] = L.marker(ll, { icon: planeIcon(a.track) }).addTo(acMap);
+    acIcons[a.hex].bindPopup(
+      `<b>${a.flight || a.hex}</b>${a.type ? ' · ' + a.type : ''}<br>`
+      + `${a.alt_baro != null ? a.alt_baro + ' ft' : '—'} · ${a.gs != null ? Math.round(a.gs) + ' kt' : '—'}<br>`
+      + `${a.distance_km} km · ${Math.round(a.bearing_deg)}°`);
+  });
+  Object.keys(acIcons).forEach(h => { if (!seen.has(h)) { acMap.removeLayer(acIcons[h]); delete acIcons[h]; } });
+
+  $('#acRows').innerHTML = inRange.map(a => {
+    const vr = a.baro_rate || 0;
+    const ar = vr > 64 ? '<span class="up">▲</span>' : vr < -64 ? '<span class="down">▼</span>' : '<span class="lvl">–</span>';
+    return `<tr><td>${a.flight || a.hex}</td><td>${a.type || ''}</td>`
+      + `<td>${a.alt_baro != null ? a.alt_baro : '—'}</td>`
+      + `<td>${a.gs != null ? Math.round(a.gs) : '—'}</td>`
+      + `<td>${a.distance_km != null ? a.distance_km.toFixed(1) : '—'}</td>`
+      + `<td>${a.bearing_deg != null ? Math.round(a.bearing_deg) : '—'}</td><td>${ar}</td></tr>`;
+  }).join('') || `<tr><td colspan="7" style="color:var(--mut);padding:14px">No aircraft in range (is readsb running?)</td></tr>`;
+}
+
 (async function init(){
   renderToggles();
   await loadMetrics();
   await query();
   await loadDevices();
   setInterval(loadDevices, 30000);   // re-poll device state (also drives offline detection)
+  await initAircraft();
   connectWS();
   keepAwake();
   // refresh the metric list occasionally in case new fields appear

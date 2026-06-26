@@ -11,6 +11,7 @@
 ## TO DO
 
 - ~~fifo in firmware~~ → DONE: binary FIFO ring (~12 days, drop-oldest), duty-cycled 15-min sync (WiFi off between), dashboard-controlled testing mode + mode badge. See docs/superpowers/specs/2026-06-26-firmware-fifo-ring-buffer-design.md. Still needs on-hardware flash + field verification.
+- ~~aircraft live panel (Mode 2, first slice)~~ → DONE: server polls readsb `aircraft.json`, locates planes vs home (range + bearing), live Leaflet map + table on the dashboard with a range slider, throttled logging to an `aircraft` table. server/geo.py + server/aircraft/ + tests (28 green, browser-verified vs fixture). Spec: docs/superpowers/specs/2026-06-26-live-aircraft-panel-design.md. **Pending:** run readsb against the RTL-SDR V4 (see DEVELOPING.md / spec); ADS-B↔sensor correlation (overhead → noise/PM/NOx) is the next increment.
 - weather-station feature (Open-Meteo + WU PWS) 
 - always-on collector app on android and dashboard there (then export for more advanced data analysis on a pc)
 
