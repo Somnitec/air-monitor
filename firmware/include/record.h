@@ -1,0 +1,95 @@
+#pragma once
+// Dense binary record for the on-device FIFO ring. ~71 bytes vs ~400 bytes of
+// JSON. Stored verbatim in the ring; expanded back to the existing JSON shape
+// only at sync time (record_to_json), so the PC contract is unchanged.
+//
+// Quantization scales are chosen so resolution far exceeds each sensor's real
+// accuracy. Absent sensors store 0 and clear their present bit.
+
+#include <stdint.h>
+#include <ArduinoJson.h>   // header-only; record_to_json takes a real JsonDocument
+
+static constexpr uint8_t  RECORD_SCHEMA_VERSION = 1;
+static constexpr int      REC_NBANDS = 9;          // must match MIC_NBANDS
+
+// ---- flag bits ----
+enum : uint16_t {
+    FLAG_TS_OK       = 1u << 0,
+    FLAG_BAT_CAL     = 1u << 1,
+    FLAG_NOISE_CLIP  = 1u << 2,
+    PRESENT_SEN66    = 1u << 3,
+    PRESENT_BH1750   = 1u << 4,
+    PRESENT_BME      = 1u << 5,
+    PRESENT_ADXL     = 1u << 6,
+    PRESENT_CO       = 1u << 7,
+    PRESENT_HCHO     = 1u << 8,
+    PRESENT_SOIL     = 1u << 9,
+    PRESENT_BATTERY  = 1u << 10,
+    PRESENT_MIC      = 1u << 11,
+};
+
+#pragma pack(push, 1)
+struct Record {
+    uint32_t seq;          // monotonic record number
+    uint32_t ts;           // unix epoch (UTC); < EPOCH_VALID_AFTER => clock unsynced
+    uint32_t up_ms;        // millis() at capture
+    uint16_t flags;        // FLAG_* | PRESENT_*
+    uint16_t boot;         // low 16 bits of per-boot id
+
+    uint16_t pm1, pm25, pm4, pm10;  // ug/m3 x10
+    uint16_t co2;                   // ppm
+    uint16_t voc, nox;              // index x1
+    int16_t  temp;                  // C x100
+    uint16_t rh;                    // %RH x100
+
+    uint16_t lux;                   // lux x1
+    uint16_t pressure;              // hPa x10
+    int16_t  bme_temp;              // C x100
+    uint16_t bme_rh;                // %RH x100
+
+    uint16_t rumble_rms;            // m/s^2 x1000
+    uint16_t rumble_peak;           // m/s^2 x1000
+    uint16_t accel_mag;             // m/s^2 x100
+
+    uint16_t co_mv;                 // mV
+    uint16_t hcho_mv;               // mV
+    uint16_t soil_mv;               // mV
+    uint16_t bat_raw_mv;            // mV
+
+    int16_t  noise_dba;             // dB(A) x10
+    int16_t  noise_spl;             // dB x10
+    int16_t  noise_dbfs;            // dBFS x10
+    uint8_t  bands[REC_NBANDS];     // dB(A) rounded, clamped 0..255
+};
+#pragma pack(pop)
+
+static constexpr unsigned RECORD_SIZE = 71;
+static_assert(sizeof(Record) == RECORD_SIZE, "Record must be tightly packed to 71 bytes");
+
+// Plain (Arduino-free) inputs to pack. firmware.cpp fills this from live sensors.
+struct RecordFields {
+    uint32_t seq = 0, ts = 0, up_ms = 0;
+    uint16_t boot = 0;
+    bool ts_ok = false, bat_cal = false, noise_clip = false;
+
+    bool  has_sen66 = false;
+    float pm1 = 0, pm25 = 0, pm4 = 0, pm10 = 0, voc = 0, nox = 0, temp = 0, rh = 0;
+    uint16_t co2 = 0;
+
+    bool  has_bh1750 = false; float lux = 0;
+    bool  has_bme = false;    float pressure = 0, bme_temp = 0, bme_rh = 0;
+    bool  has_adxl = false;   float rumble_rms = 0, rumble_peak = 0, accel_mag = 0;
+    bool  has_co = false;     uint16_t co_mv = 0;
+    bool  has_hcho = false;   uint16_t hcho_mv = 0;
+    bool  has_soil = false;   uint16_t soil_mv = 0;
+    bool  has_battery = false; uint16_t bat_raw_mv = 0;
+    bool  has_mic = false;    float noise_dba = 0, noise_spl = 0, noise_dbfs = 0;
+    float bands[REC_NBANDS] = {0};
+};
+
+Record record_pack(const RecordFields& f);
+void    record_unpack(const Record& r, RecordFields& out);   // inverse (lossy by quantization)
+
+// Expand a record into the existing JSON field set, re-deriving co_rs/hcho_rs,
+// soil_pct, bat_v/bat_pct from config constants. `doc` must be a JsonDocument.
+void    record_to_json(const Record& r, JsonDocument& doc);
