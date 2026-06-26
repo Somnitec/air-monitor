@@ -21,7 +21,9 @@
 #define SYNC_PORT      8000
 #define SYNC_PATH      "/ingest"
 
-// ---- Station location (kept out of the repo on purpose) ----
+// ---- Station location ----
+// Placeholder only (Paleis Soestdijk, Baarn). Put your REAL coordinates in
+// secrets.h — this example file is committed, so don't dox yourself here.
 // Used later for weather + aircraft correlation. Decimal degrees.
 #define STATION_LAT    52.179722
 #define STATION_LON     5.284722

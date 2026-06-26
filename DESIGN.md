@@ -322,7 +322,7 @@ Chosen for portability across the user's machines (**macOS dev, Fedora laptop, W
 **File:** `firmware/src/secrets.h` (already in .gitignore; copy from `secrets.example.h`)
 - WiFi SSID, password
 - Sensor calibration constants (R0 for gas sensors, BAT_FACTOR, soil calibration)
-- (Later) API keys for weather/flight data, location coordinates (52.179722, 5.284722)
+- (Later) API keys for weather/flight data, location coordinates (placeholder 52.179722, 5.284722 — Paleis Soestdijk; the real value lives only in `secrets.h`)
 
 **PC-side:** `.env` file or config.json
 - (Later) API keys for OpenSky/Flightradar24
