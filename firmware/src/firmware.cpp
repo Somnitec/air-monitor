@@ -35,6 +35,8 @@
 #include "config.h"
 #include "mic.h"
 #include "accel.h"
+#include "record.h"
+#include "ringstore.h"
 
 // ---------------------------------------------------------------------------
 // Sensor objects + presence flags
@@ -59,6 +61,18 @@ static WiFiMulti wifiMulti;
 // Random id regenerated every boot. Lets the server group a boot's records and
 // back-fill the ones logged before the clock was known (see adoptServerTime).
 static uint32_t g_bootId = 0;
+
+// ---------------------------------------------------------------------------
+// Operating mode + duty-cycle bookkeeping.
+// ---------------------------------------------------------------------------
+enum Mode { MODE_NORMAL, MODE_TESTING };
+static Mode     g_mode           = MODE_NORMAL;
+static uint32_t g_bootStartMs    = 0;
+static uint32_t g_lastSyncAttempt = 0;
+
+static bool inBootWindow() { return (millis() - g_bootStartMs) < BOOT_WINDOW_MS; }
+static bool wifiShouldStayOn() { return g_mode == MODE_TESTING || inBootWindow(); }
+
 struct WifiCred { const char* ssid; const char* pass; };
 #ifdef WIFI_NETWORKS
 static const WifiCred kWifiNetworks[] = WIFI_NETWORKS;
@@ -183,174 +197,91 @@ static void discoverServer() {
 }
 
 // ---------------------------------------------------------------------------
-// Durable queue: append NDJSON, track an acknowledged byte cursor.
+// Build one RecordFields from a fresh read of every present sensor.
 // ---------------------------------------------------------------------------
-static size_t cursorRead() {
-    File f = LittleFS.open(QUEUE_CURSOR_PATH, "r");
-    if (!f) return 0;
-    String s = f.readStringUntil('\n');
-    f.close();
-    return (size_t)s.toInt();
-}
-static void cursorWrite(size_t pos) {
-    File f = LittleFS.open(QUEUE_CURSOR_PATH, "w");
-    if (!f) return;
-    f.println(pos);
-    f.close();
-}
-static void queueAppendLine(const String& line) {
-    File f = LittleFS.open(QUEUE_PATH, "a");
-    if (!f) { Serial.println("[queue] append failed (FS full?)"); return; }
-    f.println(line);            // NDJSON: one record per line
-    f.close();
-}
-// Once the server has acked everything and the file has grown past the compaction
-// threshold, drop it and reset the cursor to reclaim flash.
-static void queueCompactIfDone() {
-    File f = LittleFS.open(QUEUE_PATH, "r");
-    if (!f) return;
-    size_t sz = f.size();
-    f.close();
-    if (sz >= QUEUE_COMPACT_BYTES && cursorRead() >= sz) {
-        LittleFS.remove(QUEUE_PATH);
-        cursorWrite(0);
-        Serial.println("[queue] compacted (all synced)");
-    }
-}
+static void buildFields(RecordFields& f) {
+    f.ts    = (uint32_t)time(nullptr);
+    f.ts_ok = timeIsValid();
+    f.up_ms = millis();
+    f.boot  = (uint16_t)(g_bootId & 0xFFFF);
 
-// ---------------------------------------------------------------------------
-// Build one record as a JSON object string.
-// Field names are short but readable; the PC stores them verbatim in a JSON blob.
-// ---------------------------------------------------------------------------
-static String buildRecord() {
-    JsonDocument doc;
-
-    uint32_t now = (uint32_t)time(nullptr);
-    doc["ts"]      = now;                 // unix epoch (UTC). < EPOCH_VALID_AFTER => clock unsynced
-    doc["ts_ok"]   = timeIsValid();       // PC can quarantine records with a bad clock
-    doc["dev"]     = DEVICE_ID;
-    doc["up_ms"]   = millis();            // uptime; with boot, lets the PC back-fill ts
-    doc["boot"]    = g_bootId;            // per-boot id for retroactive time correction
-
-    // ---- SEN66: PM / CO2 / VOC / NOx / T / RH ----
     if (present.sen66) {
         float pm1, pm25, pm4, pm10, t, rh, voc, nox; uint16_t co2;
-        // NB: the SEN66 driver returns humidity *before* temperature.
         if (sen66.readMeasuredValues(pm1, pm25, pm4, pm10, rh, t, voc, nox, co2) == 0) {
-            doc["pm1"]  = pm1;  doc["pm25"] = pm25; doc["pm4"] = pm4; doc["pm10"] = pm10;
-            doc["co2"]  = co2;  doc["voc"]  = voc;  doc["nox"] = nox;
-            doc["temp"] = t;    doc["rh"]   = rh;
+            f.has_sen66 = true;
+            f.pm1 = pm1; f.pm25 = pm25; f.pm4 = pm4; f.pm10 = pm10;
+            f.co2 = co2; f.voc = voc; f.nox = nox; f.temp = t; f.rh = rh;
         }
     }
-
-    // ---- BH1750: ambient light ----
     if (present.bh1750 && bh1750.measurementReady(true)) {
-        doc["lux"] = bh1750.readLightLevel();
+        f.has_bh1750 = true; f.lux = bh1750.readLightLevel();
     }
-
-    // ---- BME280: barometric pressure (+ backup temp/humidity) ----
     if (present.bme) {
-        doc["pressure_hpa"] = bme.readPressure() / 100.0f;   // Pa -> hPa
-        doc["bme_temp"]     = bme.readTemperature();         // °C, secondary to SEN66
-        doc["bme_rh"]       = bme.readHumidity();            // %RH, secondary to SEN66
+        f.has_bme = true;
+        f.pressure = bme.readPressure() / 100.0f;
+        f.bme_temp = bme.readTemperature();
+        f.bme_rh   = bme.readHumidity();
     }
-
-    // ---- ADXL345: ground-rumble level (mic-style) ----
     if (present.adxl) {
         AccelResult a;
         if (accel_capture(adxl, a)) {
-            doc["rumble"]      = a.rumble_rms;    // AC RMS, m/s^2
-            doc["rumble_peak"] = a.rumble_peak;
-            doc["accel_mag"]   = a.mag_mean;      // ~9.81 when still
+            f.has_adxl = true;
+            f.rumble_rms = a.rumble_rms; f.rumble_peak = a.rumble_peak; f.accel_mag = a.mag_mean;
         }
     }
-
-    // ---- Gas MEMS (qualitative): log raw mV + Rs so R0 can be derived later ----
-    if (present.co) {
-        uint32_t mv = readAdcMv(PIN_GAS_CO_ADC);
-        doc["co_mv"] = mv;  doc["co_rs"] = gasRs(mv, GAS_CO_RL_OHMS);
-    }
-    if (present.hcho) {
-        uint32_t mv = readAdcMv(PIN_GAS_HCHO_ADC);
-        doc["hcho_mv"] = mv;  doc["hcho_rs"] = gasRs(mv, GAS_HCHO_RL_OHMS);
-    }
-
-    // ---- Soil moisture ----
-    if (present.soil) {
-        uint32_t mv = readAdcMv(PIN_SOIL_ADC);
-        float pct = 100.0f * (float)(SOIL_DRY_MV - (int)mv) / (float)(SOIL_DRY_MV - SOIL_WET_MV);
-        doc["soil_mv"]  = mv;
-        doc["soil_pct"] = constrain(pct, 0.0f, 100.0f);
-    }
-
-    // ---- Battery (external 1M/2M divider on GPIO32 — log raw always; V/% only if calibrated) ----
+    if (present.co)   { f.has_co = true;   f.co_mv   = (uint16_t)readAdcMv(PIN_GAS_CO_ADC); }
+    if (present.hcho) { f.has_hcho = true; f.hcho_mv = (uint16_t)readAdcMv(PIN_GAS_HCHO_ADC); }
+    if (present.soil) { f.has_soil = true; f.soil_mv = (uint16_t)readAdcMv(PIN_SOIL_ADC); }
     if (present.battery) {
-        uint32_t mv = readAdcMv(PIN_BATTERY_ADC);
-        doc["bat_raw_mv"] = mv;                 // always trustworthy
-        doc["bat_cal"]    = (bool)BAT_CALIBRATED;
-        if (BAT_CALIBRATED) {
-            float v = mv / 1000.0f * BAT_DIVIDER_FACTOR;
-            doc["bat_v"]   = v;
-            doc["bat_pct"] = constrain((v - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V) * 100.0f,
-                                       0.0f, 100.0f);
-        }
+        f.has_battery = true;
+        f.bat_raw_mv = (uint16_t)readAdcMv(PIN_BATTERY_ADC);
+        f.bat_cal = (bool)BAT_CALIBRATED;
     }
-
-    // ---- INMP441: noise level + per-octave-band dB(A) ----
     if (present.mic) {
         MicResult m;
         if (mic_capture(m)) {
-            doc["noise_dba"]  = m.laeq_est;    // uncalibrated A-weighted level
-            doc["noise_spl"]  = m.spl_est;
-            doc["noise_dbfs"] = m.rms_dbfs;
-            doc["noise_clip"] = m.clipping;
-            JsonArray bands = doc["noise_bands"].to<JsonArray>();
-            for (int b = 0; b < MIC_NBANDS; ++b) bands.add(m.band_dba[b]);
+            f.has_mic = true;
+            f.noise_dba = m.laeq_est; f.noise_spl = m.spl_est; f.noise_dbfs = m.rms_dbfs;
+            f.noise_clip = m.clipping;
+            for (int b = 0; b < REC_NBANDS; ++b) f.bands[b] = m.band_dba[b];
         }
     }
-
-    String out;
-    serializeJson(doc, out);
-    return out;
 }
 
 // ---------------------------------------------------------------------------
-// Sync: POST the un-acked tail of the queue in batches, advance cursor on 200.
-// Returns true if it made progress (or there was nothing to do).
+// Duty-cycled sync session + dashboard-driven mode state machine.
 // ---------------------------------------------------------------------------
-static bool syncQueue() {
-    if (WiFi.status() != WL_CONNECTED) return false;
 
-    File f = LittleFS.open(QUEUE_PATH, "r");
-    if (!f) return true;                 // nothing queued yet
-    size_t fileSize = f.size();
-    size_t cursor   = cursorRead();
-    if (cursor >= fileSize) { f.close(); queueCompactIfDone(); return true; }
-
-    f.seek(cursor);
-
-    // Collect up to a batch of whole lines into a JSON array body.
-    String body = "[";
-    int n = 0;
-    size_t newCursor = cursor;
-    while (f.available() && n < SYNC_BATCH_MAX && body.length() < SYNC_BATCH_MAX_BYTES) {
-        String line = f.readStringUntil('\n');
-        size_t consumed = line.length() + 1;          // +1 for the '\n'
-        line.trim();
-        if (line.length() == 0) { newCursor += consumed; continue; }
-        if (n > 0) body += ",";
-        body += line;
-        n++;
-        newCursor += consumed;
+// Apply a {"command":{"set_mode": "..."}} returned by the server.
+static void applyServerCommand(const JsonDocument& doc) {
+    const char* sm = doc["command"]["set_mode"] | (const char*)nullptr;
+    if (!sm) return;
+    if (!strcmp(sm, "testing") && g_mode != MODE_TESTING) {
+        g_mode = MODE_TESTING; Serial.println("[mode] -> TESTING (server)");
+    } else if (!strcmp(sm, "normal") && g_mode != MODE_NORMAL) {
+        g_mode = MODE_NORMAL;  Serial.println("[mode] -> NORMAL (server)");
     }
-    body += "]";
-    f.close();
+}
 
-    if (n == 0) { cursorWrite(newCursor); return true; }
-
-    // Prefer the mDNS-discovered server; fall back to the static SYNC_HOST.
+// POST one batch of records as an envelope. Returns the HTTP code; on success
+// advances the synced pointer and applies any server command.
+static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
     String   host = s_serverHost.length() ? s_serverHost : String(SYNC_HOST);
     uint16_t port = s_serverHost.length() ? s_serverPort : (uint16_t)SYNC_PORT;
+
+    JsonDocument doc;
+    doc["dev"]      = DEVICE_ID;
+    doc["boot"]     = g_bootId;
+    doc["fw"]       = "phase1";
+    doc["mode"]     = (g_mode == MODE_TESTING) ? "testing" : "normal";
+    doc["buffered"] = ringstore_unsynced();
+    JsonArray arr = doc["records"].to<JsonArray>();
+    for (uint32_t i = 0; i < n; ++i) {
+        JsonDocument tmp;
+        record_to_json(recs[i], tmp);
+        arr.add(tmp);
+    }
+    String body; serializeJson(doc, body);
 
     HTTPClient http;
     String url = String("http://") + host + ":" + String(port) + SYNC_PATH;
@@ -362,18 +293,44 @@ static bool syncQueue() {
     http.end();
 
     if (code == 200 || code == 201 || code == 204) {
-        adoptServerTime(resp);   // approximate clock from the PC when NTP is unavailable
-        cursorWrite(newCursor);
-        Serial.printf("[sync] %d records acked (cursor=%u/%u)\n",
-                      n, (unsigned)newCursor, (unsigned)fileSize);
-        ledPulse();          // visual confirm: values were sent successfully
-        return true;
+        JsonDocument rdoc;
+        if (!deserializeJson(rdoc, resp)) { adoptServerTime(resp); applyServerCommand(rdoc); }
+        ringstore_mark_synced(lastSeq);
+        Serial.printf("[sync] %u acked (unsynced now %u)\n", n, ringstore_unsynced());
+        ledPulse();
+        return code;
     }
-    Serial.printf("[sync] POST failed code=%d (will retry)\n", code);
-    // The server's IP may have changed (new network) — drop the cached address
-    // so the next cycle re-discovers it via mDNS.
-    s_serverHost = "";
-    return false;
+    Serial.printf("[sync] POST failed code=%d\n", code);
+    s_serverHost = "";     // force re-discovery next time
+    return code;
+}
+
+// Drain the ring to the server in batches until empty or a POST fails.
+static void drainRing() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    Record batch[SYNC_BATCH_MAX];
+    for (int guard = 0; guard < 64; ++guard) {
+        uint32_t lastSeq = 0;
+        uint32_t n = ringstore_drain(batch, SYNC_BATCH_MAX, &lastSeq);
+        if (n == 0) break;
+        if (postBatch(batch, n, lastSeq) >= 400 || WiFi.status() != WL_CONNECTED) break;
+        if (ringstore_unsynced() == 0) break;
+    }
+}
+
+// Bring WiFi up, sync time/discover, drain, and (in NORMAL, outside the boot
+// window) drop WiFi to save power.
+static void syncSession() {
+    g_lastSyncAttempt = millis();
+    if (wifiConnect()) {
+        syncTimeIfNeeded();
+        if (s_serverHost.length() == 0) discoverServer();
+        drainRing();
+    }
+    if (g_mode == MODE_NORMAL && !inBootWindow()) {
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,11 +417,14 @@ void setup() {
         wifiMulti.addAP(kWifiNetworks[i].ssid, kWifiNetworks[i].pass);
     Serial.printf("[wifi] %u known network(s) registered\n", (unsigned)kWifiCount);
 
-    // First WiFi + time sync + server discovery (all non-fatal if they fail).
+    g_bootStartMs = millis();
+    if (!ringstore_begin()) Serial.println("[ring] begin failed");
+
+    // Boot window: WiFi on so the dashboard can flip us into testing mode.
     if (wifiConnect()) { syncTimeIfNeeded(); discoverServer(); }
 
-    ledBlink(3);                        // boot done — three quick blinks
-    digitalWrite(PIN_EXT_LED, LOW);     // idle: LED off (pulses only on sync)
+    ledBlink(3);
+    digitalWrite(PIN_EXT_LED, LOW);
     Serial.println("[boot] ready — sampling every "
                    + String(SAMPLE_BASELINE_MS / 1000) + " s");
 }
@@ -477,28 +437,31 @@ void loop() {
     if (tSample == 0 || now - tSample >= SAMPLE_BASELINE_MS) {
         tSample = now;
 
-        // Opportunistically (re)connect + set the clock so timestamps are real.
-        if (WiFi.status() != WL_CONNECTED) wifiConnect();
-        syncTimeIfNeeded();
-        // (Re)discover the server if we don't have an address yet this network.
-        if (WiFi.status() == WL_CONNECTED && s_serverHost.length() == 0) discoverServer();
+        if (wifiShouldStayOn() && WiFi.status() != WL_CONNECTED) wifiConnect();
+        if (WiFi.status() == WL_CONNECTED) { syncTimeIfNeeded();
+            if (s_serverHost.length() == 0) discoverServer(); }
 
-        String rec = buildRecord();
-        queueAppendLine(rec);
-        Serial.printf("[rec] %s\n", rec.c_str());
+        RecordFields f; buildFields(f);
+        Record rec = record_pack(f);
+        ringstore_push(rec);
+        Serial.printf("[rec] seq=%u ts=%u buffered=%u mode=%s\n",
+                      rec.seq, rec.ts, ringstore_unsynced(),
+                      g_mode == MODE_TESTING ? "testing" : "normal");
+
+        // TESTING: push live right after each sample.
+        if (g_mode == MODE_TESTING && WiFi.status() == WL_CONNECTED) drainRing();
     }
 
-    // --- drain the sync queue whenever WiFi is up (a few batches per pass) ---
-    if (WiFi.status() == WL_CONNECTED) {
-        for (int i = 0; i < 5; ++i) {
-            if (!syncQueue()) break;          // stop on failure
-            if (cursorRead() >= 0) {          // loop guard; syncQueue self-limits
-                File f = LittleFS.open(QUEUE_PATH, "r");
-                bool caughtUp = !f || cursorRead() >= f.size();
-                if (f) f.close();
-                if (caughtUp) break;
-            }
-        }
+    // --- decide whether to run a sync session ---
+    if (g_mode == MODE_TESTING) {
+        // stay connected; live drain already handled at sample time
+    } else if (inBootWindow()) {
+        // keep WiFi up and poll the server so an "enter testing" command lands fast
+        if (now - g_lastSyncAttempt >= 5000) syncSession();
+    } else {
+        bool dueByTime  = (now - g_lastSyncAttempt) >= SYNC_ATTEMPT_INTERVAL_MS;
+        bool dueByCount = ringstore_unsynced() >= SYNC_THRESHOLD_RECORDS;
+        if (g_lastSyncAttempt == 0 || dueByTime || dueByCount) syncSession();
     }
 
     delay(50);
