@@ -75,17 +75,29 @@ Put those `xset` lines in `~/.xprofile` (or the autostart) so they apply on logi
 If a tap doesn't wake it, your panel may need `xserver-xorg-input-libinput` and a
 quick check that the touch device shows up in `xinput list`.
 
-## Point the ESP32 at this server
+## How the ESP32 finds this server (no static IP needed)
 
-In `src/secrets.h` on the firmware side set:
+The server advertises itself on the LAN over **mDNS/zeroconf** as
+`_airmon._tcp`. The ESP32 looks it up by service name and gets the current
+IP + port automatically — so when the station roams to a different network, it
+just re-discovers the server. No IP to hardcode or update.
 
-```c
-#define SYNC_HOST  "192.168.1.50"   // this PC's LAN IP
-#define SYNC_PORT  8000
-#define SYNC_PATH  "/ingest"
+`SYNC_HOST`/`SYNC_PORT` in `src/secrets.h` are only a **fallback** used if mDNS
+discovery turns up nothing (e.g. a network that blocks multicast). You can leave
+them at the defaults unless you hit that case.
+
+Verify the advertisement is live:
+
+```bash
+# macOS:
+dns-sd -B _airmon._tcp
+# Linux (avahi-utils):
+avahi-browse -r _airmon._tcp
 ```
 
-Find the PC's IP: `ip addr` (Linux), `ifconfig` (macOS), `ipconfig` (Windows).
+> Note: browsing from the *same* machine that runs the server can show nothing
+> because the OS mDNS daemon and Python's zeroconf share port 5353 — that's a
+> same-host quirk only. The ESP32 (a different host) discovers it fine.
 
 ## API quick reference
 

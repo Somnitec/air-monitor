@@ -19,6 +19,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -110,6 +111,31 @@ static bool wifiConnect() {
                           WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
     else    Serial.println("[wifi] no known network in range (will retry next cycle)");
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Server discovery via mDNS. The LattePanda advertises an "_airmon._tcp"
+// service (pc/server.py does this with zeroconf), so we find it by name on
+// whatever network we joined — no static IP. SYNC_HOST/SYNC_PORT from secrets.h
+// are only a fallback if discovery turns up nothing.
+// ---------------------------------------------------------------------------
+static String   s_serverHost = "";          // resolved IP string; empty = use fallback
+static uint16_t s_serverPort = SYNC_PORT;
+static bool     s_mdnsUp     = false;
+
+static void discoverServer() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (!s_mdnsUp) s_mdnsUp = MDNS.begin(DEVICE_ID);   // our own hostname on the LAN
+    if (!s_mdnsUp) return;
+
+    int n = MDNS.queryService("airmon", "tcp");        // looks up _airmon._tcp.local.
+    if (n > 0) {
+        s_serverHost = MDNS.IP(0).toString();
+        s_serverPort = MDNS.port(0);
+        Serial.printf("[mdns] found server: %s:%u\n", s_serverHost.c_str(), s_serverPort);
+    } else {
+        Serial.println("[mdns] no _airmon server found — using fallback SYNC_HOST");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,8 +295,12 @@ static bool syncQueue() {
 
     if (n == 0) { cursorWrite(newCursor); return true; }
 
+    // Prefer the mDNS-discovered server; fall back to the static SYNC_HOST.
+    String   host = s_serverHost.length() ? s_serverHost : String(SYNC_HOST);
+    uint16_t port = s_serverHost.length() ? s_serverPort : (uint16_t)SYNC_PORT;
+
     HTTPClient http;
-    String url = String("http://") + SYNC_HOST + ":" + String(SYNC_PORT) + SYNC_PATH;
+    String url = String("http://") + host + ":" + String(port) + SYNC_PATH;
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(8000);
@@ -284,6 +314,9 @@ static bool syncQueue() {
         return true;
     }
     Serial.printf("[sync] POST failed code=%d (will retry)\n", code);
+    // The server's IP may have changed (new network) — drop the cached address
+    // so the next cycle re-discovers it via mDNS.
+    s_serverHost = "";
     return false;
 }
 
@@ -365,8 +398,8 @@ void setup() {
         wifiMulti.addAP(kWifiNetworks[i].ssid, kWifiNetworks[i].pass);
     Serial.printf("[wifi] %u known network(s) registered\n", (unsigned)kWifiCount);
 
-    // First WiFi + time sync attempt (non-fatal if it fails).
-    if (wifiConnect()) syncTimeIfNeeded();
+    // First WiFi + time sync + server discovery (all non-fatal if they fail).
+    if (wifiConnect()) { syncTimeIfNeeded(); discoverServer(); }
 
     digitalWrite(PIN_EXT_LED, HIGH);    // solid = ready
     Serial.println("[boot] ready — sampling every "
@@ -384,6 +417,8 @@ void loop() {
         // Opportunistically (re)connect + set the clock so timestamps are real.
         if (WiFi.status() != WL_CONNECTED) wifiConnect();
         syncTimeIfNeeded();
+        // (Re)discover the server if we don't have an address yet this network.
+        if (WiFi.status() == WL_CONNECTED && s_serverHost.length() == 0) discoverServer();
 
         String rec = buildRecord();
         queueAppendLine(rec);

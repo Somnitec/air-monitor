@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -124,6 +125,50 @@ hub = Hub()
 
 
 # --------------------------------------------------------------------------- #
+# mDNS / zeroconf advertisement — lets the ESP32 find us by service name on
+# whatever network we're on, instead of a hardcoded IP. Degrades gracefully if
+# the zeroconf package isn't installed.
+# --------------------------------------------------------------------------- #
+PORT = int(os.environ.get("PORT", 8000))
+
+
+def _local_ip() -> str:
+    """Best-effort primary LAN IP (the address other devices reach us on)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))   # no packets sent; just picks the route's source IP
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+async def _start_mdns():
+    """Register the _airmon._tcp service. Uses AsyncZeroconf because we're inside
+    a running asyncio loop (the sync Zeroconf API deadlocks here)."""
+    try:
+        from zeroconf import ServiceInfo
+        from zeroconf.asyncio import AsyncZeroconf
+    except ImportError:
+        print("[mdns] zeroconf not installed — ESP32 must use the static SYNC_HOST fallback")
+        return None, None
+    ip = _local_ip()
+    info = ServiceInfo(
+        "_airmon._tcp.local.",
+        "air-monitor._airmon._tcp.local.",
+        addresses=[socket.inet_aton(ip)],
+        port=PORT,
+        properties={"path": "/ingest"},
+        server=f"{socket.gethostname()}.local.",
+    )
+    aiozc = AsyncZeroconf()
+    await aiozc.async_register_service(info)
+    print(f"[mdns] advertising _airmon._tcp at {ip}:{PORT}")
+    return aiozc, info
+
+
+# --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
 @asynccontextmanager
@@ -131,7 +176,11 @@ async def lifespan(app: FastAPI):
     global _conn
     _conn = _init_db()
     print(f"[air-monitor] DB: {DB_PATH}")
+    aiozc, info = await _start_mdns()
     yield
+    if aiozc is not None:
+        await aiozc.async_unregister_service(info)
+        await aiozc.async_close()
     _conn.close()
 
 
@@ -292,4 +341,4 @@ if STATIC_DIR.exists():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
