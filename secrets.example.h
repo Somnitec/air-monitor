@@ -1,6 +1,6 @@
 #pragma once
-// Copy this file to  src/secrets.h  (which is gitignored) and fill in real values.
-// src/secrets.h is included BEFORE config.h, so these win over the placeholders.
+// Copy this file to secrets.h (which is gitignored) and fill in real values.
+// secrets.h is included BEFORE config.h, so these win over the placeholders.
 
 // ---- Wi-Fi ----
 // Primary network — also used by the legacy bring-up test sketches.

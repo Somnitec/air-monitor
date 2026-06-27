@@ -7,7 +7,7 @@
 *.swp
 build/
 .claude/settings.local.json
-/firmware/src/secrets.h
+/secrets.h
 
 # server/ runtime artifacts
 server/.venv/

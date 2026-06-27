@@ -1,7 +1,10 @@
 #pragma once
-// Dense binary record for the on-device FIFO ring. ~71 bytes vs ~400 bytes of
+// Dense binary record for the on-device FIFO ring. 84 bytes vs ~400 bytes of
 // JSON. Stored verbatim in the ring; expanded back to the existing JSON shape
 // only at sync time (record_to_json), so the PC contract is unchanged.
+//
+// Schema v2 adds Dutch/EU aircraft noise metrics (LAmax, LCeq) and infrasound
+// vibration metrics (PPV, 1/3-oct accel bands, dominant frequency).
 //
 // Quantization scales are chosen so resolution far exceeds each sensor's real
 // accuracy. Absent sensors store 0 and clear their present bit.
@@ -9,8 +12,9 @@
 #include <stdint.h>
 #include <ArduinoJson.h>   // header-only; record_to_json takes a real JsonDocument
 
-static constexpr uint8_t  RECORD_SCHEMA_VERSION = 1;
-static constexpr int      REC_NBANDS = 9;          // must match MIC_NBANDS
+static constexpr uint8_t  RECORD_SCHEMA_VERSION = 2;
+static constexpr int      REC_NBANDS      = 9;   // must match MIC_NBANDS
+static constexpr int      REC_ACCEL_BANDS = 6;   // must match ACCEL_NBANDS: 4,8,16,31.5,63,125 Hz
 
 // ---- flag bits ----
 enum : uint16_t {
@@ -26,6 +30,7 @@ enum : uint16_t {
     PRESENT_SOIL     = 1u << 9,
     PRESENT_BATTERY  = 1u << 10,
     PRESENT_MIC      = 1u << 11,
+    // bits 12-15 reserved
 };
 
 #pragma pack(push, 1)
@@ -56,15 +61,22 @@ struct Record {
     uint16_t soil_mv;               // mV
     uint16_t bat_raw_mv;            // mV
 
-    int16_t  noise_dba;             // dB(A) x10
+    int16_t  noise_dba;             // dB(A) x10  — LAeq over capture window
     int16_t  noise_spl;             // dB x10
     int16_t  noise_dbfs;            // dBFS x10
     uint8_t  bands[REC_NBANDS];     // dB(A) rounded, clamped 0..255
+
+    // ---- v2: aviation / infrasound metrics ----
+    int16_t  noise_lamax;           // dB(A) x10  — peak A-weighted level in ~1.3 s capture
+    int16_t  noise_lceq;            // dB(C) x10  — C-weighted LAeq (NL: C−A > 6 dB flags LF noise)
+    uint16_t ppv_mm10;              // Peak Particle Velocity, 0.1 mm/s units (max 6553 mm/s)
+    uint8_t  accel_dom_hz;          // dominant vibration frequency 1–255 Hz (0 = no signal)
+    int8_t   accel_bands[REC_ACCEL_BANDS]; // 1/3-oct accel levels, dB re 1 m/s² (dBm/s²)
 };
 #pragma pack(pop)
 
-static constexpr unsigned RECORD_SIZE = 71;
-static_assert(sizeof(Record) == RECORD_SIZE, "Record must be tightly packed to 71 bytes");
+static constexpr unsigned RECORD_SIZE = 84;
+static_assert(sizeof(Record) == RECORD_SIZE, "Record must be tightly packed to 84 bytes");
 
 // Plain (Arduino-free) inputs to pack. firmware.cpp fills this from live sensors.
 struct RecordFields {
@@ -85,11 +97,18 @@ struct RecordFields {
     bool  has_battery = false; uint16_t bat_raw_mv = 0;
     bool  has_mic = false;    float noise_dba = 0, noise_spl = 0, noise_dbfs = 0;
     float bands[REC_NBANDS] = {0};
+
+    // v2 — added alongside v1 fields; zero if sensor absent
+    float    noise_lamax = 0;                    // dB(A) — max in capture window
+    float    noise_lceq  = 0;                    // dB(C) — C-weighted equivalent
+    float    ppv_m_s     = 0;                    // m/s   — peak particle velocity
+    uint8_t  accel_dom_hz = 0;                   // Hz    — dominant vibration frequency
+    float    accel_band_db[REC_ACCEL_BANDS] = {0}; // dBm/s² per 1/3-oct band
 };
 
 Record record_pack(const RecordFields& f);
 void    record_unpack(const Record& r, RecordFields& out);   // inverse (lossy by quantization)
 
-// Expand a record into the existing JSON field set, re-deriving co_rs/hcho_rs,
-// soil_pct, bat_v/bat_pct from config constants. `doc` must be a JsonDocument.
+// Expand a record into the JSON field set, re-deriving co_rs/hcho_rs,
+// soil_pct, bat_v/bat_pct, ppv_mm_s from config constants.
 void    record_to_json(const Record& r, JsonDocument& doc);

@@ -33,9 +33,9 @@ async def poll_once(conn: sqlite3.Connection, db_lock, *, settings: dict,
     if on_snapshot is not None:
         await on_snapshot(records)
     now = int(time.time())
-    # Only log what our own SDR actually received — the DB stays a record of local
-    # reception, not the public reference feed.
-    due = select_for_logging(local, last_logged, now=now, interval_sec=s["log_sec"])
+    # Log all received aircraft (local SDR + public reference feed) so the DB
+    # and side view populate even before readsb is running as a service.
+    due = select_for_logging(records, last_logged, now=now, interval_sec=s["log_sec"])
     if due:
         async with db_lock:
             store.insert(conn, due, now=now)

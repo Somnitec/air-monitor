@@ -4,27 +4,36 @@ The firmware's `secrets.h` defines `STATION_LAT` / `STATION_LON`; this module re
 them so the server doesn't need its coordinates configured separately. Both the
 weather and aircraft features resolve "home" through `coords()` so they always agree.
 
-Resolution order: explicit `AIRMON_LAT`/`AIRMON_LON` env wins, then the firmware
-secrets header, then a generic Paleis Soestdijk placeholder (never a real address).
+Resolution order:
+  1. Explicit AIRMON_LAT / AIRMON_LON environment variables
+  2. firmware/src/secrets.h  (canonical gitignored firmware secrets)
+  3. <repo-root>/secrets.h   (root-level gitignored convenience copy)
+  4. Paleis Soestdijk placeholder — warns loudly so it's obvious
 """
 from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
-# Default to <repo>/firmware/src/secrets.h (this file lives at <repo>/server/station.py);
-# override the path with AIRMON_FIRMWARE_SECRETS.
-_FIRMWARE_SECRETS = os.environ.get(
-    "AIRMON_FIRMWARE_SECRETS",
-    str(Path(__file__).resolve().parents[1] / "firmware" / "src" / "secrets.h"),
-)
+_HERE = Path(__file__).resolve().parent          # server/
+_REPO = _HERE.parent                             # repo root
+
+# Candidate paths tried in priority order (stop at the first that has coords).
+_CANDIDATE_PATHS = [
+    _REPO / "firmware" / "src" / "secrets.h",   # canonical firmware secrets
+    _REPO / "secrets.h",                         # root-level copy / symlink
+]
+# Allow full override from env (e.g. set in server/.env or systemd unit).
+if os.environ.get("AIRMON_FIRMWARE_SECRETS"):
+    _CANDIDATE_PATHS.insert(0, Path(os.environ["AIRMON_FIRMWARE_SECRETS"]))
 
 _PLACEHOLDER = (52.179722, 5.284722)
 
 
-def firmware_coords(path: str | os.PathLike = _FIRMWARE_SECRETS) -> tuple[float | None, float | None]:
-    """Parse STATION_LAT / STATION_LON `#define`s from the firmware secrets header.
+def firmware_coords(path: str | os.PathLike) -> tuple[float | None, float | None]:
+    """Parse STATION_LAT / STATION_LON `#define`s from a firmware secrets header.
     Returns (None, None) if the file is missing or a value can't be parsed."""
     p = Path(path)
     if not p.exists():
@@ -40,14 +49,32 @@ def firmware_coords(path: str | os.PathLike = _FIRMWARE_SECRETS) -> tuple[float 
 
 def coords() -> tuple[float, float]:
     """Resolve (lat, lon): env override > firmware secrets.h > placeholder."""
-    fw_lat, fw_lon = firmware_coords()
-    lat = _env_float("AIRMON_LAT", fw_lat if fw_lat is not None else _PLACEHOLDER[0])
-    lon = _env_float("AIRMON_LON", fw_lon if fw_lon is not None else _PLACEHOLDER[1])
-    return lat, lon
+    # Explicit env vars beat everything.
+    env_lat = _env_float("AIRMON_LAT", None)
+    env_lon = _env_float("AIRMON_LON", None)
+    if env_lat is not None and env_lon is not None:
+        print(f"[station] coords from env: ({env_lat}, {env_lon})", file=sys.stderr)
+        return env_lat, env_lon
+
+    # Walk candidate paths; use the first that yields both values.
+    for path in _CANDIDATE_PATHS:
+        lat, lon = firmware_coords(path)
+        if lat is not None and lon is not None:
+            print(f"[station] coords from {path}: ({lat}, {lon})", file=sys.stderr)
+            return lat, lon
+
+    print(
+        "[station] WARNING: no secrets.h with STATION_LAT/STATION_LON found — "
+        "using placeholder coords (Paleis Soestdijk). "
+        "Create firmware/src/secrets.h or <repo-root>/secrets.h with your real location.",
+        file=sys.stderr,
+    )
+    return _PLACEHOLDER
 
 
-def _env_float(name: str, default: float) -> float:
+def _env_float(name: str, default):
     try:
-        return float(os.environ.get(name, default))
+        v = os.environ.get(name)
+        return float(v) if v is not None else default
     except (TypeError, ValueError):
         return default

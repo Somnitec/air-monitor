@@ -32,8 +32,9 @@
 #include <BH1750.h>
 #include <Adafruit_BME280.h>
 
-#include "secrets.h"     // WIFI_*, SYNC_* (gitignored; see secrets.example.h)
+#include "../../secrets.h"   // WIFI_*, SYNC_* (gitignored; see secrets.example.h)
 #include "config.h"
+#include "devconfig.h"
 #include "mic.h"
 #include "accel.h"
 #include "record.h"
@@ -64,6 +65,7 @@ static WiFiMulti wifiMulti;
 static uint32_t g_bootId     = 0;
 static uint32_t g_bootTs     = 0;   // UTC unix time of this boot (0 until NTP syncs)
 static uint8_t  g_resetReason = 0;  // esp_reset_reason_t cast to uint8; set before Serial
+static DeviceConfig g_config;       // device configuration (poll_interval_ms, etc.)
 
 static const char* resetReasonStr(uint8_t r) {
     switch (r) {
@@ -267,6 +269,9 @@ static void buildFields(RecordFields& f) {
         if (accel_capture(adxl, a)) {
             f.has_adxl = true;
             f.rumble_rms = a.rumble_rms; f.rumble_peak = a.rumble_peak; f.accel_mag = a.mag_mean;
+            f.ppv_m_s      = a.ppv_m_s;
+            f.accel_dom_hz = a.dom_freq_hz;
+            for (int b = 0; b < REC_ACCEL_BANDS; ++b) f.accel_band_db[b] = a.band_db[b];
         }
     }
     if (present.co)   { f.has_co = true;   f.co_mv   = (uint16_t)readAdcMv(PIN_GAS_CO_ADC); }
@@ -281,8 +286,10 @@ static void buildFields(RecordFields& f) {
         MicResult m;
         if (mic_capture(m)) {
             f.has_mic = true;
-            f.noise_dba = m.laeq_est; f.noise_spl = m.spl_est; f.noise_dbfs = m.rms_dbfs;
+            f.noise_dba  = m.laeq_est; f.noise_spl = m.spl_est; f.noise_dbfs = m.rms_dbfs;
             f.noise_clip = m.clipping;
+            f.noise_lamax = m.lamax_dba;
+            f.noise_lceq  = m.lceq;
             for (int b = 0; b < REC_NBANDS; ++b) f.bands[b] = m.band_dba[b];
         }
     }
@@ -300,9 +307,16 @@ static void printFields(const RecordFields& f) {
     if (f.has_bme)
         Serial.printf("  BME280  T=%.1fC  RH=%.1f%%  P=%.1f hPa\n",
                       f.bme_temp, f.bme_rh, f.pressure);
-    if (f.has_adxl)
-        Serial.printf("  ADXL345 rumble_rms=%.3f  rumble_peak=%.3f  mag=%.3f m/s2\n",
-                      f.rumble_rms, f.rumble_peak, f.accel_mag);
+    if (f.has_adxl) {
+        Serial.printf("  ADXL345 rumble_rms=%.3f  peak=%.3f  mag=%.3f m/s²"
+                      "  PPV=%.3f mm/s  dom=%u Hz\n",
+                      f.rumble_rms, f.rumble_peak, f.accel_mag,
+                      f.ppv_m_s * 1000.0f, f.accel_dom_hz);
+        Serial.printf("          vib 4Hz=%.0f  8Hz=%.0f  16Hz=%.0f"
+                      "  31Hz=%.0f  63Hz=%.0f  125Hz=%.0f dBm/s²\n",
+                      f.accel_band_db[0], f.accel_band_db[1], f.accel_band_db[2],
+                      f.accel_band_db[3], f.accel_band_db[4], f.accel_band_db[5]);
+    }
     if (f.has_co)      Serial.printf("  CO      %u mV\n",   f.co_mv);
     if (f.has_hcho)    Serial.printf("  HCHO    %u mV\n",   f.hcho_mv);
     if (f.has_soil)    Serial.printf("  soil    %u mV\n",   f.soil_mv);
@@ -315,9 +329,32 @@ static void printFields(const RecordFields& f) {
                       v, pct, f.bat_cal ? "" : " uncal", f.bat_raw_mv);
     }
     if (f.has_mic)
-        Serial.printf("  INMP441 dBA=%.1f  SPL=%.1f  dBFS=%.1f%s\n",
-                      f.noise_dba, f.noise_spl, f.noise_dbfs,
+        Serial.printf("  INMP441 LAeq=%.1f  LAmax=%.1f  LCeq=%.1f  LC-LA=%.1f  dBFS=%.1f%s\n",
+                      f.noise_dba, f.noise_lamax, f.noise_lceq,
+                      f.noise_lceq - f.noise_dba, f.noise_dbfs,
                       f.noise_clip ? "  CLIP" : "");
+}
+
+// Compact one-line summary of latest capture for serial logging.
+static void logCapturedValues(const RecordFields& f) {
+    char buf[256];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "[latest] ");
+    if (f.has_sen66)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "PM2.5=%.1f ", f.pm25);
+    if (f.has_mic)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "LAeq=%.1f LAmax=%.1f ", f.noise_dba, f.noise_lamax);
+    if (f.has_adxl)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "PPV=%.2f mm/s ", f.ppv_m_s * 1000.0f);
+    if (f.has_bme)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "T=%.1f RH=%.1f%% ", f.bme_temp, f.bme_rh);
+    if (f.has_battery) {
+        float v = f.bat_raw_mv / 1000.0f * BAT_DIVIDER_FACTOR;
+        float pct = (v - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V) * 100.0f;
+        if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "bat=%.2fV(%.0f%%) ", v, pct);
+    }
+    Serial.println(buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +370,14 @@ static void applyServerCommand(const JsonDocument& doc) {
     } else if (!strcmp(sm, "normal") && g_mode != MODE_NORMAL) {
         g_mode = MODE_NORMAL;  Serial.println("[mode] -> NORMAL (server)");
     }
+}
+
+// Apply device config from server response, if present.
+static void applyServerConfig(const JsonDocument& doc) {
+    if (!doc["config"].is<JsonObject>()) return;
+    String cfg_str;
+    serializeJson(doc["config"], cfg_str);
+    devconfig_apply_json(cfg_str.c_str(), g_config);
 }
 
 // POST one batch of records as an envelope. Returns the HTTP code; on success
@@ -368,7 +413,11 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
 
     if (code == 200 || code == 201 || code == 204) {
         JsonDocument rdoc;
-        if (!deserializeJson(rdoc, resp)) { adoptServerTime(resp); applyServerCommand(rdoc); }
+        if (!deserializeJson(rdoc, resp)) {
+            adoptServerTime(resp);
+            applyServerCommand(rdoc);
+            applyServerConfig(rdoc);
+        }
         ringstore_mark_synced(lastSeq);
         Serial.printf("[sync] %u acked (unsynced now %u)\n", n, ringstore_unsynced());
         ledPulse();
@@ -392,18 +441,15 @@ static void drainRing() {
     }
 }
 
-// Bring WiFi up, sync time/discover, drain, and (in NORMAL, outside the boot
-// window) drop WiFi to save power.
+// Bring WiFi up, sync time/discover, drain.
+// WiFi stays on always — the device is mains-powered so duty-cycling gains nothing
+// and causes the visible connect/disconnect churn on the network.
 static void syncSession() {
     g_lastSyncAttempt = millis();
     if (wifiConnect()) {
         syncTimeIfNeeded();
         if (s_serverHost.length() == 0) discoverServer();
         drainRing();
-    }
-    if (g_mode == MODE_NORMAL && !inBootWindow()) {
-        WiFi.disconnect(true, false);
-        WiFi.mode(WIFI_OFF);
     }
 }
 
@@ -499,6 +545,8 @@ void setup() {
     if (s_fsMounted) {
         s_ringReady = ringstore_begin();
         if (!s_ringReady) Serial.println("[ring] begin failed — samples will not be stored");
+        g_config = devconfig_load();
+        Serial.printf("[config] poll_interval_ms = %u\n", g_config.poll_interval_ms);
     }
 
     // Boot window: WiFi on so the dashboard can flip us into testing mode.
@@ -507,7 +555,7 @@ void setup() {
     ledBlink(3);
     digitalWrite(PIN_EXT_LED, LOW);
     Serial.println("[boot] ready — sampling every "
-                   + String(SAMPLE_BASELINE_MS / 1000) + " s");
+                   + String(g_config.poll_interval_ms / 1000.0f) + " s");
     RecordFields snap; buildFields(snap);
     printFields(snap);
 }
@@ -517,7 +565,7 @@ void loop() {
     const uint32_t now = millis();
 
     // --- fixed-cadence baseline sample ---
-    if (tSample == 0 || now - tSample >= SAMPLE_BASELINE_MS) {
+    if (tSample == 0 || now - tSample >= g_config.poll_interval_ms) {
         tSample = now;
 
         if (wifiShouldStayOn() && WiFi.status() != WL_CONNECTED) wifiConnect();
@@ -525,6 +573,7 @@ void loop() {
             if (s_serverHost.length() == 0) discoverServer(); }
 
         RecordFields f; buildFields(f);
+        logCapturedValues(f);  // print latest values to serial
         Record rec = record_pack(f);
         if (s_ringReady) {
             ringstore_push(rec);

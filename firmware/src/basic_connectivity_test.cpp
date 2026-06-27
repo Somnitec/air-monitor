@@ -3,7 +3,7 @@
 #include <ArduinoOTA.h>
 #include <Wire.h>
 #include <driver/i2s.h>
-#include "secrets.h"
+#include "../../secrets.h"
 
 // ---------------- Configuration ----------------
 

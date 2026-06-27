@@ -82,7 +82,7 @@ The server advertises itself on the LAN over **mDNS/zeroconf** as
 IP + port automatically — so when the station roams to a different network, it
 just re-discovers the server. No IP to hardcode or update.
 
-`SYNC_HOST`/`SYNC_PORT` in `firmware/src/secrets.h` are only a **fallback** used if mDNS
+`SYNC_HOST`/`SYNC_PORT` in `secrets.h` are only a **fallback** used if mDNS
 discovery turns up nothing (e.g. a network that blocks multicast). You can leave
 them at the defaults unless you hit that case.
 
@@ -201,7 +201,7 @@ works; if not, the poller stays quiet. Disable it entirely with `AIRCRAFT_ENABLE
 It reads `AIRCRAFT_JSON_PATH` (default `/run/readsb/aircraft.json`) or, if set,
 fetches `AIRCRAFT_JSON_URL` over HTTP instead. "Home" for range/bearing is the shared
 station location: by default the server reads `STATION_LAT`/`STATION_LON` from the
-firmware's `../firmware/src/secrets.h` (override with `AIRMON_LAT`/`AIRMON_LON` or
+firmware's `../secrets.h` (override with `AIRMON_LAT`/`AIRMON_LON` or
 point `AIRMON_FIRMWARE_SECRETS` elsewhere), so weather, aircraft, and the map agree.
 
 ### Setting up the SDR (RTL-SDR Blog V4)
