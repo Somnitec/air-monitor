@@ -335,26 +335,45 @@ static void printFields(const RecordFields& f) {
                       f.noise_clip ? "  CLIP" : "");
 }
 
-// Compact one-line summary of latest capture for serial logging.
+// Comprehensive latest-capture serial logging.
 static void logCapturedValues(const RecordFields& f) {
-    char buf[256];
-    int pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "[latest] ");
+    Serial.printf("[latest] ts=%u up=%u.%us\n", f.ts, f.up_ms / 1000, (f.up_ms % 1000) / 100);
+
     if (f.has_sen66)
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "PM2.5=%.1f ", f.pm25);
-    if (f.has_mic)
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "LAeq=%.1f LAmax=%.1f ", f.noise_dba, f.noise_lamax);
-    if (f.has_adxl)
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "PPV=%.2f mm/s ", f.ppv_m_s * 1000.0f);
+        Serial.printf("  SEN66   PM2.5=%.1f PM10=%.1f ug/m3  CO2=%u ppm  T=%.1fC  RH=%.1f%%\n",
+                      f.pm25, f.pm10, f.co2, f.temp, f.rh);
+
     if (f.has_bme)
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "T=%.1f RH=%.1f%% ", f.bme_temp, f.bme_rh);
+        Serial.printf("  BME280  T=%.1fC  RH=%.1f%%  P=%.1f hPa\n",
+                      f.bme_temp, f.bme_rh, f.pressure);
+
+    if (f.has_bh1750)
+        Serial.printf("  BH1750  lux=%.0f\n", f.lux);
+
+    if (f.has_mic)
+        Serial.printf("  INMP441 LAeq=%.1f  LAmax=%.1f  LCeq=%.1f  LC-LA=%.1f dB  dBFS=%.1f%s\n",
+                      f.noise_dba, f.noise_lamax, f.noise_lceq,
+                      f.noise_lceq - f.noise_dba, f.noise_dbfs,
+                      f.noise_clip ? "  CLIP!" : "");
+
+    if (f.has_adxl) {
+        Serial.printf("  ADXL345 RMS=%.3f  peak=%.3f m/s²  PPV=%.2f mm/s  dom=%u Hz\n",
+                      f.rumble_rms, f.rumble_peak, f.ppv_m_s * 1000.0f, f.accel_dom_hz);
+        Serial.printf("          vib: 4Hz=%.0f  8Hz=%.0f  16Hz=%.0f  31Hz=%.0f  63Hz=%.0f  125Hz=%.0f dBm/s²\n",
+                      f.accel_band_db[0], f.accel_band_db[1], f.accel_band_db[2],
+                      f.accel_band_db[3], f.accel_band_db[4], f.accel_band_db[5]);
+    }
+
+    if (f.has_co)      Serial.printf("  CO      %u mV\n", f.co_mv);
+    if (f.has_hcho)    Serial.printf("  HCHO    %u mV\n", f.hcho_mv);
+    if (f.has_soil)    Serial.printf("  soil    %u mV\n", f.soil_mv);
+
     if (f.has_battery) {
         float v = f.bat_raw_mv / 1000.0f * BAT_DIVIDER_FACTOR;
         float pct = (v - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V) * 100.0f;
         if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "bat=%.2fV(%.0f%%) ", v, pct);
+        Serial.printf("  battery %.2f V  %.0f%%%s\n", v, pct, f.bat_cal ? "" : "  (uncal)");
     }
-    Serial.println(buf);
 }
 
 // ---------------------------------------------------------------------------

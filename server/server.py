@@ -54,21 +54,50 @@ _db_lock = asyncio.Lock()
 _conn: sqlite3.Connection
 
 
+# Records timestamped before this are from an unsynced ESP32 clock and can't be
+# trusted (mirrors firmware EPOCH_VALID_AFTER = 2025-01-01).
+EPOCH_VALID_AFTER = 1735689600
+
+# Numeric scalar fields unpacked from the JSON payload into real, queryable columns.
+# Generated VIRTUAL columns: no value duplication, payload stays the source of truth,
+# but `SELECT pm25, noise_dba ...` and indexes Just Work for analysis. Per-band arrays
+# (noise_bands, accel bands) stay in the payload — query them with json_extract as needed.
+READING_METRIC_COLS = [
+    "pm1", "pm25", "pm4", "pm10", "co2", "voc", "nox", "temp", "rh", "lux",
+    "pressure_hpa", "bme_temp", "bme_rh",
+    "rumble", "rumble_peak", "accel_mag", "ppv_mm_s", "accel_dom_hz",
+    "co_mv", "co_rs", "hcho_mv", "hcho_rs", "soil_mv", "soil_pct",
+    "bat_raw_mv", "bat_v", "bat_pct",
+    "noise_dba", "noise_spl", "noise_dbfs", "lamax", "lceq", "lc_minus_la",
+]
+
+
+def _metric_col_ddl() -> str:
+    return ",\n            ".join(
+        f"{c} REAL GENERATED ALWAYS AS (json_extract(payload,'$.{c}')) VIRTUAL"
+        for c in READING_METRIC_COLS
+    )
+
+
 def _init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")     # crash-resilient, good for a USB stick
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.executescript(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS readings (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts          INTEGER NOT NULL,          -- sensor unix epoch (UTC)
+            ts          INTEGER NOT NULL,          -- effective unix epoch (best estimate, queryable)
+            device_ts   INTEGER,                   -- raw ts the device reported (may be unsynced/garbage)
             device      TEXT,
-            ts_ok       INTEGER DEFAULT 1,         -- 0 = ESP32 clock was unsynced
-            ts_status   TEXT DEFAULT 'ok',         -- 'ok' | 'provisional' | 'corrected'
+            up_ms       INTEGER,                   -- device uptime at capture (monotonic, always reliable)
+            boot        INTEGER,                   -- per-boot id (up_ms resets each boot)
+            ts_ok       INTEGER DEFAULT 1,         -- 0 = ESP32 clock was unsynced at capture
+            ts_source   TEXT DEFAULT 'device',     -- 'device' | 'uptime' | 'received' | 'corrected'
             received_at INTEGER NOT NULL,          -- server unix epoch when stored
-            payload     TEXT NOT NULL              -- full JSON record, verbatim
+            payload     TEXT NOT NULL,             -- full JSON record, verbatim
+            {_metric_col_ddl()}
         );
         CREATE INDEX IF NOT EXISTS idx_readings_ts     ON readings(ts);
         CREATE INDEX IF NOT EXISTS idx_readings_device ON readings(device);
@@ -81,54 +110,131 @@ def _init_db() -> sqlite3.Connection:
             note  TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+
+        -- Human-readable view: timestamps as local-time strings + the unpacked metrics.
+        DROP VIEW IF EXISTS readings_h;
+        CREATE VIEW readings_h AS
+            SELECT id,
+                   datetime(ts, 'unixepoch', 'localtime')          AS time,
+                   datetime(received_at, 'unixepoch', 'localtime') AS received,
+                   ts_source, device, boot,
+                   {', '.join(READING_METRIC_COLS)}
+            FROM readings ORDER BY ts;
         """
     )
-    # Migrate older DBs that predate the ts_status column.
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(readings)")}
-    if "ts_status" not in cols:
-        conn.execute("ALTER TABLE readings ADD COLUMN ts_status TEXT DEFAULT 'ok'")
-        conn.execute("UPDATE readings SET ts_status='provisional' WHERE ts_ok=0")
+    _migrate_readings(conn)
     conn.commit()
     weather_store.init_weather_table(conn)    # external weather/air-quality series
     aircraft_store.init_aircraft_table(conn)  # ADS-B sightings (logged, throttled)
     return conn
 
 
-def _dedupe_insert(rec: dict[str, Any]) -> bool:
-    """Insert one reading. Returns True if newly stored, False if a duplicate
-    (same device+ts) was skipped — makes re-syncs after a crash idempotent."""
-    ts = int(rec.get("ts", 0))
+def _migrate_readings(conn: sqlite3.Connection) -> None:
+    """Bring a pre-existing readings table up to the current schema (add the new
+    bookkeeping + generated metric columns) and fix up implausible timestamps."""
+    # table_xinfo (not table_info) also lists generated columns, so we don't try to
+    # re-add an existing virtual column.
+    cols = {r[1] for r in conn.execute("PRAGMA table_xinfo(readings)")}
+    add = []
+    if "device_ts" not in cols:
+        add.append("ALTER TABLE readings ADD COLUMN device_ts INTEGER")
+    if "up_ms" not in cols:
+        add.append("ALTER TABLE readings ADD COLUMN up_ms INTEGER")
+    if "boot" not in cols:
+        add.append("ALTER TABLE readings ADD COLUMN boot INTEGER")
+    if "ts_source" not in cols:
+        add.append("ALTER TABLE readings ADD COLUMN ts_source TEXT DEFAULT 'device'")
+    for stmt in add:
+        conn.execute(stmt)
+    for c in READING_METRIC_COLS:
+        if c not in cols:
+            conn.execute(
+                f"ALTER TABLE readings ADD COLUMN {c} REAL "
+                f"GENERATED ALWAYS AS (json_extract(payload,'$.{c}')) VIRTUAL"
+            )
+    if add:
+        # Backfill new bookkeeping columns from the stored payload.
+        conn.execute(
+            "UPDATE readings SET "
+            "  device_ts = COALESCE(device_ts, ts), "
+            "  up_ms = COALESCE(up_ms, json_extract(payload,'$.up_ms')), "
+            "  boot  = COALESCE(boot,  json_extract(payload,'$.boot'))"
+        )
+        # One-time repair: any row whose effective ts is implausibly old (unsynced
+        # device clock) gets re-derived from uptime, anchored to the newest record of
+        # its boot (whose up_ms ≈ received_at). Keeps intra-boot ordering, lands it in
+        # real time so it shows up in the dashboard.
+        conn.execute(
+            f"""
+            WITH anchor AS (
+                SELECT boot,
+                       MAX(up_ms) AS max_up,
+                       MAX(received_at) AS recv
+                FROM readings WHERE boot IS NOT NULL AND up_ms IS NOT NULL
+                GROUP BY boot
+            )
+            UPDATE readings
+               SET ts = CAST(a.recv - (a.max_up - readings.up_ms) / 1000.0 AS INTEGER),
+                   ts_source = 'uptime'
+              FROM anchor a
+             WHERE readings.boot = a.boot
+               AND readings.up_ms IS NOT NULL
+               AND readings.ts < {EPOCH_VALID_AFTER}
+            """
+        )
+
+
+def _effective_ts(rec: dict[str, Any], received_at: int, boot_anchor_up_ms: int | None) -> tuple[int, str]:
+    """Return (effective_ts, source). Trust the device clock when it's plausibly
+    synced; otherwise reconstruct from uptime: the record with the largest up_ms in
+    this boot's batch was captured ≈ received_at, so every record's real time is
+    received_at − (max_up_ms − this_up_ms). Falls back to received_at if no uptime."""
+    device_ts = int(rec.get("ts", 0) or 0)
+    ts_ok = bool(rec.get("ts_ok", True))
+    now = received_at
+    if ts_ok and EPOCH_VALID_AFTER < device_ts <= now + 86400:
+        return device_ts, "device"
+    up_ms = rec.get("up_ms")
+    if up_ms is not None and boot_anchor_up_ms is not None:
+        return int(received_at - (boot_anchor_up_ms - up_ms) / 1000.0), "uptime"
+    return received_at, "received"
+
+
+def _dedupe_insert(rec: dict[str, Any], received_at: int, eff_ts: int, source: str) -> bool:
+    """Insert one reading at its effective timestamp. Returns True if newly stored,
+    False if a duplicate (same device + device_ts + boot) was skipped — makes
+    re-syncs after a crash idempotent."""
     device = rec.get("dev") or rec.get("device")
+    device_ts = int(rec.get("ts", 0) or 0)
+    boot = rec.get("boot")
     ts_ok = 1 if rec.get("ts_ok", True) else 0
 
     cur = _conn.execute(
-        "SELECT 1 FROM readings WHERE ts=? AND device IS ? LIMIT 1", (ts, device)
+        "SELECT 1 FROM readings WHERE device IS ? AND device_ts=? AND boot IS ? LIMIT 1",
+        (device, device_ts, boot),
     )
     if cur.fetchone() is not None:
         return False
-    status = "ok" if ts_ok else "provisional"
     _conn.execute(
-        "INSERT INTO readings (ts, device, ts_ok, ts_status, received_at, payload) "
-        "VALUES (?,?,?,?,?,?)",
-        (ts, device, ts_ok, status, int(time.time()),
+        "INSERT INTO readings "
+        "(ts, device_ts, device, up_ms, boot, ts_ok, ts_source, received_at, payload) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (eff_ts, device_ts, device, rec.get("up_ms"), boot, ts_ok, source, received_at,
          json.dumps(rec, separators=(",", ":"))),
     )
     return True
 
 
 def _backfill_times(device: Any, boot: Any) -> int:
-    """Retroactively fix a boot's early records. The ESP32 logs with provisional
-    (uptime-based) timestamps until its clock is set; every record carries up_ms
-    and a per-boot id. Once any record of this boot has a reliable clock (ts_ok=1),
-    we know boot_epoch = ts - up_ms/1000, so each earlier record's true time is
-    boot_epoch + up_ms/1000. Only the db columns change; payload stays verbatim.
-    Returns the number of rows corrected."""
+    """Promote a boot's uptime-derived estimates to true time once a record with a
+    real synced clock (ts_source='device') arrives. boot_epoch = device_ts − up_ms/1000
+    from that record, so every other record's true time is boot_epoch + up_ms/1000.
+    Only db columns change; payload stays verbatim. Returns the rows corrected."""
     if boot is None:
         return 0
     row = _conn.execute(
-        "SELECT ts - json_extract(payload,'$.up_ms')/1000.0 "
-        "FROM readings "
-        "WHERE device IS ? AND json_extract(payload,'$.boot')=? AND ts_ok=1 "
+        "SELECT device_ts - up_ms/1000.0 FROM readings "
+        "WHERE device IS ? AND boot=? AND ts_source='device' AND up_ms IS NOT NULL "
         "ORDER BY ts LIMIT 1",
         (device, boot),
     ).fetchone()
@@ -137,9 +243,9 @@ def _backfill_times(device: Any, boot: Any) -> int:
     boot_epoch = row[0]
     cur = _conn.execute(
         "UPDATE readings "
-        "SET ts = CAST(? + json_extract(payload,'$.up_ms')/1000.0 AS INTEGER), "
-        "    ts_ok=1, ts_status='corrected' "
-        "WHERE device IS ? AND json_extract(payload,'$.boot')=? AND ts_ok=0",
+        "SET ts = CAST(? + up_ms/1000.0 AS INTEGER), ts_source='corrected' "
+        "WHERE device IS ? AND boot=? AND up_ms IS NOT NULL "
+        "AND ts_source IN ('uptime','received')",
         (boot_epoch, device, boot),
     )
     return cur.rowcount
@@ -334,12 +440,18 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 
 def _flatten(row: sqlite3.Row) -> dict:
-    """Merge the stored JSON payload with the db columns into one flat dict."""
+    """Merge the stored JSON payload with the db columns into one flat dict. The
+    db `ts` (effective timestamp) overrides the payload's raw device ts so the
+    dashboard plots every reading at its best-estimate real time."""
     out = json.loads(row["payload"])
-    out["ts"] = row["ts"]
+    out["ts"] = row["ts"]                       # effective timestamp wins
     out["device"] = row["device"]
     out["ts_ok"] = bool(row["ts_ok"])
-    out["ts_status"] = row["ts_status"] if "ts_status" in row.keys() else "ok"
+    keys = row.keys()
+    if "ts_source" in keys:
+        out["ts_source"] = row["ts_source"]
+    if "device_ts" in keys:
+        out["device_ts"] = row["device_ts"]
     return out
 
 
@@ -359,6 +471,15 @@ async def ingest(request: Request):
     else:
         records = body if isinstance(body, list) else [body]
 
+    received_at = int(time.time())
+    # Per-boot anchor: the largest uptime in this batch ≈ captured at received_at,
+    # so uptime-derived timestamps for that boot hang off it (preserves intra-boot order).
+    anchor_up: dict[Any, int] = {}
+    for rec in records:
+        if isinstance(rec, dict) and rec.get("up_ms") is not None:
+            b = rec.get("boot")
+            anchor_up[b] = max(anchor_up.get(b, 0), int(rec["up_ms"]))
+
     stored = []
     corrected = 0
     async with _db_lock:
@@ -366,11 +487,13 @@ async def ingest(request: Request):
         for rec in records:
             if not isinstance(rec, dict):
                 continue
-            if _dedupe_insert(rec):
+            eff_ts, source = _effective_ts(rec, received_at, anchor_up.get(rec.get("boot")))
+            if _dedupe_insert(rec, received_at, eff_ts, source):
+                rec = {**rec, "ts": eff_ts, "ts_source": source}   # broadcast at effective time
                 stored.append(rec)
-            if rec.get("ts_ok", True) and rec.get("boot") is not None:
+            if source == "device" and rec.get("boot") is not None:
                 boots.add((rec.get("dev") or rec.get("device"), rec.get("boot")))
-        # A reliably-timed record lets us back-fill that boot's earlier provisional ones.
+        # A reliably-timed record lets us back-fill that boot's uptime-derived ones.
         for device, boot in boots:
             corrected += _backfill_times(device, boot)
         _conn.commit()
@@ -392,6 +515,8 @@ async def ingest(request: Request):
             "server_time": int(time.time())}
     if dev and dev in PENDING_CMD:
         resp["command"] = {"set_mode": PENDING_CMD[dev]}
+    if dev and DEVICE_CONFIG.get(dev):           # firmware applyServerConfig() reads this
+        resp["config"] = DEVICE_CONFIG[dev]
     return resp
 
 
@@ -404,7 +529,7 @@ async def get_readings(
     device: str | None = None,
 ):
     """Time-range query. `since`/`until` are unix epoch seconds."""
-    sql = "SELECT ts, device, ts_ok, payload FROM readings WHERE 1=1"
+    sql = "SELECT ts, device_ts, ts_ok, ts_source, payload FROM readings WHERE 1=1"
     args: list[Any] = []
     if since is not None:
         sql += " AND ts >= ?"; args.append(int(since))
@@ -612,12 +737,11 @@ async def audio_bands(
 # To make it persistent, store in the database or a config file.
 DEVICE_CONFIG: dict[str, dict] = {}  # dev -> {poll_interval_s, ...}
 
-@app.get("/api/config")
-async def get_config(device: str | None = None):
-    """Get device configuration. If `device` omitted, returns all devices' configs."""
-    if device:
-        return JSONResponse(DEVICE_CONFIG.get(device, {}))
-    return JSONResponse(DEVICE_CONFIG)
+@app.get("/api/config/{device}")
+async def get_device_config(device: str):
+    """One device's pushed config (poll_interval_s, …). Delivered to the device in
+    each /ingest reply; this is just for inspection from the dashboard/CLI."""
+    return JSONResponse(DEVICE_CONFIG.get(device, {}))
 
 
 @app.post("/api/config/{device}")
@@ -713,10 +837,12 @@ async def weather_metrics():
 # ---- aircraft (ADS-B) ------------------------------------------------------ #
 @app.get("/api/config")
 async def get_config():
-    """Static-ish config the dashboard needs (home location for the map, etc.)."""
+    """Static-ish config the dashboard needs (home location for the map, SDR status,
+    and any per-device pushed configs)."""
     s = aircraft_config.settings()
     return {"home": [s["lat"], s["lon"]], "aircraft_enabled": s["enabled"],
-            "max_range_km": s["max_range_km"], "sdr": _sdr_status_cached()}
+            "max_range_km": s["max_range_km"], "sdr": _sdr_status_cached(),
+            "devices": DEVICE_CONFIG}
 
 
 @app.get("/api/aircraft")
