@@ -30,19 +30,39 @@ CREATE TABLE IF NOT EXISTS aircraft (
     distance_km REAL,                  -- from home
     bearing_deg REAL,                  -- from home
     rssi        REAL,
+    seen        REAL,                  -- secs since last message at sample time
+    operator    TEXT,                  -- ownOp (e.g. "KLM Royal Dutch Airlines")
+    desc        TEXT,                  -- model description (e.g. "AIRBUS A-320")
+    category    TEXT,                  -- ADS-B emitter category (A3, A7, ...)
+    year        TEXT,                  -- year of manufacture
     source      TEXT DEFAULT 'local'   -- 'local' | 'public' | 'both'
 );
 CREATE INDEX IF NOT EXISTS idx_aircraft_ts  ON aircraft(ts);
 CREATE INDEX IF NOT EXISTS idx_aircraft_hex ON aircraft(hex);
 """
 
+# Columns added after the initial release; each gets a plain ALTER on older DBs.
+_ADDED_COLS = {
+    "source": "TEXT DEFAULT 'local'", "seen": "REAL", "operator": "TEXT",
+    "desc": "TEXT", "category": "TEXT", "year": "TEXT",
+}
+
 
 def init_aircraft_table(conn: sqlite3.Connection) -> None:
     conn.executescript(_DDL)
-    # Migrate older DBs that predate the source column.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(aircraft)")}
-    if "source" not in cols:
-        conn.execute("ALTER TABLE aircraft ADD COLUMN source TEXT DEFAULT 'local'")
+    for name, decl in _ADDED_COLS.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE aircraft ADD COLUMN {name} {decl}")
+    # Human-readable view for casual DB browsing.
+    conn.executescript(
+        "DROP VIEW IF EXISTS aircraft_h;"
+        "CREATE VIEW aircraft_h AS SELECT id,"
+        " datetime(ts,'unixepoch','localtime') AS time, hex, flight, type, desc,"
+        " category, operator, reg, year, alt_baro, gs, track, baro_rate,"
+        " round(distance_km,2) AS dist_km, round(bearing_deg) AS brg, source"
+        " FROM aircraft ORDER BY ts;"
+    )
     conn.commit()
 
 
@@ -54,14 +74,15 @@ def insert(conn: sqlite3.Connection, aircraft: list[Aircraft], *,
     rows = [
         (now, a.hex, a.flight, a.type, a.reg, a.lat, a.lon, a.alt_baro,
          a.gs, a.track, a.baro_rate, a.distance_km, a.bearing_deg, a.rssi,
-         a.source)
+         a.seen, a.operator, a.desc, a.category, a.year, a.source)
         for a in aircraft
     ]
     conn.executemany(
         "INSERT INTO aircraft "
         "(ts, hex, flight, type, reg, lat, lon, alt_baro, gs, track, "
-        " baro_rate, distance_km, bearing_deg, rssi, source) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " baro_rate, distance_km, bearing_deg, rssi, seen, operator, desc, "
+        " category, year, source) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     conn.commit()
