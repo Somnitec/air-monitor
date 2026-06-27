@@ -104,10 +104,12 @@
   .achead .acchev { margin-left:auto; color:var(--mut); transition:transform .2s; }
   .acpanel.collapsed .acchev { transform:rotate(-90deg); }
   .acbody { display:flex; flex-wrap:wrap; }
+  #pathSide { height:360px; flex:0 0 360px; width:360px; background:#0e1117; border-right:1px solid var(--line); cursor:default; }
   #acmap { height:360px; flex:2 1 360px; min-width:260px; background:#0e1117; }
   .actablewrap { flex:1 1 300px; max-height:360px; overflow:auto; border-left:1px solid var(--line); -webkit-overflow-scrolling:touch; }
   .actable { width:100%; border-collapse:collapse; font-size:13px; }
   .actable th, .actable td { padding:7px 9px; text-align:left; white-space:nowrap; border-bottom:1px solid var(--line); }
+  .actable td { -webkit-user-select:text; user-select:text; }
   .actable th { position:sticky; top:0; background:#1b1f28; color:var(--mut); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
   .actable tbody tr:hover { background:#1b1f28; }
   .actable .up { color:#2ecc71; } .actable .down { color:#ff8c69; } .actable .lvl { color:var(--mut); }
@@ -115,8 +117,55 @@
   .leaflet-container { background:#0e1117; font:inherit; }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip { background:#171a21; color:var(--fg); }
   .leaflet-bar a { background:#222633; color:var(--fg); border-color:var(--line); }
-  .planeicon { font-size:17px; line-height:17px; filter:drop-shadow(0 0 2px #000); }
+  .planeicon { filter:drop-shadow(0 0 2px #000); }    /* font-size set per-icon by weight */
+  /* public-only aircraft (reference feed, not heard by our SDR): dimmed + desaturated */
+  .planeicon.public { opacity:.45; filter:grayscale(1) drop-shadow(0 0 2px #000); }
+  .actable tr.public td { color:var(--mut); }
+  .kindbadge { font-size:10px; font-weight:600; padding:1px 5px; border-radius:4px;
+               background:rgba(255,255,255,.07); color:var(--mut); margin-left:4px; vertical-align:middle; }
+  /* SDR-connected badge in the aircraft header */
+  .sdrbadge { font-size:11px; font-weight:700; padding:2px 7px; border-radius:7px;
+              background:#3a1f23; color:#ffb3bd; }      /* default: not connected */
+  .sdrbadge.on  { background:#1f7a44; color:#eafff1; }  /* dongle present */
+  .sdrbadge.unknown { background:#222633; color:var(--mut); }
+  .howlbtn { background:#1a2535; color:#8bb8e8; border:1px solid #2a3f5a; border-radius:7px;
+             padding:2px 9px; font-size:12px; font-weight:600; cursor:pointer; line-height:1.6; }
+  .howlbtn:active { background:#223047; }
+  .howllast { font-size:11px; color:var(--mut); }
+  /* compact range slider inline in the aircraft header */
+  .acrangeslider { -webkit-appearance:none; appearance:none; width:80px; height:4px; background:var(--line);
+                   border-radius:2px; border:none; min-height:unset; padding:0; cursor:pointer; vertical-align:middle; }
+  .acrangeslider::-webkit-slider-thumb { -webkit-appearance:none; width:14px; height:14px;
+    border-radius:50%; background:var(--accent); cursor:pointer; }
+  /* mode toggle in main header */
+  .modebtn { font-size:12px; font-weight:700; padding:3px 10px; border-radius:7px; cursor:pointer; min-height:unset;
+             background:#1b2535; color:#8bb8e8; border:1px solid #2a3f5a; width:auto; }
+  .modebtn.home { background:#1f3a1f; color:#9effa0; border-color:#2a5a2a; }
+  /* home/plane mode visibility */
+  body.homemode #aircraftPanel { display:none; }
+  body.planemode header .pill.hide-sm { display:none; }
+  body.planemode #homeSection { display:none; }
+  /* clickable flight number */
+  .flightlink { color:var(--accent); text-decoration:none; }
+  .flightlink:hover { text-decoration:underline; }
+  /* selected aircraft row */
+  .actable tbody tr.selected td { background:#1b2a3a; }
+  /* metrics list section headers + current-value readout */
+  .metrics-head { font-size:10px; font-weight:700; text-transform:uppercase; color:var(--mut); letter-spacing:.06em; margin:8px 0 3px; }
+  .metrics label .curval { float:right; color:#7ec8e3; font-size:10px; opacity:.8; }
+  /* outdoor weather strip */
+  #weatherStrip { display:flex; flex-wrap:wrap; gap:6px 14px; padding:6px 14px; background:#10141c;
+    border-bottom:1px solid var(--line); font-size:12px; color:#9aa3b5; align-items:center; }
+  #weatherStrip .witem { display:flex; align-items:center; gap:4px; white-space:nowrap; }
+  #weatherStrip .witem strong { color:#cfd5e3; }
+  #weatherStrip .wsrc { margin-left:auto; color:#556; font-size:10px; }
+  .windArrow { display:inline-block; font-size:14px; line-height:1; }
+  /* Leaflet weather control */
+  .leaflet-weather-ctrl { background:rgba(14,17,23,0.82); color:#cfd5e3; padding:6px 8px;
+    border-radius:6px; font-size:11px; line-height:1.6; pointer-events:none; }
+  .leaflet-weather-ctrl .wrow { display:flex; align-items:center; gap:5px; }
   @media (max-width: 820px) { .acpanel { margin:10px 10px 0; } #acmap { flex-basis:100%; height:300px; }
+    #pathSide { flex-basis:100%; height:240px; width:100%; border-right:none; border-bottom:1px solid var(--line); }
     .actablewrap { border-left:none; border-top:1px solid var(--line); } }
 </style>
 </head>
@@ -124,6 +173,7 @@
 <header>
   <button id="menu" class="iconbtn" aria-label="Menu">☰</button>
   <h1>🌫️ Air Monitor</h1>
+  <button type="button" id="modeBtn" class="modebtn" title="Toggle home/plane mode">🏠 Home</button>
   <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt" class="hide-sm">connecting…</span></span>
   <span class="pill" id="devmode" title="Sensor device mode"></span>
   <span class="grow"></span>
@@ -138,19 +188,26 @@
   <div class="achead" id="acHead">
     <h2>✈ Aircraft</h2>
     <span class="account" id="acCount">—</span>
+    <input type="range" id="acRangeHead" min="0.5" max="20" step="0.5" class="acrangeslider" title="Range" />
     <span class="acrange" id="acRangeLbl"></span>
+    <span class="sdrbadge" id="sdrBadge" title="RTL-SDR dongle">SDR —</span>
+    <button type="button" class="howlbtn" id="howlBtn" title="Mark: I heard the howl">🔊 Heard it howl</button>
+    <span class="howllast" id="howlLast"></span>
     <span class="acchev">▾</span>
   </div>
   <div class="acbody">
+    <canvas id="pathSide" width="360" height="360" title="Side view — altitude cross-section (W←→E)"></canvas>
     <div id="acmap"></div>
     <div class="actablewrap">
       <table class="actable">
-        <thead><tr><th>Flight</th><th>Type</th><th>Alt</th><th>Spd</th><th>Dist</th><th>Brg</th><th></th></tr></thead>
+        <thead><tr><th></th><th>Flight</th><th>Airline</th><th>Kind</th><th>Model</th><th>Wt</th><th>Age</th><th>Alt (ft)</th><th>Spd (kt)</th><th>Dist (km)</th><th title="Bearing from station">Dir °</th><th></th></tr></thead>
         <tbody id="acRows"></tbody>
       </table>
     </div>
   </div>
 </div>
+
+<div id="weatherStrip" style="display:none"></div>
 
 <div class="wrap">
   <div class="controls" id="drawer">
@@ -158,6 +215,8 @@
       <h2>Time range</h2>
       <label>Window</label>
       <select id="range">
+        <option value="900">Last 15 min</option>
+        <option value="1800">Last 30 min</option>
         <option value="3600">Last hour</option>
         <option value="21600">Last 6 hours</option>
         <option value="86400" selected>Last 24 hours</option>
@@ -169,16 +228,13 @@
         <label>From</label><input type="datetime-local" id="from" />
         <label>To</label><input type="datetime-local" id="to" />
       </div>
-      <div class="row" style="margin-top:10px">
-        <button id="refresh">Query</button>
-        <button class="sec" id="livebtn">Live: on</button>
-      </div>
-    </section>
-
-    <section>
-      <h2>✈ Aircraft range</h2>
-      <label>Show planes within <span id="acRangeVal">40</span> km</label>
-      <input type="range" id="acRange" min="5" max="250" step="5" value="40" class="slider" />
+      <select id="liveintvl" title="Dashboard refresh interval" style="margin-top:8px">
+        <option value="0">Live (WS)</option>
+        <option value="60">Every 1 min</option>
+        <option value="300">Every 5 min</option>
+        <option value="900">Every 15 min</option>
+        <option value="3600">Every 1 hr</option>
+      </select>
     </section>
 
     <section>
@@ -186,7 +242,7 @@
       <div class="metrics" id="metrics"></div>
     </section>
 
-    <section>
+    <section id="homeSection">
       <h2>Home state</h2>
       <div class="events-grid" id="toggles"></div>
       <label style="margin-top:14px">💨 Ventilation — <span id="ventVal">0%</span></label>
@@ -197,9 +253,6 @@
     <section>
       <h2>Sensor device</h2>
       <div class="stat" id="devstat">no device seen yet</div>
-      <div class="row" style="margin-top:10px">
-        <button id="testBtn" class="sec">Enter testing mode</button>
-      </div>
       <div class="stat" id="devpending"></div>
     </section>
 
@@ -253,14 +306,42 @@ const GROUP_ORDER = [
   'Light (lux)','Noise (dB)','Noise (dBFS)','Soil','Motion (m/s²)',
 ];
 function groupRank(g) {
-  if (g === 'Battery') return 1e6;        // always at the bottom
+  if (g === 'Battery') return 1e6;
   const i = GROUP_ORDER.indexOf(g);
-  return i < 0 ? 5e5 : i;                  // unknown groups sit above Battery
+  return i < 0 ? 5e5 : i;
 }
+
+// Weather metric metadata (variables returned by /api/weather).
+// Groups that overlap with META (e.g. 'Particulates') share the same Plotly chart.
+const WEATHER_META = {
+  temperature_2m:       { g:'Temp / Humidity', n:'Outdoor °C' },
+  apparent_temperature: { g:'Temp / Humidity', n:'Feels like °C' },
+  dew_point_2m:         { g:'Temp / Humidity', n:'Dew point °C' },
+  relative_humidity_2m: { g:'Temp / Humidity', n:'Outdoor RH %' },
+  pressure_msl:         { g:'Pressure (hPa)', n:'Outdoor hPa' },
+  precipitation:        { g:'Precipitation (mm)', n:'Precip mm' },
+  rain:                 { g:'Precipitation (mm)', n:'Rain mm' },
+  rain_live:            { g:'Precipitation (mm)', n:'Rain live mm' },
+  cloud_cover:          { g:'Cloud & Radiation', n:'Cloud %' },
+  shortwave_radiation:  { g:'Cloud & Radiation', n:'Solar W/m²' },
+  global_radiation:     { g:'Cloud & Radiation', n:'Global rad W/m²' },
+  direct_radiation:     { g:'Cloud & Radiation', n:'Direct W/m²' },
+  wind_speed_10m:       { g:'Wind', n:'Wind m/s' },
+  wind_gusts_10m:       { g:'Wind', n:'Gusts m/s' },
+  wind_direction_10m:   { g:'Wind', n:'Wind dir °' },
+  pm10:                 { g:'Particulates (µg/m³)', n:'Outdoor PM10' },
+  pm2_5:                { g:'Particulates (µg/m³)', n:'Outdoor PM2.5' },
+  european_aqi:         { g:'Air Quality Index', n:'EU AQI' },
+  no2:                  { g:'Air Quality Index', n:'NO₂ µg/m³' },
+  o3:                   { g:'Air Quality Index', n:'O₃ µg/m³' },
+  uv_index:             { g:'Air Quality Index', n:'UV index' },
+};
 
 let live = true, selected = new Set(), allMetrics = [];
 let dataCache = [];   // current query result (array of flat records)
+let weatherCache = [];
 let eventsCache = [];
+let _allWeatherMetrics = [], _selectedWeather = new Set();
 
 const $ = s => document.querySelector(s);
 
@@ -275,19 +356,55 @@ function fmtRange() {
 }
 
 async function loadMetrics() {
-  allMetrics = await (await fetch('/api/metrics')).json();
-  if (selected.size === 0)
-    allMetrics.forEach(m => selected.add(m));   // everything on when you first arrive
-  const box = $('#metrics'); box.innerHTML = '';
-  allMetrics.forEach(m => {
+  const [sensorMs, weatherMs] = await Promise.all([
+    (await fetch('/api/metrics')).json(),
+    fetch('/api/weather/metrics').then(r => r.json()).catch(() => []),
+  ]);
+  allMetrics = sensorMs;
+  _allWeatherMetrics = weatherMs.map(m => m.name).filter(m => WEATHER_META[m]);
+  if (selected.size === 0) {
+    allMetrics.forEach(m => selected.add(m));
+    _allWeatherMetrics.forEach(m => _selectedWeather.add(m));
+  }
+  renderMetricsList();
+}
+
+function renderMetricsList() {
+  const box = $('#metrics'); if (!box) return;
+  box.innerHTML = '';
+
+  const makeRow = (m, isWeather) => {
     const lbl = document.createElement('label');
     const cb = document.createElement('input');
-    cb.type = 'checkbox'; cb.checked = selected.has(m);
-    cb.onchange = () => { cb.checked ? selected.add(m) : selected.delete(m); render(); };
+    cb.type = 'checkbox';
+    cb.checked = isWeather ? _selectedWeather.has(m) : selected.has(m);
+    cb.onchange = () => {
+      if (isWeather) { cb.checked ? _selectedWeather.add(m) : _selectedWeather.delete(m); }
+      else           { cb.checked ? selected.add(m) : selected.delete(m); }
+      render();
+    };
+    const meta = isWeather ? WEATHER_META[m] : META[m];
+    const name = meta?.n || m;
+    const cur  = isWeather ? (_weatherLatest[m] ?? null)
+                           : (dataCache.length ? (dataCache.at(-1)[m] ?? null) : null);
+    const curStr = cur != null ? ` <span class="curval">${typeof cur === 'number' ? cur.toFixed(cur < 10 ? 1 : 0) : cur}</span>` : '';
     lbl.appendChild(cb);
-    lbl.appendChild(document.createTextNode((META[m]?.n || m)));
-    box.appendChild(lbl);
-  });
+    lbl.innerHTML += ` ${name}${curStr}`;
+    return lbl;
+  };
+
+  if (allMetrics.length) {
+    const h = document.createElement('div');
+    h.className = 'metrics-head'; h.textContent = 'Sensor';
+    box.appendChild(h);
+    allMetrics.forEach(m => box.appendChild(makeRow(m, false)));
+  }
+  if (_allWeatherMetrics.length) {
+    const h = document.createElement('div');
+    h.className = 'metrics-head'; h.textContent = 'Outdoor weather';
+    box.appendChild(h);
+    _allWeatherMetrics.forEach(m => box.appendChild(makeRow(m, true)));
+  }
 }
 
 async function query() {
@@ -295,12 +412,16 @@ async function query() {
   const qs = new URLSearchParams();
   if (since) qs.set('since', since);
   if (until) qs.set('until', until);
-  dataCache = await (await fetch('/api/readings?' + qs)).json();
-  eventsCache = await (await fetch('/api/events?' + qs)).json();
+  [dataCache, eventsCache, weatherCache] = await Promise.all([
+    (await fetch('/api/readings?' + qs)).json(),
+    (await fetch('/api/events?' + qs)).json(),
+    fetch('/api/weather?' + qs + '&limit=5000').then(r => r.json()).catch(() => []),
+  ]);
   render();
   restoreToggleStates();
   checkBattery();
   loadStats();
+  renderMetricsList();   // refresh current-value readout
 }
 
 async function loadStats() {
@@ -313,39 +434,66 @@ async function loadStats() {
 
 // group selected metrics by their chart group, one Plotly chart per group
 function render() {
+  // Each entry: { m, isWeather }
   const groups = {};
   [...selected].forEach(m => {
     const g = META[m]?.g || m;
-    (groups[g] ||= []).push(m);
+    (groups[g] ||= []).push({ m, isWeather:false });
+  });
+  [..._selectedWeather].forEach(m => {
+    const wm = WEATHER_META[m]; if (!wm) return;
+    (groups[wm.g] ||= []).push({ m, isWeather:true });
   });
 
   const host = $('#charts');
-  // remove charts no longer needed
   [...host.children].forEach(c => { if (!groups[c.dataset.group]) c.remove(); });
 
-  Object.entries(groups).forEach(([g, metrics]) => {
+  // Flyover annotations from aircraft path history
+  const { since, until } = fmtRange();
+  const flyovers = _computeFlyovers(since, until);
+  const flyShapes = flyovers.map(f => ({
+    type:'line', x0:new Date(f.ts*1000), x1:new Date(f.ts*1000), yref:'paper', y0:0, y1:1,
+    line:{color:'rgba(126,200,227,.35)', width:1, dash:'dot'},
+  }));
+  const flyAnnot = flyovers.map(f => ({
+    x:new Date(f.ts*1000), y:0.98, yref:'paper',
+    text:`${f.flight||f.hex} ${f.ascending ? '↗' : '↙'}`,
+    showarrow:false, font:{size:8, color:'#7ec8e3'}, textangle:-90, xanchor:'left', yanchor:'top',
+  }));
+
+  Object.entries(groups).forEach(([g, mlist]) => {
     let div = [...host.children].find(c => c.dataset.group === g);
     if (!div) {
       div = document.createElement('div');
       div.className = 'chart'; div.dataset.group = g; div.style.height = '260px';
       host.appendChild(div);
     }
-    const hasRight = metrics.some(m => META[m]?.a === 2);
-    const traces = metrics.map(m => ({
-      x: dataCache.map(r => new Date(r.ts*1000)),
-      y: dataCache.map(r => r[m] ?? null),
-      name: META[m]?.n || m, mode:'lines', line:{width:1.6}, connectgaps:false,
-      yaxis: META[m]?.a === 2 ? 'y2' : 'y',
-    }));
-    // event markers as vertical lines (shapes)
-    const shapes = eventsCache.map(e => ({
-      type:'line', x0:new Date(e.ts*1000), x1:new Date(e.ts*1000), yref:'paper', y0:0, y1:1,
-      line:{color:'rgba(255,200,80,.45)', width:1, dash:'dot'},
-    }));
-    const annotations = eventsCache.map(e => ({
-      x:new Date(e.ts*1000), y:1, yref:'paper', text:(e.label||e.kind), showarrow:false,
-      font:{size:9, color:'#ffce6b'}, textangle:-90, xanchor:'left', yanchor:'top',
-    }));
+    const hasRight = mlist.some(({m, isWeather}) => (isWeather ? WEATHER_META[m] : META[m])?.a === 2);
+    const traces = mlist.map(({m, isWeather}) => {
+      const meta = isWeather ? WEATHER_META[m] : META[m];
+      const cache = isWeather ? weatherCache : dataCache;
+      const tsKey = isWeather ? 'valid_ts' : 'ts';
+      return {
+        x: cache.map(r => new Date(r[tsKey]*1000)),
+        y: cache.map(r => r[m] ?? null),
+        name: meta?.n || m, mode:'lines', line:{width:1.6}, connectgaps:false,
+        yaxis: meta?.a === 2 ? 'y2' : 'y',
+      };
+    });
+    const shapes = [
+      ...eventsCache.map(e => ({
+        type:'line', x0:new Date(e.ts*1000), x1:new Date(e.ts*1000), yref:'paper', y0:0, y1:1,
+        line:{color:'rgba(255,200,80,.45)', width:1, dash:'dot'},
+      })),
+      ...flyShapes,
+    ];
+    const annotations = [
+      ...eventsCache.map(e => ({
+        x:new Date(e.ts*1000), y:1, yref:'paper', text:(e.label||e.kind), showarrow:false,
+        font:{size:9, color:'#ffce6b'}, textangle:-90, xanchor:'left', yanchor:'top',
+      })),
+      ...flyAnnot,
+    ];
     const ax = GROUP_AXES[g] || {};
     const layout = {
       title:{text:g, font:{size:13, color:'#cfd5e3'}, x:0.01},
@@ -370,6 +518,78 @@ function render() {
     .forEach(c => host.appendChild(c));
 }
 
+// ---- outdoor weather (public providers) -----------------------------------
+let _weatherLatest = {};   // key → latest numeric value from weather API
+
+function _pickFirst(obj, ...keys) {
+  for (const k of keys) if (obj[k] != null) return obj[k];
+  return null;
+}
+
+function renderWeather() {
+  const w = _weatherLatest;
+  const strip = $('#weatherStrip');
+  if (!strip) return;
+  const temp    = _pickFirst(w, 'temperature_2m','temp');
+  const rh      = _pickFirst(w, 'relative_humidity_2m','relative_humidity','humidity');
+  const wspd    = _pickFirst(w, 'wind_speed_10m','wind_speed');
+  const wdir    = _pickFirst(w, 'wind_direction_10m','wind_direction','wind_angle','winddir');
+  const precip  = _pickFirst(w, 'precipitation','rain','rain_live');
+  const cloud   = _pickFirst(w, 'cloud_cover');
+  const rad     = _pickFirst(w, 'shortwave_radiation','global_radiation','solarRadiation','direct_radiation');
+  const src     = w._source || '';
+
+  if (temp == null && wspd == null && rh == null) { strip.style.display = 'none'; return; }
+
+  // Wind direction: rotate arrow emoji
+  const windArrow = wdir != null
+    ? `<span class="windArrow" style="display:inline-block;transform:rotate(${Math.round(wdir)}deg)" title="${Math.round(wdir)}°">↑</span>`
+    : '';
+
+  const items = [];
+  if (temp    != null) items.push(`<span class="witem">🌡️ <strong>${temp.toFixed(1)}°C</strong></span>`);
+  if (rh      != null) items.push(`<span class="witem">💧 <strong>${Math.round(rh)}%</strong></span>`);
+  if (wspd    != null) items.push(`<span class="witem">💨 ${windArrow} <strong>${wspd.toFixed(1)} m/s</strong></span>`);
+  if (precip  != null) items.push(`<span class="witem">🌧️ <strong>${precip.toFixed(1)} mm</strong></span>`);
+  if (cloud   != null) items.push(`<span class="witem">☁️ <strong>${Math.round(cloud)}%</strong></span>`);
+  if (rad     != null) items.push(`<span class="witem">☀️ <strong>${Math.round(rad)} W/m²</strong></span>`);
+  if (src)             items.push(`<span class="wsrc">${src}</span>`);
+
+  strip.innerHTML = items.join('');
+  strip.style.display = 'flex';
+
+  // Update map weather control if it exists
+  const ctrl = document.getElementById('mapWeatherCtrl');
+  if (ctrl) {
+    const dir = wdir != null ? Math.round(wdir) : null;
+    const arrow = dir != null
+      ? `<span style="display:inline-block;transform:rotate(${dir}deg);font-size:16px">↑</span> `
+      : '';
+    ctrl.innerHTML = [
+      wspd != null  ? `<div class="wrow">${arrow}<strong>${wspd.toFixed(1)} m/s</strong> ${dir != null ? dir+'°' : ''}</div>` : '',
+      precip != null && precip > 0 ? `<div class="wrow">🌧️ ${precip.toFixed(1)} mm</div>` : '',
+      cloud  != null ? `<div class="wrow">☁️ ${Math.round(cloud)}%</div>` : '',
+      rad    != null ? `<div class="wrow">☀️ ${Math.round(rad)} W/m²</div>` : '',
+    ].filter(Boolean).join('');
+  }
+}
+
+async function loadWeather() {
+  try {
+    const since = Math.floor(Date.now()/1000) - 3600;
+    const rows = await (await fetch(`/api/weather?since=${since}&limit=200`)).json();
+    if (!rows.length) return;
+    // Take the most recent row overall; merge with any more-recent per-key values
+    // from any source so the displayed values are as fresh as possible.
+    const sorted = rows.slice().sort((a, b) => (a.valid_ts||0) - (b.valid_ts||0));
+    const merged = {};
+    for (const r of sorted) Object.assign(merged, r);
+    _weatherLatest = merged;
+    _weatherLatest._source = sorted.at(-1)?.source || '';
+    renderWeather();
+  } catch (_) {}
+}
+
 // ---- live updates over WebSocket ------------------------------------------
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -378,7 +598,8 @@ function connectWS() {
   ws.onclose = () => { $('#livedot').classList.remove('live'); $('#livetxt').textContent = 'reconnecting…'; setTimeout(connectWS, 2000); };
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === 'aircraft') { updateAircraft(msg.data); return; }   // live view, independent of the Live toggle
+    if (msg.type === 'aircraft') { renderSdr(msg.sdr); updateAircraft(msg.data); return; }
+    if (msg.type === 'weather')  { Object.assign(_weatherLatest, msg.data); _weatherLatest._source = msg.data.source || _weatherLatest._source; renderWeather(); return; }
     if (!live) return;
     if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); checkBattery(); loadStats(); }
     if (msg.type === 'device')  { deviceState = msg.data; renderDevice(); }
@@ -487,15 +708,40 @@ function checkBattery() {
 
 // ---- wire up controls -----------------------------------------------------
 $('#range').onchange = () => {
-  $('#customRange').style.display = $('#range').value === 'custom' ? 'block' : 'none';
+  const val = $('#range').value;
+  $('#customRange').style.display = val === 'custom' ? 'block' : 'none';
+  if (val !== 'custom') { query(); closeDrawer(); }
 };
-$('#refresh').onclick = () => { query(); closeDrawer(); };
 $('#markerAdd').onclick = addMarker;
 $('#markerText').addEventListener('keydown', e => { if (e.key === 'Enter') addMarker(); });
-$('#livebtn').onclick = () => {
-  live = !live;
-  $('#livebtn').textContent = live ? 'Live: on' : 'Live: off';
+// Live/interval selector
+let _liveTimer = null;
+$('#liveintvl').onchange = function() {
+  const v = parseInt(this.value, 10);
+  if (_liveTimer) { clearInterval(_liveTimer); _liveTimer = null; }
+  if (v === 0) {
+    live = true;
+  } else {
+    live = false;
+    _liveTimer = setInterval(() => { query(); }, v * 1000);
+  }
 };
+
+// Home / plane mode toggle
+let _appMode = localStorage.getItem('appMode') || 'home';
+function applyMode(m) {
+  _appMode = m; localStorage.setItem('appMode', m);
+  document.body.classList.toggle('homemode', m === 'home');
+  document.body.classList.toggle('planemode', m === 'plane');
+  const btn = $('#modeBtn');
+  btn.textContent = m === 'home' ? '🏠 Home' : '✈ Plane';
+  btn.classList.toggle('home', m === 'home');
+  if (m === 'plane' && acMap) setTimeout(() => acMap.invalidateSize(), 100);
+}
+$('#modeBtn').addEventListener('click', e => {
+  e.stopPropagation();
+  applyMode(_appMode === 'home' ? 'plane' : 'home');
+});
 
 // ---- touch drawer + fullscreen + screen wake-lock -------------------------
 function openDrawer()  { document.body.classList.add('drawer-open'); }
@@ -525,17 +771,15 @@ let deviceState = null;   // {dev,mode,last_seen,buffered,pending}
 const OFFLINE_AFTER = 35 * 60;   // > 2x the 15-min sync interval
 
 function renderDevice() {
-  const el = $('#devmode'), st = $('#devstat'), pend = $('#devpending'), btn = $('#testBtn');
-  if (!deviceState) { el.textContent = ''; return; }
+  const el = $('#devmode'), st = $('#devstat'), pend = $('#devpending');
+  if (!deviceState) { if (el) el.textContent = ''; return; }
   const age = Math.floor(Date.now()/1000) - (deviceState.last_seen || 0);
   const offline = age > OFFLINE_AFTER;
   const mode = offline ? 'offline' : (deviceState.mode || 'normal');
   el.className = 'pill';
   el.innerHTML = `<span class="badge ${mode}${deviceState.pending ? ' pending' : ''}">${mode.toUpperCase()}</span>`;
   st.textContent = `${deviceState.dev} · ${deviceState.buffered ?? '?'} buffered · seen ${age}s ago`;
-  const wantTesting = (deviceState.mode !== 'testing');
-  btn.textContent = wantTesting ? 'Enter testing mode' : 'Stop testing mode';
-  pend.textContent = deviceState.pending
+  if (pend) pend.textContent = deviceState.pending
     ? `pending: switch to ${deviceState.pending} (applies at next sync)` : '';
 }
 
@@ -544,24 +788,20 @@ async function loadDevices() {
   if (devs.length) { deviceState = devs[0]; renderDevice(); }
 }
 
-$('#testBtn').onclick = async () => {
-  if (!deviceState) return;
-  const target = (deviceState.mode === 'testing') ? 'normal' : 'testing';
-  await fetch(`/api/device/${encodeURIComponent(deviceState.dev)}/mode`,
-    { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ mode: target }) });
-  deviceState.pending = target; renderDevice();
-};
 
 // ---- aircraft (ADS-B live map + table) ------------------------------------
-let acMap, acRing, acIcons = {}, acData = [], acHome = null;
-let acRange = parseInt(localStorage.getItem('acRange')) || 40;
+let acMap, acRing, acIcons = {}, _predCurves = {}, _acAnimState = {}, acData = [], acHome = null;
+let acRange = Math.min(20, Math.max(0.5, parseFloat(localStorage.getItem('acRange')) || 20));   // km, clamped to slider 0.5–20
+const fmtKm = km => km < 1 ? `${Math.round(km * 1000)} m` : `${km} km`;
+const fitToRing = () => { if (acMap && acRing) acMap.fitBounds(acRing.getBounds(), { padding:[20, 20] }); };
 
 async function initAircraft() {
   let cfg = {};
   try { cfg = await (await fetch('/api/config')).json(); } catch (_) {}
   acHome = (cfg && cfg.home) || [52.179722, 5.284722];
+  renderSdr(cfg && cfg.sdr);
 
-  acMap = L.map('acmap', { zoomControl:true }).setView(acHome, 9);
+  acMap = L.map('acmap', { zoomControl:true }).setView(acHome, 13);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
     maxZoom:18, attribution:'&copy; OpenStreetMap, &copy; CARTO',
   }).addTo(acMap);
@@ -569,57 +809,620 @@ async function initAircraft() {
     .addTo(acMap).bindPopup('Home');
   acRing = L.circle(acHome, { radius: acRange*1000, color:'#4ea1ff', weight:1, fill:false, dashArray:'4 4' }).addTo(acMap);
 
-  const sl = $('#acRange'); sl.value = acRange; $('#acRangeVal').textContent = acRange;
-  sl.addEventListener('input',  () => { $('#acRangeVal').textContent = sl.value; });
-  sl.addEventListener('change', () => setAcRange(parseInt(sl.value)));
+  // Weather overlay control — content filled by renderWeather()
+  const WeatherCtrl = L.Control.extend({
+    onAdd() { const d = L.DomUtil.create('div','leaflet-weather-ctrl'); d.id='mapWeatherCtrl'; return d; }
+  });
+  new WeatherCtrl({ position:'bottomleft' }).addTo(acMap);
+
+  const sl = $('#acRange');
+  if (sl) {
+    sl.value = acRange;
+    sl.addEventListener('input',  () => { const rv = $('#acRangeVal'); if (rv) rv.textContent = fmtKm(parseFloat(sl.value)); });
+    sl.addEventListener('change', () => setAcRange(parseFloat(sl.value)));
+  }
+  const slh = $('#acRangeHead'); slh.value = acRange;
+  slh.addEventListener('input',     e => { e.stopPropagation(); $('#acRangeLbl').textContent = `· ≤ ${fmtKm(parseFloat(slh.value))}`; });
+  slh.addEventListener('change',    e => { e.stopPropagation(); setAcRange(parseFloat(slh.value)); });
+  slh.addEventListener('click',     e => e.stopPropagation());
+  slh.addEventListener('mousedown', e => e.stopPropagation());
   $('#acHead').onclick = () => $('#aircraftPanel').classList.toggle('collapsed');
 
   try { updateAircraft(await (await fetch('/api/aircraft')).json()); } catch (_) {}
-  setTimeout(() => acMap && acMap.invalidateSize(), 250);   // map needs a layout pass
+  setTimeout(() => { if (acMap) { acMap.invalidateSize(); fitToRing(); } }, 250);   // layout pass, then frame the range
 }
 
 function setAcRange(km) {
   acRange = km; localStorage.setItem('acRange', km);
-  $('#acRangeVal').textContent = km; if (acRing) acRing.setRadius(km*1000);
+  const rv = $('#acRangeVal'); if (rv) rv.textContent = fmtKm(km);
+  $('#acRangeLbl').textContent = `· ≤ ${fmtKm(km)}`;
+  const slh = $('#acRangeHead'); if (slh) slh.value = km;
+  const sl  = $('#acRange');     if (sl)  sl.value  = km;
+  if (acRing) acRing.setRadius(km*1000);
+  fitToRing();
   renderAircraft();
+  loadFlightPaths();
+}
+
+// ── Flight-path history graphs ──────────────────────────────────────────────
+
+// Registration prefix → country flag emoji
+const REG_FLAGS = {
+  // 3-char
+  'A6C':'🇦🇪','A9C':'🇧🇭','A40':'🇴🇲',
+  // 2-char
+  PH:'🇳🇱',EI:'🇮🇪',OE:'🇦🇹',HB:'🇨🇭',LN:'🇳🇴',SE:'🇸🇪',OH:'🇫🇮',OY:'🇩🇰',
+  EC:'🇪🇸',CS:'🇵🇹',TS:'🇹🇳',TC:'🇹🇷',OD:'🇱🇧',SU:'🇪🇬',ET:'🇪🇹',ZS:'🇿🇦',
+  VH:'🇦🇺',ZK:'🇳🇿',HL:'🇰🇷',JA:'🇯🇵',VT:'🇮🇳',AP:'🇵🇰',EP:'🇮🇷',RP:'🇵🇭',
+  HS:'🇹🇭',PK:'🇮🇩','9M':'🇲🇾','9V':'🇸🇬',LZ:'🇧🇬',OK:'🇨🇿',SP:'🇵🇱',HA:'🇭🇺',
+  YR:'🇷🇴',YU:'🇷🇸',OM:'🇸🇰','9A':'🇭🇷','4X':'🇮🇱',HZ:'🇸🇦',A6:'🇦🇪','7T':'🇩🇿',
+  LY:'🇱🇹',ES:'🇪🇪',YL:'🇱🇻',UR:'🇺🇦',EK:'🇦🇲','4K':'🇦🇿',SX:'🇬🇷',
+  // 1-char
+  G:'🇬🇧',F:'🇫🇷',D:'🇩🇪',I:'🇮🇹',N:'🇺🇸',C:'🇨🇦',B:'🇨🇳',
+};
+function _regFlag(reg) {
+  if (!reg) return '';
+  const r = (reg || '').toUpperCase().replace(/-/g,'');
+  for (const len of [3,2,1]) { const f=REG_FLAGS[r.slice(0,len)]; if (f) return f; }
+  return '';
+}
+
+// Leaflet polylines for historical paths overlaid on the map
+let _mapPathLines = {};
+
+function _pathColor(p) {
+  const w = ICAO_MTOW[(p.type||'').toUpperCase()];
+  if (w !== undefined) {
+    if (w >= 300) return '#ff6b6b';
+    if (w >= 100) return '#ffa96b';
+    if (w >= 40)  return '#ffd76b';
+    return '#a8e6a3';
+  }
+  return _hexColor(p.hex || '');
+}
+
+function drawMapPaths() {
+  if (!acMap) return;
+  // remove old lines that are no longer in _pathData
+  const activeHex = new Set(_pathData.map(p => p.hex));
+  Object.keys(_mapPathLines).forEach(h => {
+    if (!activeHex.has(h)) { acMap.removeLayer(_mapPathLines[h]); delete _mapPathLines[h]; }
+  });
+  const groups = _groupByHex(_pathData);
+  for (const [hex, pts] of Object.entries(groups)) {
+    const lls = pts.map(p => [p.lat, p.lon]);
+    const col = _pathColor(pts[0]);
+    if (_mapPathLines[hex]) {
+      _mapPathLines[hex].setLatLngs(lls).setStyle({color: col});
+    } else {
+      _mapPathLines[hex] = L.polyline(lls, {color:col, weight:1.5, opacity:0.55}).addTo(acMap);
+    }
+  }
+}
+
+let _pathData = [];
+
+async function loadFlightPaths() {
+  try {
+    // Fetch 2× range so drawPredPaths() has history for incoming planes
+    const resp = await fetch(`/api/aircraft/paths?range_km=${acRange * 2}`);
+    if (!resp.ok) return;
+    _pathData = (await resp.json()).points || [];
+  } catch (_) { return; }
+  drawMapPaths();
+  drawSideView();
+  drawPredPaths();
+}
+
+function _hexColor(hex) {
+  let h = 0;
+  for (let i = 0; i < hex.length; i++) h = ((h * 31) + hex.charCodeAt(i)) >>> 0;
+  return `hsl(${h % 360},60%,62%)`;
+}
+
+function _groupByHex(pts) {
+  const m = {};
+  for (const p of pts) { if (!m[p.hex]) m[p.hex] = []; m[p.hex].push(p); }
+  for (const v of Object.values(m)) v.sort((a, b) => a.ts - b.ts);
+  return m;
+}
+
+
+function drawSideView() {
+  const cv = $('#pathSide'); if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.fillStyle = '#0e1117'; ctx.fillRect(0, 0, W, H);
+  if (!acHome) return;
+  const [hLat, hLon] = acHome;
+  const lonKm = Math.cos(hLat * Math.PI / 180) * 111.32;
+  const PAD_L = 24, PAD_R = 8, PAD_T = 14, PAD_B = 16;
+  const drawW = W - PAD_L - PAD_R, drawH = H - PAD_T - PAD_B;
+
+  const maxAlt = _pathData.length ? Math.max(5000, ..._pathData.map(p => p.alt_baro || 0)) : 5000;
+  const ceilAlt = Math.ceil(maxAlt / 5000) * 5000;
+
+  // west=left, east=right: +dx_km east → +x right
+  function toXY(lon, alt) {
+    const dx_km = (lon - hLon) * lonKm;
+    const x = PAD_L + drawW/2 + dx_km / acRange * (drawW/2);
+    const y = PAD_T + drawH - (alt || 0) / ceilAlt * drawH;
+    return [x, y];
+  }
+
+  // altitude grid
+  const step = ceilAlt <= 10000 ? 2000 : ceilAlt <= 20000 ? 5000 : 10000;
+  for (let a = 0; a <= ceilAlt; a += step) {
+    const y = PAD_T + drawH - a / ceilAlt * drawH;
+    ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(W-PAD_R, y);
+    ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.28)'; ctx.font = '8px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(a === 0 ? '0' : (a/1000)+'k', PAD_L-2, y+3);
+  }
+
+  // "you are here" vertical
+  const cx = PAD_L + drawW/2;
+  ctx.strokeStyle = 'rgba(78,161,255,.45)'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+  ctx.beginPath(); ctx.moveTo(cx, PAD_T); ctx.lineTo(cx, H-PAD_B); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(78,161,255,.65)'; ctx.font = '8px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('you', cx, H-2);
+
+  // axis labels
+  ctx.fillStyle = 'rgba(255,255,255,.3)'; ctx.font = '9px sans-serif';
+  ctx.textAlign = 'left';  ctx.fillText('W', PAD_L+2, PAD_T-3);
+  ctx.textAlign = 'right'; ctx.fillText('E', W-PAD_R-2, PAD_T-3);
+  ctx.textAlign = 'left';  ctx.fillText('ft', 0, PAD_T+3);
+
+  if (!_pathData.length) {
+    ctx.fillStyle = 'rgba(255,255,255,.2)'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('no local data yet', W/2, H/2+4);
+  } else {
+    for (const [hex, pts] of Object.entries(_groupByHex(_pathData))) {
+      const validPts = pts.filter(p => p.alt_baro != null);
+      if (!validPts.length) continue;
+      ctx.strokeStyle = _hexColor(hex); ctx.lineWidth = 1.5; ctx.beginPath();
+      let first = true;
+      for (const p of validPts) {
+        const [x, y] = toXY(p.lon, p.alt_baro);
+        first ? ctx.moveTo(x, y) : ctx.lineTo(x, y); first = false;
+      }
+      ctx.stroke();
+    }
+  }
+
+  // live aircraft overlay (current snapshot)
+  const live = (acData || []).filter(a => a.lat != null && a.lon != null && a.alt_baro != null
+                                       && a.distance_km != null && a.distance_km <= acRange);
+  for (const a of live) {
+    const [x, y] = toXY(a.lon, a.alt_baro);
+    const sz = planeSize(a.type, a.category);
+    ctx.font = `${sz}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(((a.track||0) - 45) * Math.PI/180);
+    ctx.globalAlpha = a.source === 'public' ? 0.4 : 1.0;
+    ctx.fillText('✈️', 0, 0);
+    ctx.restore();
+    ctx.globalAlpha = 1.0;
+  }
+  ctx.textBaseline = 'alphabetic';
 }
 
 function updateAircraft(list) { acData = Array.isArray(list) ? list : []; renderAircraft(); }
 
-function planeIcon(track) {
-  return L.divIcon({ className:'', iconSize:[20,20], iconAnchor:[10,10],
-    html:`<div class="planeicon" style="transform:rotate(${track || 0}deg)">✈️</div>` });
+// ── Smooth icon interpolation ───────────────────────────────────────────────
+// Runs at 3 fps between ADS-B updates to move icons along the polynomial curve.
+function _startAnimLoop() {
+  setInterval(() => {
+    if (!acMap) return;
+    const now = Date.now() / 1000;
+    for (const [hex, st] of Object.entries(_acAnimState)) {
+      if (!acIcons[hex]) continue;
+      const age = now - st.reportedAt;
+      if (age > 30) continue;   // stale — don't interpolate past ~half a poll cycle
+      let lat, lon;
+      if (st.cLat && st.cLon && st.t0 != null) {
+        lat = polyEval(st.cLat, now - st.t0);
+        lon = polyEval(st.cLon, now - st.t0);
+      } else if (st.track != null && st.gs) {
+        const distKm = st.gs * (age / 3600) * 1.852;
+        [lat, lon] = destPoint(st.lat, st.lon, st.track, distKm);
+      } else {
+        continue;
+      }
+      // Sanity: don't teleport more than 10 km from last known position
+      if (haversineKm(st.lat, st.lon, lat, lon) > 10) continue;
+      acIcons[hex].setLatLng([lat, lon]);
+    }
+  }, 333);   // ~3 fps
 }
+
+// ICAO 3-letter airline code → display name (callsign prefix of the flight number)
+const ICAO_AIRLINES = {
+  // Netherlands / Benelux
+  KLM:'KLM', TRA:'Transavia', MPH:'Martinair', CLX:'Cargolux', BEL:'Brussels Airlines',
+  CAI:'Corendon', EXS:'Jet2',
+  // UK / Ireland
+  BAW:'British Airways', EZY:'easyJet', RYR:'Ryanair', EIN:'Aer Lingus',
+  TOM:'TUI Airways', WJA:'WestJet',
+  // Germany / Austria / Switzerland
+  DLH:'Lufthansa', EWG:'Eurowings', AUA:'Austrian', SWR:'Swiss', GWI:'Germanwings', BCS:'easyJet Switzerland',
+  // France / Iberia / Portugal
+  AFR:'Air France', IBE:'Iberia', VLG:'Vueling', TAP:'TAP Portugal',
+  // Scandinavia / Nordics
+  SAS:'SAS', FIN:'Finnair', NAX:'Norwegian', WIF:'Widerøe', BLF:'Blue1',
+  // Eastern Europe
+  LOT:'LOT Polish', WZZ:'Wizz Air', ROT:'TAROM', CSA:'Czech Airlines', AFL:'Aeroflot',
+  // Southern Europe
+  THY:'Turkish Airlines', PGT:'Pegasus', SXS:'SunExpress', AEE:'Aegean',
+  AZU:'Azurair', AZA:'ITA Airways',
+  // Middle East
+  UAE:'Emirates', ETD:'Etihad', QTR:'Qatar Airways', SVA:'Saudia',
+  OMA:'Oman Air', GFA:'Gulf Air', IAW:'Iraqi Airways', MEA:'Middle East Airlines',
+  // North America
+  DAL:'Delta', UAL:'United', AAL:'American', ACA:'Air Canada',
+  SWA:'Southwest', JBU:'JetBlue', NKS:'Spirit',
+  // Cargo
+  FDX:'FedEx', UPS:'UPS', BOX:'DHL Air', TFL:'Titan Airways',
+  ATN:'Air Transport Intl', GTI:'Atlas Air', NCR:'National Air Cargo',
+  // Asia-Pacific
+  SIA:'Singapore Airlines', CPA:'Cathay Pacific', ANZ:'Air New Zealand',
+  QFA:'Qantas', JAL:'JAL', ANA:'ANA', KAL:'Korean Air', AAR:'Asiana',
+  CCA:'Air China', CSN:'China Southern', CES:'China Eastern',
+  // Africa / Other
+  MSR:'EgyptAir', ETH:'Ethiopian Airlines', SAA:'South African Airways',
+};
+const CARGO_PREFIXES = new Set(['FDX','UPS','BOX','MPH','CLX','TFL','ATN','GTI','NCR','ABX','PAC']);
+
+function acAirline(flight) {
+  const m = /^([A-Z]{2,3})/.exec((flight || '').trim());
+  if (!m) return '';
+  return ICAO_AIRLINES[m[1]] || m[1];
+}
+
+function acKind(category, flight) {
+  const prefix = /^([A-Z]{2,3})/.exec((flight || '').trim())?.[1] ?? '';
+  if (CARGO_PREFIXES.has(prefix)) return 'Cargo';
+  const c = category || '';
+  if (c === 'A7') return 'Helicopter';
+  if (c === 'A5') return 'Heavy';
+  if (c === 'A4' || c === 'A3') return 'Airliner';
+  if (c === 'A2') return 'Small';
+  if (c === 'A1') return 'Private';
+  if (c === 'A6') return 'Military';
+  if (c === 'B1') return 'Glider';
+  if (c === 'B2') return 'Balloon';
+  if (c === 'B4') return 'Ultralight';
+  if (c === 'B6') return 'Drone';
+  if (c === 'C1') return 'Emergency';
+  if (c === 'C2') return 'Service';
+  return '';
+}
+
+// ICAO type code → approximate MTOW in tonnes (common commercial types)
+const ICAO_MTOW = {
+  A318:68, A319:75, A320:78, A321:93, A19N:75, A20N:79, A21N:97,
+  A332:233, A333:242, A338:251, A339:251, A359:280, A35K:316, A388:575,
+  B732:58, B733:63, B734:68, B735:60, B736:66, B737:66, B738:80, B739:85,
+  B37M:82, B38M:82, B39M:88, B3XM:88, B752:116, B753:124,
+  B762:175, B763:181, B764:204, B772:298, B77L:299, B77W:352,
+  B788:228, B789:254, B78X:254, B741:333, B742:377, B744:412, B748:448, B74F:447,
+  E170:37, E175:38, E190:51, E195:52, E290:56, E295:61,
+  CRJ2:24, CRJ7:33, CRJ9:38, CRJX:40, AT72:23, AT75:23, AT76:23, DH8D:30, SF34:14,
+  C56X:9, C750:16, GLEX:45, GL5T:45,
+};
+
+function acWeight(type, category) {
+  const w = ICAO_MTOW[(type || '').toUpperCase()];
+  if (w !== undefined) return `~${w} t`;
+  // Category-based fallback when exact MTOW not known
+  const c = (category || '').toUpperCase();
+  if (c === 'A5') return '>136 t';
+  if (c === 'A4') return '~100 t';
+  if (c === 'A3') return '~75 t';
+  if (c === 'A2') return '~2 t';
+  if (c === 'A1') return '<0.6 t';
+  if (c === 'A7') return '~5 t';
+  if (c === 'B6') return '<0.1 t';
+  return '';
+}
+
+function acAge(year) {
+  if (!year) return '';
+  const age = 2026 - parseInt(year, 10);
+  return (age >= 0 && age < 100) ? `${age} yr` : '';
+}
+
+// SDR dongle indicator: connected (green) / not connected (red) / unknown (grey).
+function renderSdr(sdr) {
+  const el = $('#sdrBadge'); if (!el) return;
+  const c = sdr ? sdr.connected : null;
+  el.classList.toggle('on', c === true);
+  el.classList.toggle('unknown', c == null);
+  el.textContent = c === true ? `SDR ✓${sdr.name ? ' ' + sdr.name : ''}`
+                 : c === false ? 'SDR ✗' : 'SDR —';
+  el.title = c === true ? `RTL-SDR connected${sdr.name ? ': ' + sdr.name : ''}`
+           : c === false ? 'No RTL-SDR dongle detected on USB'
+           : 'SDR status unknown';
+}
+
+function planeSize(type, category) {
+  const w = ICAO_MTOW[(type || '').toUpperCase()];
+  if (w !== undefined) {
+    if (w >= 300) return 28;
+    if (w >= 100) return 23;
+    if (w >= 40)  return 19;
+    return 15;
+  }
+  const c = category || '';
+  if (c === 'A5') return 26;
+  if (c === 'A4' || c === 'A3') return 21;
+  if (c === 'A7') return 18;
+  if (c === 'A2') return 16;
+  return 15;
+}
+
+// Haversine distance in km between two lat/lon points (degrees)
+function haversineKm(la1, lo1, la2, lo2) {
+  const R = 6371, dLa = (la2-la1)*Math.PI/180, dLo = (lo2-lo1)*Math.PI/180;
+  const a = Math.sin(dLa/2)**2 + Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dLo/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// Find the closest-approach moment for each aircraft in _pathData within the time window.
+// Returns [{ts, flight, hex, ascending}] for planes that came within acRange/5 km (min 0.5 km).
+function _computeFlyovers(since, until) {
+  if (!acHome || !_pathData.length) return [];
+  const [hLat, hLon] = acHome;
+  const threshold = Math.max(0.5, acRange / 5);
+  const grouped = _groupByHex(_pathData);
+  const out = [];
+  for (const [hex, pts] of Object.entries(grouped)) {
+    const win = pts.filter(p => (!since || p.ts >= since) && (!until || p.ts <= until));
+    if (!win.length) continue;
+    let minD = Infinity, minI = -1;
+    win.forEach((p, i) => {
+      const d = haversineKm(hLat, hLon, p.lat, p.lon);
+      if (d < minD) { minD = d; minI = i; }
+    });
+    if (minD > threshold) continue;
+    // ascending/descending: compare alt of adjacent points around the closest one
+    let trend = 0;
+    if (minI > 0 && win[minI-1].alt_baro != null)       trend += (win[minI].alt_baro||0) - (win[minI-1].alt_baro||0);
+    if (minI < win.length-1 && win[minI+1].alt_baro != null) trend += (win[minI+1].alt_baro||0) - (win[minI].alt_baro||0);
+    out.push({ ts: win[minI].ts, flight: win[minI].flight, hex, ascending: trend > 0 });
+  }
+  return out;
+}
+
+// Great-circle destination point: start lat/lon (deg), bearing (deg), dist (km)
+function destPoint(lat, lon, bearingDeg, distKm) {
+  const R = 6371;
+  const d = distKm / R;
+  const b = bearingDeg * Math.PI / 180;
+  const la = lat * Math.PI / 180, lo = lon * Math.PI / 180;
+  const la2 = Math.asin(Math.sin(la)*Math.cos(d) + Math.cos(la)*Math.sin(d)*Math.cos(b));
+  const lo2 = lo + Math.atan2(Math.sin(b)*Math.sin(d)*Math.cos(la), Math.cos(d) - Math.sin(la)*Math.sin(la2));
+  return [la2 * 180/Math.PI, lo2 * 180/Math.PI];
+}
+
+// ── Polynomial regression (least-squares) ──────────────────────────────────
+// Solves a dense n×n linear system using Gaussian elimination with partial pivoting.
+function _gaussSolve(M, n) {
+  for (let col = 0; col < n; col++) {
+    let maxR = col;
+    for (let r = col+1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[maxR][col])) maxR = r;
+    [M[col], M[maxR]] = [M[maxR], M[col]];
+    if (Math.abs(M[col][col]) < 1e-12) continue;
+    for (let r = col+1; r < n; r++) {
+      const f = M[r][col] / M[col][col];
+      for (let j = col; j <= n; j++) M[r][j] -= f * M[col][j];
+    }
+  }
+  const x = new Array(n).fill(0);
+  for (let i = n-1; i >= 0; i--) {
+    if (Math.abs(M[i][i]) < 1e-12) continue;
+    x[i] = M[i][n] / M[i][i];
+    for (let j = i-1; j >= 0; j--) M[j][n] -= M[j][i] * x[i];
+  }
+  return x;
+}
+
+// Returns polynomial coefficients [c0, c1, ..., cdeg] for y ≈ Σ ck * t^k.
+function polyFit(ts, ys, deg) {
+  const n = deg + 1, len = ts.length;
+  // Build Gram matrix (A^T A) and vector (A^T y) for the normal equations
+  const G = Array.from({length:n}, () => new Array(n+1).fill(0));
+  for (let k = 0; k < len; k++) {
+    const row = Array.from({length:n}, (_, i) => Math.pow(ts[k], i));
+    for (let i = 0; i < n; i++) {
+      G[i][n] += row[i] * ys[k];
+      for (let j = 0; j < n; j++) G[i][j] += row[i] * row[j];
+    }
+  }
+  return _gaussSolve(G, n);
+}
+
+function polyEval(c, t) {
+  let v = 0;
+  for (let i = c.length-1; i >= 0; i--) v = v*t + c[i];   // Horner's method
+  return v;
+}
+
+function _sampleCurve(cLat, cLon, tStart, tEnd, nPts) {
+  const lls = [];
+  for (let i = 0; i <= nPts; i++) {
+    const t = tStart + (tEnd - tStart) * i / nPts;
+    lls.push([polyEval(cLat, t), polyEval(cLon, t)]);
+  }
+  return lls;
+}
+
+// Draw polynomial-fit trail + prediction for all planes within 2× acRange.
+// Trail = smooth curve through last-5 DB positions (solid).
+// Pred  = extrapolation 3 min ahead (dashed). Disappears once ≥5 new points arrive.
+function drawPredPaths() {
+  if (!acMap || !acHome) return;
+  const byHex = _groupByHex(_pathData);
+  const twoX = (acData || []).filter(a =>
+    a.lat != null && a.lon != null && a.distance_km != null && a.distance_km <= acRange * 2
+  );
+  const active = new Set();
+
+  for (const a of twoX) {
+    active.add(a.hex);
+    const hist = (byHex[a.hex] || []).slice(-5);
+    let trailLLs = null, predLLs = null;
+
+    if (hist.length >= 2) {
+      const t0 = hist[0].ts;
+      const ts  = hist.map(p => p.ts - t0);
+      const lats = hist.map(p => p.lat);
+      const lons = hist.map(p => p.lon);
+      const deg = Math.min(2, hist.length - 1);
+      const cLat = polyFit(ts, lats, deg);
+      const cLon = polyFit(ts, lons, deg);
+      // Store for smooth animation loop
+      _acAnimState[a.hex] = { cLat, cLon, t0, lat:a.lat, lon:a.lon,
+                               track:a.track, gs:a.gs, reportedAt: Date.now()/1000 };
+      const tTrailEnd = hist.at(-1).ts - t0;
+      const tPredEnd  = tTrailEnd + 3*60;
+      trailLLs = _sampleCurve(cLat, cLon, 0, tTrailEnd, 10);
+      predLLs  = _sampleCurve(cLat, cLon, tTrailEnd, tPredEnd, 10);
+    } else if (a.track != null && a.gs) {
+      _acAnimState[a.hex] = { cLat:null, cLon:null, t0:null,
+                               lat:a.lat, lon:a.lon, track:a.track, gs:a.gs, reportedAt: Date.now()/1000 };
+      const distKm = a.gs * (3/60) * 1.852;
+      predLLs = [[a.lat, a.lon], destPoint(a.lat, a.lon, a.track, distKm)];
+    } else {
+      _removePredCurve(a.hex);
+      continue;
+    }
+
+    const col = a.source === 'public' ? '#7ec8e3' : '#9de8b3';
+    if (!_predCurves[a.hex]) _predCurves[a.hex] = {};
+    const pc = _predCurves[a.hex];
+
+    if (trailLLs && trailLLs.length > 1) {
+      if (pc.trail) pc.trail.setLatLngs(trailLLs).setStyle({color:col});
+      else pc.trail = L.polyline(trailLLs, {color:col, weight:2, opacity:0.65}).addTo(acMap);
+    } else { if (pc.trail) { acMap.removeLayer(pc.trail); delete pc.trail; } }
+
+    if (predLLs && predLLs.length > 1) {
+      if (pc.pred) pc.pred.setLatLngs(predLLs).setStyle({color:col});
+      else pc.pred = L.polyline(predLLs, {color:col, weight:1.5, opacity:0.5, dashArray:'5 7'}).addTo(acMap);
+    } else { if (pc.pred) { acMap.removeLayer(pc.pred); delete pc.pred; } }
+  }
+
+  // Clean up curves for planes no longer in extended range
+  for (const hex of Object.keys(_predCurves)) {
+    if (!active.has(hex)) _removePredCurve(hex);
+  }
+}
+
+function _removePredCurve(hex) {
+  const pc = _predCurves[hex];
+  if (!pc) return;
+  if (pc.trail) acMap.removeLayer(pc.trail);
+  if (pc.pred)  acMap.removeLayer(pc.pred);
+  delete _predCurves[hex];
+  delete _acAnimState[hex];
+}
+
+function planeIcon(track, source, type, category) {
+  const cls = source === 'public' ? 'planeicon public' : 'planeicon';
+  const sz = planeSize(type, category);
+  return L.divIcon({ className:'', iconSize:[sz, sz], iconAnchor:[sz/2, sz/2],
+    html:`<div class="${cls}" style="font-size:${sz}px;line-height:${sz}px;transform:rotate(${(track || 0) - 45}deg)">✈️</div>` });
+}
+
+$('#howlBtn').addEventListener('click', e => {
+  e.stopPropagation();   // don't bubble to acHead and collapse the panel
+  const ts = Math.floor(Date.now() / 1000);
+  fetch('/api/event', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({kind:'howl', ts}) });
+  const d = new Date(ts * 1000);
+  const hms = [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map(n => String(n).padStart(2,'0')).join(':');
+  $('#howlLast').textContent = `· ${hms}`;
+});
 
 function renderAircraft() {
   if (!acMap) return;
   const inRange = acData.filter(a => a.distance_km != null && a.distance_km <= acRange);
-  $('#acCount').textContent = `${inRange.length} in range`;
-  $('#acRangeLbl').textContent = `· ≤ ${acRange} km`;
+  const nLocal = inRange.filter(a => a.source !== 'public').length;   // 'local' or 'both'
+  const nPublic = inRange.length - nLocal;
+  $('#acCount').textContent = nPublic
+    ? `${nLocal} local · ${nPublic} ref`
+    : `${inRange.length} in range`;
+  $('#acRangeLbl').textContent = `· ≤ ${fmtKm(acRange)}`;
 
   const seen = new Set();
   inRange.forEach(a => {
     if (a.lat == null || a.lon == null) return;
     seen.add(a.hex);
     const ll = [a.lat, a.lon];
-    if (acIcons[a.hex]) acIcons[a.hex].setLatLng(ll).setIcon(planeIcon(a.track));
-    else acIcons[a.hex] = L.marker(ll, { icon: planeIcon(a.track) }).addTo(acMap);
+    if (acIcons[a.hex]) acIcons[a.hex].setLatLng(ll).setIcon(planeIcon(a.track, a.source, a.type, a.category));
+    else acIcons[a.hex] = L.marker(ll, { icon: planeIcon(a.track, a.source, a.type, a.category) }).addTo(acMap);
+    const src = a.source === 'public' ? ' · reference feed'
+              : a.source === 'both' ? ' · local + reference' : ' · local SDR';
+    const al = acAirline(a.flight); const kd = acKind(a.category, a.flight);
     acIcons[a.hex].bindPopup(
-      `<b>${a.flight || a.hex}</b>${a.type ? ' · ' + a.type : ''}<br>`
+      `<b>${a.flight || a.hex}</b>${al ? ' · ' + al : ''}${kd ? ' <small>(' + kd + ')</small>' : ''}<br>`
+      + `${a.desc || a.type || '—'}<br>`
       + `${a.alt_baro != null ? a.alt_baro + ' ft' : '—'} · ${a.gs != null ? Math.round(a.gs) + ' kt' : '—'}<br>`
-      + `${a.distance_km} km · ${Math.round(a.bearing_deg)}°`);
+      + `${a.distance_km} km · ${Math.round(a.bearing_deg)}°${src}`);
   });
   Object.keys(acIcons).forEach(h => { if (!seen.has(h)) { acMap.removeLayer(acIcons[h]); delete acIcons[h]; } });
 
-  $('#acRows').innerHTML = inRange.map(a => {
+  drawPredPaths();
+
+  const rows = inRange.map(a => {
     const vr = a.baro_rate || 0;
     const ar = vr > 64 ? '<span class="up">▲</span>' : vr < -64 ? '<span class="down">▼</span>' : '<span class="lvl">–</span>';
-    return `<tr><td>${a.flight || a.hex}</td><td>${a.type || ''}</td>`
+    const airline = acAirline(a.flight);
+    const kind = acKind(a.category, a.flight);
+    const model = a.desc || a.type || '';
+    const wt = acWeight(a.type, a.category);
+    const age = acAge(a.year);
+    const flag = _regFlag(a.reg);
+    const flightId = (a.flight || '').trim();
+    const flightCell = flightId
+      ? `<a class="flightlink" href="https://www.flightradar24.com/${flightId.toLowerCase()}" target="_blank" rel="noopener">${flightId}</a>`
+      : a.hex;
+    return `<tr class="${a.source === 'public' ? 'public' : ''}" data-hex="${a.hex}" style="cursor:pointer">`
+      + `<td>${flag}</td>`
+      + `<td>${flightCell}</td>`
+      + `<td>${airline}</td>`
+      + `<td>${kind}</td>`
+      + `<td title="${a.desc || ''}">${model}</td>`
+      + `<td>${wt}</td>`
+      + `<td>${age}</td>`
       + `<td>${a.alt_baro != null ? a.alt_baro : '—'}</td>`
       + `<td>${a.gs != null ? Math.round(a.gs) : '—'}</td>`
       + `<td>${a.distance_km != null ? a.distance_km.toFixed(1) : '—'}</td>`
-      + `<td>${a.bearing_deg != null ? Math.round(a.bearing_deg) : '—'}</td><td>${ar}</td></tr>`;
-  }).join('') || `<tr><td colspan="7" style="color:var(--mut);padding:14px">No aircraft in range (is readsb running?)</td></tr>`;
+      + `<td>${a.bearing_deg != null ? Math.round(a.bearing_deg) : '—'}</td>`
+      + `<td>${ar}</td></tr>`;
+  });
+  $('#acRows').innerHTML = rows.join('') || `<tr><td colspan="12" style="color:var(--mut);padding:14px">No aircraft in range</td></tr>`;
+
+  // row click → pan map to aircraft + highlight row
+  $('#acRows').querySelectorAll('tr[data-hex]').forEach(tr => {
+    tr.addEventListener('click', e => {
+      if (e.target.tagName === 'A') return;   // don't intercept flight-link clicks
+      const hex = tr.dataset.hex;
+      const ac = inRange.find(a => a.hex === hex);
+      if (ac && ac.lat != null && acMap) {
+        acMap.setView([ac.lat, ac.lon], Math.max(acMap.getZoom(), 11), {animate:true});
+        if (acIcons[hex]) acIcons[hex].openPopup();
+      }
+      $('#acRows').querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
+      tr.classList.add('selected');
+    });
+  });
+
+  drawSideView();
 }
 
 (async function init(){
@@ -628,10 +1431,15 @@ function renderAircraft() {
   await query();
   await loadDevices();
   setInterval(loadDevices, 30000);   // re-poll device state (also drives offline detection)
+  applyMode(_appMode);
   await initAircraft();
+  loadFlightPaths();
+  setInterval(loadFlightPaths, 60000);
+  loadWeather();
+  setInterval(loadWeather, 600000);
+  _startAnimLoop();
   connectWS();
   keepAwake();
-  // refresh the metric list occasionally in case new fields appear
   setInterval(loadMetrics, 60000);
 })();
 </script>

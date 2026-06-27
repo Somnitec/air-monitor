@@ -154,16 +154,24 @@
 
 // --- Binary FIFO ring buffer on flash (LittleFS) ---
 // Fixed-size packed records (see record.h, RECORD_SIZE=71). Drop-oldest when
-// full. Pointers persisted in a double-buffered, CRC'd meta file.
-#define RING_PATH            "/ring.bin"
-#define RING_META_PATH       "/ring.meta"
-#define RING_CAPACITY        18000U          // 18000*71B ~= 1.28 MB ~= ~12.5 days @ 60s
+// full. Stored as APPEND-ONLY segment files under QUEUE_DIR, never one big
+// preallocated file: a random in-place write to a large LittleFS file triggers
+// a full-file copy-on-write (CTZ skip-list) needing free space >= the file size
+// and crashes the allocator (NOSPC surfaced as IntegerDivideByZero). See
+// ringstore.cpp for the segment layout. seq -> (segment, offset) is implicit, so
+// head/tail are recovered by scanning the dir; only the synced cursor persists.
+#define QUEUE_DIR            "/q"             // directory holding /q/<hex>.seg files
+#define QUEUE_CURSOR_PATH    "/q/cursor"      // double-buffered, CRC'd synced boundary
+#define SEG_RECORDS          500U             // records per segment (500*71 = ~35.5 KB ~= 9 blocks)
+#define RING_CAPACITY        12000U           // logical capacity ~= ~8.3 days @ 60s (24 segments)
 #define SYNC_BATCH_MAX       20              // records POSTed per HTTP request
 #define SYNC_BATCH_MAX_BYTES 4096            // ...or this many bytes, whichever first
 
-// Legacy NDJSON queue paths — removed on boot if present (no migration needed).
+// Legacy queue paths — removed on boot if present (no migration needed).
 #define LEGACY_QUEUE_PATH    "/queue.ndjson"
 #define LEGACY_CURSOR_PATH   "/cursor.txt"
+#define RING_PATH            "/ring.bin"      // old single-file ring (deleted on boot)
+#define RING_META_PATH       "/ring.meta"     // old ring metadata   (deleted on boot)
 
 // --- Duty-cycled sync + modes ---
 // NORMAL: WiFi off between sessions; attempt to offload every SYNC_ATTEMPT_INTERVAL_MS,

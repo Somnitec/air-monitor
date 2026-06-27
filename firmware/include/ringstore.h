@@ -1,15 +1,17 @@
 #pragma once
-// LittleFS-backed binary FIFO ring. Binds ringlogic (pointer math) to a
-// preallocated /ring.bin of RING_CAPACITY fixed slots, with pointers persisted
-// in a double-buffered CRC'd /ring.meta. Worst-case loss on a power cut is the
-// single in-flight record (data is written before metadata).
+// LittleFS-backed binary FIFO queue, stored as append-only segment files under
+// QUEUE_DIR (see ringstore.cpp for why a single big file is unusable on
+// LittleFS). A record's global seq maps implicitly to (segment, offset), so
+// head/tail are recovered by scanning the directory; only the synced cursor is
+// persisted (double-buffered + CRC). Worst-case loss on a power cut is the
+// single in-flight record (data is appended before the cursor advances).
 
 #include "record.h"
 #include <stdint.h>
 
-// Mount LittleFS-resident state: load+validate meta (or init), preallocate
-// /ring.bin if absent, and delete any legacy NDJSON queue files. Call once in
-// setup() AFTER LittleFS.begin(). Returns false on unrecoverable FS error.
+// Mount the queue: delete legacy files, ensure QUEUE_DIR exists, recover
+// head/tail/synced from the segment files + cursor. Call once in setup() AFTER
+// LittleFS.begin(). Returns false on unrecoverable FS error.
 bool ringstore_begin();
 
 // Append one record (drop-oldest if full). Returns false on write error.

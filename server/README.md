@@ -191,6 +191,55 @@ real response.
 Design rationale lives in
 [`docs/superpowers/specs/2026-06-26-weather-integration-design.md`](../docs/superpowers/specs/2026-06-26-weather-integration-design.md).
 
+## Aircraft (ADS-B) integration
+
+A background poller reads a local **readsb** JSON snapshot and correlates nearby
+aircraft with the sensor data (logged to the `aircraft` table, throttled by
+`AIRCRAFT_LOG_SEC`). It's keyless and **self-enabling**: if readsb is running it just
+works; if not, the poller stays quiet. Disable it entirely with `AIRCRAFT_ENABLED=0`.
+
+It reads `AIRCRAFT_JSON_PATH` (default `/run/readsb/aircraft.json`) or, if set,
+fetches `AIRCRAFT_JSON_URL` over HTTP instead. "Home" for range/bearing is the shared
+station location: by default the server reads `STATION_LAT`/`STATION_LON` from the
+firmware's `../firmware/src/secrets.h` (override with `AIRMON_LAT`/`AIRMON_LON` or
+point `AIRMON_FIRMWARE_SECRETS` elsewhere), so weather, aircraft, and the map agree.
+
+### Setting up the SDR (RTL-SDR Blog V4)
+
+The V4 has two well-known gotchas. Do these once on the box the dongle is plugged into:
+
+1. **Stop the kernel's DVB-T driver from grabbing the dongle.** By default Linux loads
+   `dvb_usb_rtl28xxu` and treats the V4 as a TV tuner, holding the USB device so SDR
+   software can't open it (symptom: "usb_claim_interface error" / device busy).
+   Blacklist it permanently and unload it now:
+
+   ```bash
+   sudo tee /etc/modprobe.d/blacklist-rtl-sdr.conf >/dev/null <<'EOF'
+   blacklist dvb_usb_rtl28xxu
+   blacklist rtl2832
+   blacklist rtl2830
+   blacklist dvb_usb_v2
+   EOF
+   sudo modprobe -r dvb_usb_rtl28xxu     # frees rtl2832 too; no reboot needed
+   grep -c rtl28xxu /proc/modules        # expect 0
+   ```
+
+2. **Use a driver that knows the V4.** Its R828D tuner needs a recent librtlsdr. Try
+   the distro package first; a working V4 reports the **R828D** tuner:
+
+   ```bash
+   sudo dnf install rtl-sdr      # Debian/RPi OS: sudo apt install rtl-sdr
+   rtl_test -t                   # look for "Found Rafael Micro R828D tuner"
+   ```
+
+   If `rtl_test` shows the wrong tuner, "PLL not locked," or can't find the device,
+   build the reference [rtl-sdr-blog](https://github.com/rtlsdrblog/rtl-sdr-blog) fork
+   instead (`cmake ../ -DINSTALL_UDEV_RULES=ON && make && sudo make install && sudo ldconfig`).
+   The udev rules also let you run it without `sudo`.
+
+Once `rtl_test` is happy, install and run **readsb** pointed at the V4; it writes the
+`aircraft.json` this server polls. Verify the feed with `curl http://localhost:8000/api/aircraft`.
+
 ## Data model
 
 SQLite, two tables. Sensor fields are stored as a verbatim JSON blob in

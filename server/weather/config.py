@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import station
 from .base import Provider
 from .open_meteo import OpenMeteoWeather, OpenMeteoAirQuality
 from .luchtmeetnet import Luchtmeetnet
@@ -36,9 +37,10 @@ def _f(name: str, default: float) -> float:
 
 
 def settings() -> dict:
+    lat, lon = station.coords()  # env > firmware secrets.h > placeholder
     return {
-        "lat": _f("AIRMON_LAT", 52.179722),
-        "lon": _f("AIRMON_LON", 5.284722),
+        "lat": lat,
+        "lon": lon,
         "radius_km": _f("WEATHER_RADIUS_KM", 10.0),
         "poll_sec": int(os.environ.get("WEATHER_POLL_SEC", 600)),
         "enabled": os.environ.get("WEATHER_ENABLED", "1") not in ("0", "false", "False", "no"),

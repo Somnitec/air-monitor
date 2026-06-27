@@ -502,3 +502,34 @@ From [`docs/SENSORS.md`](docs/SENSORS.md):
 - Is the 20 KB ring buffer size sensible for this device's SRAM budget?
 - Should we pre-allocate the ring buffer in PSRAM (not available) or stick to SRAM?
 - Should the JSON blob in SQLite include all sensors, or split into separate tables per sensor type?
+
+---
+
+## Deferred / backlog features
+
+### Firmware / sensor data
+- **Configurable poll interval from UI**: expose `WEATHER_POLL_SEC` as a writable setting via `PATCH /api/config`; wire the dashboard "Every N min" dropdown to it. Same for ESP32 send cadence once firmware is stable.
+- **Per-band audio power in `/ingest`**: firmware should send `mic_db` plus per-band powers (infrasound <20 Hz via accelerometer, low 50–500 Hz, high 500 Hz–8 kHz) so noise overlays on the aircraft side view become meaningful.
+
+### Aircraft / ADS-B
+- **readsb as a service**: see `server/README.md`; until done, local SDR data stays empty.
+- **Flight duration / journey length**: show "tracked N min" cheaply; or query AeroDataBox/FlightAware AeroAPI (~$0.002/call) for departure/arrival airports. Cache per flight per day.
+- **Arrival / departure timer**: extrapolate from `track` + `gs` + position to estimate seconds until overhead crossing. Needs ≥2 fixes to refine bearing rate.
+- **Landing / takeoff detection**: rapid descent to 0 or disappear = landing; appear at 0 + rapid climb = takeoff. Log as `events` rows (`kind='landing'/'takeoff'`).
+- **Flight statistics** (requires landing/takeoff detection + ~1 week of data):
+  - flights/day, flights/week
+  - "flight window" detection (gap > N min = new window), window count/day
+  - average spacing within a window
+  - night-flight count (23:00–06:00)
+- **Top-5 leaderboards**: most frequent aircraft, noisiest type, busiest airline, most gas-correlated type. Needs several days of data.
+- **Smooth predicted path + fading trail**: ghost trail (opacity fades oldest → newest) + dotted forward extrapolation per aircraft on the Leaflet map.
+- **Time graph (3 am–3 am)**: Plotly scatter; X=time, Y=weight or noise; one dot per flyover, color by airline, rotated by direction. Selectable day/week/month/all.
+- **Noise overlay on side view**: color-fill from aircraft path to ground with opacity = normalised noise dB; bands selectable (infrasound, low, high). Prerequisite: per-band firmware data above.
+- **Vortex / wake turbulence correlation**: cross-correlate `howl` event timestamps against aircraft log ~30–90 s prior. Needs ~50+ events to be statistically meaningful.
+- **Noise circle on map markers**: semi-transparent circle scaled by estimated ground-level noise (altitude + MTOW proxy). Decorative until real mic data is available.
+- **Side view scenery backdrop**: static canvas art (forest left, towers left-centre, home centre, sport field right, meadow right); sun/moon by time of day.
+- **Aircraft range-based statistics**: all accumulated stats (landings, flight windows, noise, etc.) computed only within the currently selected range slider value.
+
+### Infrastructure
+- **Cloudflare Tunnel**: `cloudflared tunnel create air-monitor` → free, no port-forwarding needed. See README for full steps.
+- **WAL-mode SQLite backup**: use `sqlite3 data/air-monitor.db ".backup backup.db"` or `VACUUM INTO` — never plain `cp` while server is running.
