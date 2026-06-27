@@ -30,6 +30,11 @@ class Aircraft:
     bearing_deg: float       # from home
     rssi: float | None
     seen: float              # seconds since last message
+    operator: str | None = None   # ownOp from feed (e.g. "KLM Royal Dutch Airlines")
+    desc: str | None = None       # aircraft model description (e.g. "AIRBUS A-320")
+    category: str | None = None   # ADS-B emitter category (e.g. "A3", "A7")
+    year: str | None = None       # year of manufacture
+    source: str = "local"         # 'local' (our SDR), 'public' (reference feed), or 'both'
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +45,9 @@ class Aircraft:
             "distance_km": round(self.distance_km, 2),
             "bearing_deg": round(self.bearing_deg, 1),
             "rssi": self.rssi, "seen": self.seen,
+            "operator": self.operator, "desc": self.desc, "category": self.category,
+            "year": self.year,
+            "source": self.source,
         }
 
 
@@ -62,10 +70,12 @@ def _alt(v: Any) -> int | None:
 
 
 def normalize(raw: dict, home_lat: float, home_lon: float, *,
-              stale_sec: float = 60.0, max_range_km: float = 300.0) -> list[Aircraft]:
+              stale_sec: float = 60.0, max_range_km: float = 300.0,
+              source: str = "local") -> list[Aircraft]:
     """Turn a parsed readsb `aircraft.json` dict into a distance-sorted list of
     `Aircraft`. Drops entries without a position, heard longer ago than
-    `stale_sec`, or farther than `max_range_km` from home."""
+    `stale_sec`, or farther than `max_range_km` from home. `source` tags where the
+    snapshot came from ('local' SDR or a 'public' reference feed)."""
     out: list[Aircraft] = []
     for a in raw.get("aircraft", []):
         lat, lon = _to_float(a.get("lat")), _to_float(a.get("lon"))
@@ -91,7 +101,31 @@ def normalize(raw: dict, home_lat: float, home_lon: float, *,
             bearing_deg=bearing_deg(home_lat, home_lon, lat, lon),
             rssi=_to_float(a.get("rssi")),
             seen=seen,
+            operator=(a.get("ownOp") or "").strip() or None,
+            desc=(a.get("desc") or "").strip() or None,
+            category=a.get("category"),
+            year=str(a["year"]) if a.get("year") else None,
+            source=source,
         ))
+    out.sort(key=lambda x: x.distance_km)
+    return out
+
+
+def merge_sources(local: list[Aircraft], public: list[Aircraft]) -> list[Aircraft]:
+    """Union local and public snapshots by `hex` for cross-correlation. An aircraft
+    seen by both is tagged 'both' and keeps the local record (real rssi/seen);
+    local-only stays 'local', public-only becomes 'public'. Distance-sorted."""
+    by_hex: dict[str, Aircraft] = {}
+    for ac in local:
+        ac.source = "local"
+        by_hex[ac.hex] = ac
+    for ac in public:
+        if ac.hex in by_hex:
+            by_hex[ac.hex].source = "both"
+        else:
+            ac.source = "public"
+            by_hex[ac.hex] = ac
+    out = list(by_hex.values())
     out.sort(key=lambda x: x.distance_km)
     return out
 

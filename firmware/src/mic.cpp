@@ -46,7 +46,7 @@ bool mic_begin() {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = I2S_SAMPLE_RATE_HZ,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // L/R pin tied to GND
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,  // L/R→GND = LEFT slot, ESP32 driver names it RIGHT
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 4,

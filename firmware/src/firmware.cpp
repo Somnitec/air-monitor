@@ -25,6 +25,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <sys/time.h>    // settimeofday() — adopt the server's clock when NTP is unavailable
+#include <esp_system.h>  // esp_reset_reason()
 
 #include <SensirionI2cSen66.h>
 #include <Adafruit_ADXL345_U.h>
@@ -60,7 +61,28 @@ static WiFiMulti wifiMulti;
 
 // Random id regenerated every boot. Lets the server group a boot's records and
 // back-fill the ones logged before the clock was known (see adoptServerTime).
-static uint32_t g_bootId = 0;
+static uint32_t g_bootId     = 0;
+static uint32_t g_bootTs     = 0;   // UTC unix time of this boot (0 until NTP syncs)
+static uint8_t  g_resetReason = 0;  // esp_reset_reason_t cast to uint8; set before Serial
+
+static const char* resetReasonStr(uint8_t r) {
+    switch (r) {
+        case 1:  return "POWERON";
+        case 2:  return "EXT_PIN";
+        case 3:  return "SW_RESET";
+        case 4:  return "PANIC";
+        case 5:  return "INT_WDT";
+        case 6:  return "TASK_WDT";
+        case 7:  return "WDT";
+        case 8:  return "DEEPSLEEP";
+        case 9:  return "BROWNOUT";
+        case 10: return "SDIO";
+        default: return "UNKNOWN";
+    }
+}
+
+// Whether the ring was successfully initialised; guards ringstore_push in loop().
+static bool s_ringReady = false;
 
 // ---------------------------------------------------------------------------
 // Operating mode + duty-cycle bookkeeping.
@@ -117,7 +139,14 @@ static void syncTimeIfNeeded() {
     configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);   // UTC; tz handled on PC side
     // brief, non-blocking-ish wait; we don't stall the loop for long
     for (int i = 0; i < 20 && !timeIsValid(); ++i) delay(100);
-    if (timeIsValid()) Serial.printf("[time] NTP ok: %lu\n", (unsigned long)time(nullptr));
+    if (timeIsValid()) {
+        uint32_t now = (uint32_t)time(nullptr);
+        Serial.printf("[time] NTP ok: %lu\n", (unsigned long)now);
+        if (g_bootTs == 0) {
+            g_bootTs = now;
+            Serial.printf("[boot] boot time: %lu\n", (unsigned long)g_bootTs);
+        }
+    }
 }
 
 // If our own clock is still unsynced (no NTP reachable), adopt the approximate
@@ -158,9 +187,20 @@ static bool wifiConnect() {
     // wifiMulti.run() scans and connects to the strongest known network in range.
     wifiMulti.run(WIFI_CONNECT_TIMEOUT_MS);
     bool ok = (WiFi.status() == WL_CONNECTED);
-    if (ok) Serial.printf("[wifi] connected: %s (%s, %d dBm)\n",
-                          WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    else    Serial.println("[wifi] no known network in range (will retry next cycle)");
+    if (ok) {
+        // Modem power-save makes the ESP32 miss frames the AP forwards between
+        // clients — internet (via the gateway) still works but TCP to a LAN peer
+        // black-holes. Keep the radio awake while we're up.
+        WiFi.setSleep(false);
+        Serial.printf("[wifi] connected: %s (%s, %d dBm)\n",
+                      WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        Serial.printf("[wifi] gw=%s mask=%s dns=%s\n",
+                      WiFi.gatewayIP().toString().c_str(),
+                      WiFi.subnetMask().toString().c_str(),
+                      WiFi.dnsIP().toString().c_str());
+    } else {
+        Serial.println("[wifi] no known network in range (will retry next cycle)");
+    }
     return ok;
 }
 
@@ -248,6 +288,38 @@ static void buildFields(RecordFields& f) {
     }
 }
 
+// Print a human-readable snapshot of all sensor values in f to Serial.
+static void printFields(const RecordFields& f) {
+    Serial.printf("[snap] ts=%u up=%.1fs\n", f.ts, f.up_ms / 1000.0f);
+    if (f.has_sen66)
+        Serial.printf("  SEN66   PM1=%.1f PM2.5=%.1f PM4=%.1f PM10=%.1f ug/m3"
+                      "  CO2=%u ppm  VOC=%.0f  NOx=%.0f  T=%.1fC  RH=%.1f%%\n",
+                      f.pm1, f.pm25, f.pm4, f.pm10, f.co2, f.voc, f.nox, f.temp, f.rh);
+    if (f.has_bh1750)
+        Serial.printf("  BH1750  lux=%.1f\n", f.lux);
+    if (f.has_bme)
+        Serial.printf("  BME280  T=%.1fC  RH=%.1f%%  P=%.1f hPa\n",
+                      f.bme_temp, f.bme_rh, f.pressure);
+    if (f.has_adxl)
+        Serial.printf("  ADXL345 rumble_rms=%.3f  rumble_peak=%.3f  mag=%.3f m/s2\n",
+                      f.rumble_rms, f.rumble_peak, f.accel_mag);
+    if (f.has_co)      Serial.printf("  CO      %u mV\n",   f.co_mv);
+    if (f.has_hcho)    Serial.printf("  HCHO    %u mV\n",   f.hcho_mv);
+    if (f.has_soil)    Serial.printf("  soil    %u mV\n",   f.soil_mv);
+    if (f.has_battery) {
+        float v   = f.bat_raw_mv / 1000.0f * BAT_DIVIDER_FACTOR;
+        float pct = (v - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V) * 100.0f;
+        if (pct < 0)   pct = 0;
+        if (pct > 100) pct = 100;
+        Serial.printf("  battery %.2f V  %.0f%%%s  (raw %u mV)\n",
+                      v, pct, f.bat_cal ? "" : " uncal", f.bat_raw_mv);
+    }
+    if (f.has_mic)
+        Serial.printf("  INMP441 dBA=%.1f  SPL=%.1f  dBFS=%.1f%s\n",
+                      f.noise_dba, f.noise_spl, f.noise_dbfs,
+                      f.noise_clip ? "  CLIP" : "");
+}
+
 // ---------------------------------------------------------------------------
 // Duty-cycled sync session + dashboard-driven mode state machine.
 // ---------------------------------------------------------------------------
@@ -270,11 +342,13 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
     uint16_t port = s_serverHost.length() ? s_serverPort : (uint16_t)SYNC_PORT;
 
     JsonDocument doc;
-    doc["dev"]      = DEVICE_ID;
-    doc["boot"]     = g_bootId;
-    doc["fw"]       = "phase1";
-    doc["mode"]     = (g_mode == MODE_TESTING) ? "testing" : "normal";
-    doc["buffered"] = ringstore_unsynced();
+    doc["dev"]          = DEVICE_ID;
+    doc["boot"]         = g_bootId;
+    doc["boot_ts"]      = g_bootTs;
+    doc["reset_reason"] = resetReasonStr(g_resetReason);
+    doc["fw"]           = "phase1";
+    doc["mode"]         = (g_mode == MODE_TESTING) ? "testing" : "normal";
+    doc["buffered"]     = ringstore_unsynced();
     JsonArray arr = doc["records"].to<JsonArray>();
     for (uint32_t i = 0; i < n; ++i) {
         JsonDocument tmp;
@@ -393,11 +467,15 @@ void setup() {
 
     Serial.begin(115200);
     delay(300);
+    g_resetReason = (uint8_t)esp_reset_reason();
     g_bootId = esp_random();
     Serial.printf("\n[boot] air-monitor phase 1 (boot=%lu)\n", (unsigned long)g_bootId);
+    Serial.printf("[boot] reset reason: %s (%u)\n", resetReasonStr(g_resetReason), g_resetReason);
 
-    if (!LittleFS.begin(true)) {        // format on first boot if needed
-        Serial.println("[fs] LittleFS mount failed!");
+    bool s_fsMounted = LittleFS.begin(true);   // format on first boot if needed
+    if (!s_fsMounted) {
+        Serial.println("[fs] LittleFS mount failed! Run: pio run -t uploadfs");
+        // Leave s_ringReady false; ringstore_begin is never called below.
     }
 
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ_HZ);
@@ -418,7 +496,10 @@ void setup() {
     Serial.printf("[wifi] %u known network(s) registered\n", (unsigned)kWifiCount);
 
     g_bootStartMs = millis();
-    if (!ringstore_begin()) Serial.println("[ring] begin failed");
+    if (s_fsMounted) {
+        s_ringReady = ringstore_begin();
+        if (!s_ringReady) Serial.println("[ring] begin failed — samples will not be stored");
+    }
 
     // Boot window: WiFi on so the dashboard can flip us into testing mode.
     if (wifiConnect()) { syncTimeIfNeeded(); discoverServer(); }
@@ -427,6 +508,8 @@ void setup() {
     digitalWrite(PIN_EXT_LED, LOW);
     Serial.println("[boot] ready — sampling every "
                    + String(SAMPLE_BASELINE_MS / 1000) + " s");
+    RecordFields snap; buildFields(snap);
+    printFields(snap);
 }
 
 void loop() {
@@ -443,10 +526,14 @@ void loop() {
 
         RecordFields f; buildFields(f);
         Record rec = record_pack(f);
-        ringstore_push(rec);
-        Serial.printf("[rec] seq=%u ts=%u buffered=%u mode=%s\n",
-                      rec.seq, rec.ts, ringstore_unsynced(),
-                      g_mode == MODE_TESTING ? "testing" : "normal");
+        if (s_ringReady) {
+            ringstore_push(rec);
+            Serial.printf("[rec] seq=%u ts=%u buffered=%u mode=%s\n",
+                          rec.seq, rec.ts, ringstore_unsynced(),
+                          g_mode == MODE_TESTING ? "testing" : "normal");
+        } else {
+            Serial.printf("[rec] ts=%u (ring not ready, discarding)\n", rec.ts);
+        }
 
         // TESTING: push live right after each sample.
         if (g_mode == MODE_TESTING && WiFi.status() == WL_CONNECTED) drainRing();

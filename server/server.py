@@ -42,6 +42,7 @@ from weather import store as weather_store
 from aircraft import config as aircraft_config
 from aircraft import scheduler as aircraft_scheduler
 from aircraft import store as aircraft_store
+from aircraft import usb as aircraft_usb
 
 # --------------------------------------------------------------------------- #
 # Storage
@@ -252,6 +253,19 @@ async def _broadcast_weather(observations) -> None:
 
 # Aircraft: the current in-range snapshot (live only), refreshed by the poll loop.
 _aircraft_snapshot: list = []
+_sdr_status: dict = {"connected": None, "name": None}
+_sdr_checked_at: float = 0.0
+
+
+def _sdr_status_cached(ttl: float = 5.0) -> dict:
+    """RTL-SDR presence, re-probed at most every `ttl` seconds (sysfs is cheap but
+    the snapshot broadcast fires ~every second)."""
+    global _sdr_status, _sdr_checked_at
+    now = time.monotonic()
+    if now - _sdr_checked_at >= ttl:
+        _sdr_status = aircraft_usb.rtlsdr_status()
+        _sdr_checked_at = now
+    return _sdr_status
 
 
 async def _on_aircraft_snapshot(records) -> None:
@@ -259,6 +273,7 @@ async def _on_aircraft_snapshot(records) -> None:
     global _aircraft_snapshot
     _aircraft_snapshot = records
     await hub.broadcast({"type": "aircraft", "ts": int(time.time()),
+                         "sdr": _sdr_status_cached(),
                          "data": [a.as_dict() for a in records]})
 
 
@@ -519,7 +534,7 @@ async def get_config():
     """Static-ish config the dashboard needs (home location for the map, etc.)."""
     s = aircraft_config.settings()
     return {"home": [s["lat"], s["lon"]], "aircraft_enabled": s["enabled"],
-            "max_range_km": s["max_range_km"]}
+            "max_range_km": s["max_range_km"], "sdr": _sdr_status_cached()}
 
 
 @app.get("/api/aircraft")
@@ -529,6 +544,23 @@ async def get_aircraft(range_km: float | None = None):
     if range_km is not None:
         records = [a for a in records if a.distance_km <= range_km]
     return JSONResponse([a.as_dict() for a in records])
+
+
+# ---- flight-path history --------------------------------------------------- #
+
+@app.get("/api/aircraft/paths")
+async def aircraft_paths(range_km: float = 1.0, hours: float = 48.0):
+    """Historical sightings within range_km, for flight-path graphs."""
+    since = int(time.time()) - int(min(hours, 168) * 3600)
+    rows = aircraft_store.query(_conn, since=since, limit=200_000)
+    pts = [
+        {"hex": r["hex"], "flight": r["flight"], "ts": r["ts"],
+         "lat": r["lat"], "lon": r["lon"], "alt_baro": r["alt_baro"]}
+        for r in rows
+        if r["distance_km"] is not None and r["distance_km"] <= range_km
+        and r["lat"] is not None and r["lon"] is not None
+    ]
+    return JSONResponse({"points": pts})
 
 
 # ---- events (home mode) ---------------------------------------------------- #
