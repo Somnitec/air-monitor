@@ -126,7 +126,90 @@ def _init_db() -> sqlite3.Connection:
     conn.commit()
     weather_store.init_weather_table(conn)    # external weather/air-quality series
     aircraft_store.init_aircraft_table(conn)  # ADS-B sightings (logged, throttled)
+    _create_research_views(conn)              # analysis views over the joined data
     return conn
+
+
+def _create_research_views(conn: sqlite3.Connection) -> None:
+    """Read-only views that turn the raw tables into the project's research questions:
+    how loud, how often, which aircraft, day vs night, plane-noise correlation. They
+    join readings↔aircraft by time proximity, so they only fill in once the mic is
+    reporting noise_dba/lamax. Cheap to (re)define; nothing computes until queried."""
+    conn.executescript(
+        """
+        -- Every reading at/above 65 dB(A), tagged with hour + night flag (23:00–07:00).
+        DROP VIEW IF EXISTS noise_loud;
+        CREATE VIEW noise_loud AS
+        SELECT id, ts,
+               datetime(ts,'unixepoch','localtime') AS time,
+               noise_dba, lamax, lceq,
+               COALESCE(lamax, noise_dba) AS peak_db,
+               CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+               (CAST(strftime('%H', ts,'unixepoch','localtime') AS INTEGER) < 7 OR
+                CAST(strftime('%H', ts,'unixepoch','localtime') AS INTEGER) >= 23) AS night
+        FROM readings
+        WHERE COALESCE(lamax, noise_dba) >= 65
+        ORDER BY ts;
+
+        -- Each loud-ish reading joined to the closest aircraft overhead within ±30 s.
+        -- "Which plane made this noise?" — the basis for cause attribution.
+        DROP VIEW IF EXISTS noise_with_aircraft;
+        CREATE VIEW noise_with_aircraft AS
+        SELECT r.ts,
+               datetime(r.ts,'unixepoch','localtime') AS time,
+               r.noise_dba, r.lamax,
+               a.hex, a.flight, a.type, a.category, a.operator,
+               a.alt_baro, a.gs, a.baro_rate,
+               round(a.distance_km, 2) AS dist_km
+        FROM readings r
+        LEFT JOIN aircraft a ON a.id = (
+            SELECT a2.id FROM aircraft a2
+            WHERE ABS(a2.ts - r.ts) <= 30
+            ORDER BY a2.distance_km ASC LIMIT 1)
+        WHERE COALESCE(r.lamax, r.noise_dba) >= 60
+        ORDER BY r.ts;
+
+        -- Which aircraft TYPES are loudest (avg + peak), for types seen overhead (≤8 km).
+        DROP VIEW IF EXISTS loudness_by_type;
+        CREATE VIEW loudness_by_type AS
+        SELECT a.type,
+               COUNT(*) AS n_samples,
+               round(AVG(r.noise_dba), 1) AS avg_dba,
+               round(MAX(COALESCE(r.lamax, r.noise_dba)), 1) AS max_dba
+        FROM aircraft a
+        JOIN readings r ON ABS(r.ts - a.ts) <= 15
+        WHERE a.distance_km <= 8 AND a.type IS NOT NULL AND r.noise_dba IS NOT NULL
+        GROUP BY a.type
+        HAVING n_samples >= 3
+        ORDER BY avg_dba DESC;
+
+        -- Per local day: flights overhead, loudness, event counts, air quality.
+        -- "Clearly better air when they don't fly for a day?" lives here.
+        DROP VIEW IF EXISTS daily_summary;
+        CREATE VIEW daily_summary AS
+        WITH days(day) AS (
+            SELECT DISTINCT date(ts,'unixepoch','localtime') FROM readings
+            UNION
+            SELECT DISTINCT date(ts,'unixepoch','localtime') FROM aircraft)
+        SELECT day,
+            (SELECT COUNT(DISTINCT hex) FROM aircraft
+               WHERE date(ts,'unixepoch','localtime')=day AND distance_km<=10) AS flights,
+            (SELECT round(MAX(COALESCE(lamax,noise_dba)),1) FROM readings
+               WHERE date(ts,'unixepoch','localtime')=day) AS max_db,
+            (SELECT COUNT(*) FROM readings
+               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba)>=65) AS n_ge65,
+            (SELECT COUNT(*) FROM readings
+               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba)>=70) AS n_ge70,
+            (SELECT COUNT(*) FROM readings
+               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba)>=65
+                 AND (CAST(strftime('%H',ts,'unixepoch','localtime') AS INTEGER)<7
+                   OR CAST(strftime('%H',ts,'unixepoch','localtime') AS INTEGER)>=23)) AS n_ge65_night,
+            (SELECT round(AVG(pm25),1) FROM readings WHERE date(ts,'unixepoch','localtime')=day) AS avg_pm25,
+            (SELECT round(AVG(co2),0)  FROM readings WHERE date(ts,'unixepoch','localtime')=day) AS avg_co2
+        FROM days ORDER BY day DESC;
+        """
+    )
+    conn.commit()
 
 
 def _migrate_readings(conn: sqlite3.Connection) -> None:
@@ -529,7 +612,7 @@ async def get_readings(
     device: str | None = None,
 ):
     """Time-range query. `since`/`until` are unix epoch seconds."""
-    sql = "SELECT ts, device_ts, ts_ok, ts_source, payload FROM readings WHERE 1=1"
+    sql = "SELECT ts, device, device_ts, ts_ok, ts_source, payload FROM readings WHERE 1=1"
     args: list[Any] = []
     if since is not None:
         sql += " AND ts >= ?"; args.append(int(since))

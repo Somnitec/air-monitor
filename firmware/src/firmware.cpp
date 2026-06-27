@@ -238,6 +238,20 @@ static void discoverServer() {
     Serial.println("[mdns] no usable _airmon record — using fallback SYNC_HOST");
 }
 
+// Reject physically-impossible SEN66 frames so corrupted reads never reach the DB.
+// PM must be non-negative and monotonic (pm1≤pm2.5≤pm4≤pm10); RH 0–100 %; T a
+// sane ambient range; VOC/NOx indices 0–500; CO2 0–40000 ppm.
+static bool sen66ValuesSane(float pm1, float pm25, float pm4, float pm10,
+                            float t, float rh, float voc, float nox, uint16_t co2) {
+    if (pm1 < 0 || pm25 < pm1 || pm4 < pm25 || pm10 < pm4) return false;
+    if (pm10 > 1000) return false;                    // SEN66 PM range tops out ~1000 µg/m³
+    if (rh < 0 || rh > 100) return false;
+    if (t < -40 || t > 85) return false;
+    if (voc < 0 || voc > 500 || nox < 0 || nox > 500) return false;
+    if (co2 > 40000) return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Build one RecordFields from a fresh read of every present sensor.
 // ---------------------------------------------------------------------------
@@ -248,8 +262,13 @@ static void buildFields(RecordFields& f) {
     f.boot  = (uint16_t)(g_bootId & 0xFFFF);
 
     if (present.sen66) {
+        // Only read once a fresh measurement is ready (continuous mode produces one
+        // per second). Reading otherwise can return stale/not-ready frames.
+        uint8_t pad = 0; bool ready = false;
+        bool okReady = (sen66.getDataReady(pad, ready) == 0) && ready;
         float pm1, pm25, pm4, pm10, t, rh, voc, nox; uint16_t co2;
-        if (sen66.readMeasuredValues(pm1, pm25, pm4, pm10, rh, t, voc, nox, co2) == 0) {
+        if (okReady && sen66.readMeasuredValues(pm1, pm25, pm4, pm10, rh, t, voc, nox, co2) == 0
+            && sen66ValuesSane(pm1, pm25, pm4, pm10, t, rh, voc, nox, co2)) {
             f.has_sen66 = true;
             f.pm1 = pm1; f.pm25 = pm25; f.pm4 = pm4; f.pm10 = pm10;
             f.co2 = co2; f.voc = voc; f.nox = nox; f.temp = t; f.rh = rh;
