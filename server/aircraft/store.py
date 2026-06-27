@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS aircraft (
     baro_rate   INTEGER,               -- ft/min (+climb / -descent)
     distance_km REAL,                  -- from home
     bearing_deg REAL,                  -- from home
-    rssi        REAL
+    rssi        REAL,
+    source      TEXT DEFAULT 'local'   -- 'local' | 'public' | 'both'
 );
 CREATE INDEX IF NOT EXISTS idx_aircraft_ts  ON aircraft(ts);
 CREATE INDEX IF NOT EXISTS idx_aircraft_hex ON aircraft(hex);
@@ -38,6 +39,10 @@ CREATE INDEX IF NOT EXISTS idx_aircraft_hex ON aircraft(hex);
 
 def init_aircraft_table(conn: sqlite3.Connection) -> None:
     conn.executescript(_DDL)
+    # Migrate older DBs that predate the source column.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(aircraft)")}
+    if "source" not in cols:
+        conn.execute("ALTER TABLE aircraft ADD COLUMN source TEXT DEFAULT 'local'")
     conn.commit()
 
 
@@ -48,14 +53,15 @@ def insert(conn: sqlite3.Connection, aircraft: list[Aircraft], *,
     now = int(time.time()) if now is None else int(now)
     rows = [
         (now, a.hex, a.flight, a.type, a.reg, a.lat, a.lon, a.alt_baro,
-         a.gs, a.track, a.baro_rate, a.distance_km, a.bearing_deg, a.rssi)
+         a.gs, a.track, a.baro_rate, a.distance_km, a.bearing_deg, a.rssi,
+         a.source)
         for a in aircraft
     ]
     conn.executemany(
         "INSERT INTO aircraft "
         "(ts, hex, flight, type, reg, lat, lon, alt_baro, gs, track, "
-        " baro_rate, distance_km, bearing_deg, rssi) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " baro_rate, distance_km, bearing_deg, rssi, source) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     conn.commit()

@@ -27,7 +27,7 @@ firmware/                 ESP32 (PlatformIO, Arduino framework)
     ringlogic.cpp         FIFO pointer math
     ringstore.cpp         ring file + double-buffered CRC metadata
     mic.cpp / accel.cpp   sensor capture
-    secrets.h             WiFi creds + sync host (gitignored; copy secrets.example.h)
+  secrets.h               WiFi creds + sync host (gitignored; copy secrets.example.h)
   test/
     test_record/          Unity tests (native)
     test_ringlogic/       Unity tests (native)
@@ -125,7 +125,7 @@ round-trip, and mode validation.
 
 ## Building & flashing the firmware
 
-1. Create `firmware/src/secrets.h` from `firmware/src/secrets.example.h` (WiFi
+1. Create `secrets.h` from `secrets.example.h` in the repo root (WiFi
    networks, sync host fallback, calibration overrides). It is gitignored.
 2. Flash over USB:
    ```bash

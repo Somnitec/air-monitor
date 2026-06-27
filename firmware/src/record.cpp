@@ -17,11 +17,23 @@ static int16_t qI16(float v, float scale) {
     if (s < -32768.0f) return -32768;
     return (int16_t)s;
 }
+static uint16_t qU16c(float v, float scale) {  // clamp-to-zero variant (no negative)
+    float s = roundf(v * scale);
+    if (s < 0.0f)      return 0;
+    if (s > 65535.0f)  return 65535;
+    return (uint16_t)s;
+}
 static uint8_t qU8(float v) {
     float s = roundf(v);
     if (s > 255.0f) return 255;
     if (s < 0.0f)   return 0;
     return (uint8_t)s;
+}
+static int8_t qI8(float v) {
+    float s = roundf(v);
+    if (s >  127.0f) return  127;
+    if (s < -128.0f) return -128;
+    return (int8_t)s;
 }
 static void setBit(uint16_t& flags, uint16_t bit, bool on) { if (on) flags |= bit; }
 
@@ -57,19 +69,27 @@ Record record_pack(const RecordFields& f) {
         r.bme_temp = qI16(f.bme_temp, 100); r.bme_rh = qU16(f.bme_rh, 100);
     }
     if (f.has_adxl) {
-        r.rumble_rms = qU16(f.rumble_rms, 1000);
+        r.rumble_rms  = qU16(f.rumble_rms,  1000);
         r.rumble_peak = qU16(f.rumble_peak, 1000);
-        r.accel_mag = qU16(f.accel_mag, 100);
+        r.accel_mag   = qU16(f.accel_mag,   100);
+        // v2 accel metrics (always packed when adxl present)
+        r.ppv_mm10      = qU16c(f.ppv_m_s * 10000.0f, 1.0f);   // m/s → 0.1 mm/s units
+        r.accel_dom_hz  = (uint8_t)(f.accel_dom_hz);
+        for (int b = 0; b < REC_ACCEL_BANDS; ++b)
+            r.accel_bands[b] = qI8(f.accel_band_db[b]);
     }
     if (f.has_co)      r.co_mv = f.co_mv;
     if (f.has_hcho)    r.hcho_mv = f.hcho_mv;
     if (f.has_soil)    r.soil_mv = f.soil_mv;
     if (f.has_battery) r.bat_raw_mv = f.bat_raw_mv;
     if (f.has_mic) {
-        r.noise_dba = qI16(f.noise_dba, 10);
-        r.noise_spl = qI16(f.noise_spl, 10);
+        r.noise_dba  = qI16(f.noise_dba,  10);
+        r.noise_spl  = qI16(f.noise_spl,  10);
         r.noise_dbfs = qI16(f.noise_dbfs, 10);
         for (int b = 0; b < REC_NBANDS; ++b) r.bands[b] = qU8(f.bands[b]);
+        // v2 mic metrics
+        r.noise_lamax = qI16(f.noise_lamax, 10);
+        r.noise_lceq  = qI16(f.noise_lceq,  10);
     }
     return r;
 }
@@ -90,15 +110,26 @@ void record_unpack(const Record& r, RecordFields& f) {
     f.has_bme = r.flags & PRESENT_BME;
     if (f.has_bme) { f.pressure = r.pressure/10.0f; f.bme_temp = r.bme_temp/100.0f; f.bme_rh = r.bme_rh/100.0f; }
     f.has_adxl = r.flags & PRESENT_ADXL;
-    if (f.has_adxl) { f.rumble_rms = r.rumble_rms/1000.0f; f.rumble_peak = r.rumble_peak/1000.0f; f.accel_mag = r.accel_mag/100.0f; }
+    if (f.has_adxl) {
+        f.rumble_rms  = r.rumble_rms  / 1000.0f;
+        f.rumble_peak = r.rumble_peak / 1000.0f;
+        f.accel_mag   = r.accel_mag   / 100.0f;
+        f.ppv_m_s     = r.ppv_mm10    / 10000.0f;   // 0.1 mm/s units → m/s
+        f.accel_dom_hz = r.accel_dom_hz;
+        for (int b = 0; b < REC_ACCEL_BANDS; ++b) f.accel_band_db[b] = r.accel_bands[b];
+    }
     f.has_co = r.flags & PRESENT_CO;       if (f.has_co)      f.co_mv = r.co_mv;
     f.has_hcho = r.flags & PRESENT_HCHO;   if (f.has_hcho)    f.hcho_mv = r.hcho_mv;
     f.has_soil = r.flags & PRESENT_SOIL;   if (f.has_soil)    f.soil_mv = r.soil_mv;
     f.has_battery = r.flags & PRESENT_BATTERY; if (f.has_battery) f.bat_raw_mv = r.bat_raw_mv;
     f.has_mic = r.flags & PRESENT_MIC;
     if (f.has_mic) {
-        f.noise_dba = r.noise_dba/10.0f; f.noise_spl = r.noise_spl/10.0f; f.noise_dbfs = r.noise_dbfs/10.0f;
+        f.noise_dba  = r.noise_dba  / 10.0f;
+        f.noise_spl  = r.noise_spl  / 10.0f;
+        f.noise_dbfs = r.noise_dbfs / 10.0f;
         for (int b = 0; b < REC_NBANDS; ++b) f.bands[b] = r.bands[b];
+        f.noise_lamax = r.noise_lamax / 10.0f;
+        f.noise_lceq  = r.noise_lceq  / 10.0f;
     }
 }
 
@@ -127,7 +158,16 @@ void record_to_json(const Record& r, JsonDocument& doc) {
         doc["pressure_hpa"] = f.pressure; doc["bme_temp"] = f.bme_temp; doc["bme_rh"] = f.bme_rh;
     }
     if (f.has_adxl) {
-        doc["rumble"] = f.rumble_rms; doc["rumble_peak"] = f.rumble_peak; doc["accel_mag"] = f.accel_mag;
+        doc["rumble"]      = f.rumble_rms;
+        doc["rumble_peak"] = f.rumble_peak;
+        doc["accel_mag"]   = f.accel_mag;
+        // v2 — vibration / infrasound
+        doc["ppv_mm_s"]    = roundf(f.ppv_m_s * 10000.0f) / 10.0f;  // m/s → mm/s, 1 dp
+        doc["accel_dom_hz"] = f.accel_dom_hz;
+        // 1/3-octave bands: 4, 8, 16, 31.5, 63, 125 Hz in dBm/s²
+        static const char* BAND_KEYS[REC_ACCEL_BANDS] =
+            {"vib_4hz","vib_8hz","vib_16hz","vib_31hz","vib_63hz","vib_125hz"};
+        for (int b = 0; b < REC_ACCEL_BANDS; ++b) doc[BAND_KEYS[b]] = f.accel_band_db[b];
     }
     if (f.has_co) {
         doc["co_mv"] = f.co_mv; doc["co_rs"] = gasRsLocal(f.co_mv, GAS_CO_RL_OHMS);
@@ -150,8 +190,14 @@ void record_to_json(const Record& r, JsonDocument& doc) {
         }
     }
     if (f.has_mic) {
-        doc["noise_dba"] = f.noise_dba; doc["noise_spl"] = f.noise_spl;
-        doc["noise_dbfs"] = f.noise_dbfs; doc["noise_clip"] = f.noise_clip;
+        doc["noise_dba"]  = f.noise_dba;      // LAeq over capture window, dB(A)
+        doc["noise_spl"]  = f.noise_spl;
+        doc["noise_dbfs"] = f.noise_dbfs;
+        doc["noise_clip"] = f.noise_clip;
+        // v2 — Dutch/EU aircraft noise metrics
+        doc["lamax"]      = f.noise_lamax;    // peak A-weighted in ~1.3 s window, dB(A)
+        doc["lceq"]       = f.noise_lceq;     // C-weighted equivalent, dB(C)
+        doc["lc_minus_la"] = roundf((f.noise_lceq - f.noise_dba) * 10.0f) / 10.0f;
         JsonArray bands = doc["noise_bands"].to<JsonArray>();
         for (int b = 0; b < REC_NBANDS; ++b) bands.add(f.bands[b]);
     }

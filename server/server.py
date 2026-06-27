@@ -457,6 +457,188 @@ async def stats():
     return {"readings": row["n"], "first_ts": row["lo"], "last_ts": row["hi"], "events": nev}
 
 
+# ---- Dutch / EU aircraft noise statistics -------------------------------- #
+
+import math as _math
+import datetime as _dt
+
+def _lden_from_rows(rows: list, tz_offset_h: int = 1) -> dict:
+    """Compute Dutch Lden, Lnight and N-counts from a list of payload dicts.
+
+    Lden = 10 × log10( (1/24) × (12×L_day + 4×10^((L_eve+5)/10) + 8×10^((L_nig+10)/10)) )
+    where L_x is the energy-average LAeq over that period (day 07-19, eve 19-23, night 23-07 local).
+
+    N-counts: NAxx = number of records where noise_lamax (or noise_dba when lamax absent) >= xx dB(A).
+    Returns a dict keyed by device, or "all" for the aggregate.
+    """
+    period_e = {d: {"day": [], "eve": [], "night": []} for d in ["all"]}
+
+    for p in rows:
+        dev = p.get("device") or p.get("dev") or "unknown"
+        if dev not in period_e:
+            period_e[dev] = {"day": [], "eve": [], "night": []}
+
+        ts = p.get("ts")
+        if not ts:
+            continue
+        # Local hour (CET = UTC+1)
+        local_h = (_dt.datetime.utcfromtimestamp(ts) + _dt.timedelta(hours=tz_offset_h)).hour
+
+        # Use LAmax if available (Dutch preferred), fall back to LAeq
+        level = p.get("lamax") or p.get("noise_dba")
+        if level is None:
+            continue
+        level = float(level)
+
+        bucket = "day" if 7 <= local_h < 19 else "eve" if 19 <= local_h < 23 else "night"
+        period_e[dev][bucket].append(level)
+        period_e["all"][bucket].append(level)
+
+    def energy_avg(levels):
+        if not levels:
+            return None
+        return 10.0 * _math.log10(sum(10 ** (x / 10.0) for x in levels) / len(levels))
+
+    def lden(d, e, n):
+        parts = []
+        if d is not None: parts.append((12, d, 0))
+        if e is not None: parts.append((4,  e, 5))
+        if n is not None: parts.append((8,  n, 10))
+        if not parts:
+            return None
+        total = sum(w * 10 ** ((l + pen) / 10.0) for w, l, pen in parts)
+        return 10.0 * _math.log10(total / 24.0)
+
+    def ncounts(levels):
+        return {
+            "na55": sum(1 for x in levels if x >= 55),
+            "na60": sum(1 for x in levels if x >= 60),
+            "na65": sum(1 for x in levels if x >= 65),
+            "na70": sum(1 for x in levels if x >= 70),
+        }
+
+    result = {}
+    for dev, buckets in period_e.items():
+        ld = energy_avg(buckets["day"])
+        le = energy_avg(buckets["eve"])
+        ln = energy_avg(buckets["night"])
+        all_levels = buckets["day"] + buckets["eve"] + buckets["night"]
+        result[dev] = {
+            "lday":   round(ld, 1) if ld is not None else None,
+            "levening": round(le, 1) if le is not None else None,
+            "lnight": round(ln, 1) if ln is not None else None,
+            "lden":   round(lden(ld, le, ln), 1) if lden(ld, le, ln) is not None else None,
+            "n_events": len(all_levels),
+            **ncounts(all_levels),
+        }
+    return result
+
+
+@app.get("/api/noise_stats")
+async def noise_stats(
+    since: int | None = None,
+    until: int | None = None,
+    device: str | None = None,
+):
+    """Dutch/EU aircraft noise indicators: Lden, Lnight, NA55/60/65/70 event counts.
+
+    `since`/`until` are unix timestamps.  If omitted, defaults to the last 24 h.
+    The Lden formula uses local time CET (UTC+1) for day/evening/night split.
+    """
+    now = int(time.time())
+    if since is None:
+        since = now - 86400
+    sql = "SELECT ts, device, payload FROM readings WHERE ts >= ?"
+    args: list[Any] = [since]
+    if until is not None:
+        sql += " AND ts <= ?"; args.append(int(until))
+    if device:
+        sql += " AND device = ?"; args.append(device)
+    sql += " ORDER BY ts ASC"
+
+    async with _db_lock:
+        rows = _conn.execute(sql, args).fetchall()
+
+    payloads = []
+    for r in rows:
+        p = json.loads(r["payload"])
+        p["device"] = r["device"]
+        payloads.append(p)
+
+    return JSONResponse(_lden_from_rows(payloads))
+
+
+# ---- audio frequency bands ------------------------------------------------ #
+@app.get("/api/audio_bands")
+async def audio_bands(
+    since: int | None = None,
+    until: int | None = None,
+    device: str | None = None,
+    limit: int = 5000,
+):
+    """Time-series of mic frequency bands (9 A-weighted bands).
+
+    Returns: [{"ts": unix_epoch, "device": "dev_id", "bands": [dB, dB, ...]}, ...]
+    where bands are: 20-100, 100-200, 200-400, 400-800, 800-1600, 1600-3200, 3200-6400, 6400-12800, 12800-20000 Hz (nominal).
+    """
+    sql = "SELECT ts, device, payload FROM readings WHERE 1=1"
+    args: list[Any] = []
+    if since is not None:
+        sql += " AND ts >= ?"; args.append(int(since))
+    if until is not None:
+        sql += " AND ts <= ?"; args.append(int(until))
+    if device:
+        sql += " AND device = ?"; args.append(device)
+    sql += " ORDER BY ts ASC LIMIT ?"; args.append(int(limit))
+
+    async with _db_lock:
+        rows = _conn.execute(sql, args).fetchall()
+
+    result = []
+    for r in rows:
+        p = json.loads(r["payload"])
+        bands = p.get("noise_bands", [])
+        if bands:
+            result.append({
+                "ts": r["ts"],
+                "device": r["device"],
+                "bands": bands,
+            })
+    return JSONResponse(result)
+
+
+# ---- device configuration ------------------------------------------------- #
+# In-memory config per device. Persists only during this server session.
+# To make it persistent, store in the database or a config file.
+DEVICE_CONFIG: dict[str, dict] = {}  # dev -> {poll_interval_s, ...}
+
+@app.get("/api/config")
+async def get_config(device: str | None = None):
+    """Get device configuration. If `device` omitted, returns all devices' configs."""
+    if device:
+        return JSONResponse(DEVICE_CONFIG.get(device, {}))
+    return JSONResponse(DEVICE_CONFIG)
+
+
+@app.post("/api/config/{device}")
+async def set_config(device: str, request: Request):
+    """Set device configuration. Persists only until server restart.
+
+    Example: {"poll_interval_s": 120}
+    The device fetches this at startup and after each sync.
+    """
+    body = await request.json()
+    if device not in DEVICE_CONFIG:
+        DEVICE_CONFIG[device] = {}
+    DEVICE_CONFIG[device].update(body)
+    # In a production system, you'd persist this to disk or database here.
+    return JSONResponse({
+        "ok": True,
+        "device": device,
+        "config": DEVICE_CONFIG[device],
+    })
+
+
 # ---- device mode (testing) control --------------------------------------- #
 @app.get("/api/devices")
 async def get_devices():

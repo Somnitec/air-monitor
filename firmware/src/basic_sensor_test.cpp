@@ -6,7 +6,7 @@
 #include <SensirionI2cSen66.h>
 #include <Adafruit_ADXL345_U.h>
 #include <BH1750.h>
-#include "secrets.h"
+#include "../../secrets.h"
 
 // ---------------- Pin map ----------------
 // Matches the working assignments from basic_connectivity_test.cpp.

@@ -147,10 +147,12 @@
 // is Phase 2; Phase 1 is fixed-cadence on purpose to gather a clean baseline.
 #define SAMPLE_BASELINE_MS   60000UL    // 60 s
 
-// --- Accelerometer ground-rumble capture (mic-style, coarser) ---
-// Capture a short burst, remove gravity (DC), report AC-magnitude RMS + peak.
-#define ACCEL_RUMBLE_SAMPLES   128      // samples per rumble window
-#define ACCEL_RUMBLE_GAP_US   1500      // ~us between samples (~660 Hz attempt; I2C-limited)
+// --- Accelerometer vibration capture ---
+// Poll at ~400 Hz (I2C overhead + gap ≈ 2.5 ms/sample), capture 512 samples (~1.3 s).
+// FFT gives 1/3-octave bands 4–125 Hz; integration gives peak particle velocity (PPV).
+#define ACCEL_FFT_SAMPLES     512       // samples per window; must be power of 2
+#define ACCEL_FFT_GAP_US      1500      // µs of padding between samples (I2C adds ~1 ms more)
+#define ACCEL_NBANDS          6         // 1/3-oct bands: 4, 8, 16, 31.5, 63, 125 Hz
 
 // --- Binary FIFO ring buffer on flash (LittleFS) ---
 // Fixed-size packed records (see record.h, RECORD_SIZE=71). Drop-oldest when

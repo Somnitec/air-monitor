@@ -15,17 +15,25 @@ static RecordFields sample() {
     f.co2 = 812; f.voc = 101; f.nox = 3; f.temp = 21.37f; f.rh = 48.5f;
     f.has_bh1750 = true; f.lux = 333;
     f.has_bme = true; f.pressure = 1013.2f; f.bme_temp = 21.5f; f.bme_rh = 49.0f;
-    f.has_adxl = true; f.rumble_rms = 0.123f; f.rumble_peak = 0.987f; f.accel_mag = 9.81f;
+    f.has_adxl = true;
+    f.rumble_rms = 0.123f; f.rumble_peak = 0.987f; f.accel_mag = 9.81f;
+    // v2 accel
+    f.ppv_m_s     = 0.0012f;    // 0.0012 m/s = 1.2 mm/s
+    f.accel_dom_hz = 16;
+    for (int b = 0; b < REC_ACCEL_BANDS; ++b) f.accel_band_db[b] = -60.0f + b * 5;
     f.has_co = true; f.co_mv = 410;
     f.has_hcho = true; f.hcho_mv = 222;
     f.has_soil = true; f.soil_mv = 1800;
     f.has_battery = true; f.bat_raw_mv = 2750;
     f.has_mic = true; f.noise_dba = 41.2f; f.noise_spl = 55.5f; f.noise_dbfs = -38.4f;
+    // v2 mic
+    f.noise_lamax = 46.8f;
+    f.noise_lceq  = 48.3f;
     for (int b = 0; b < REC_NBANDS; ++b) f.bands[b] = 20.0f + b;
     return f;
 }
 
-void test_size_is_71() { TEST_ASSERT_EQUAL_UINT(71, sizeof(Record)); }
+void test_size_is_84() { TEST_ASSERT_EQUAL_UINT(84, sizeof(Record)); }
 
 void test_roundtrip_preserves_within_quantization() {
     RecordFields in = sample();
@@ -62,6 +70,34 @@ void test_quantization_clamps_high_values() {
     TEST_ASSERT_EQUAL_UINT16(65535, r.pm25);                // clamped, no wrap
 }
 
+void test_v2_mic_roundtrip() {
+    RecordFields in = sample();
+    Record r = record_pack(in);
+    RecordFields out; record_unpack(r, out);
+
+    // LAmax: int16 × 10 → 0.1 dB resolution
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, in.noise_lamax, out.noise_lamax);
+    // LCeq: same
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, in.noise_lceq, out.noise_lceq);
+}
+
+void test_v2_accel_roundtrip() {
+    RecordFields in = sample();
+    Record r = record_pack(in);
+    RecordFields out; record_unpack(r, out);
+
+    // PPV: stored as 0.1 mm/s (ppv_mm10 = ppv_m_s × 10000)
+    // in.ppv_m_s=0.0012 → 12 units → 0.0012 m/s out (exact)
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, in.ppv_m_s, out.ppv_m_s);
+
+    // dom_freq stored as uint8
+    TEST_ASSERT_EQUAL_UINT8(in.accel_dom_hz, out.accel_dom_hz);
+
+    // Band levels: stored as int8 (1 dB resolution) → within 0.5 dB
+    for (int b = 0; b < REC_ACCEL_BANDS; ++b)
+        TEST_ASSERT_FLOAT_WITHIN(0.5f, in.accel_band_db[b], out.accel_band_db[b]);
+}
+
 #include <ArduinoJson.h>
 
 void test_to_json_has_expected_keys_and_derived() {
@@ -81,6 +117,22 @@ void test_to_json_has_expected_keys_and_derived() {
     // co_rs must equal RL*(Vcc-v)/v with v=410mV, RL=GAS_CO_RL_OHMS
     float expect = GAS_CO_RL_OHMS * (GAS_VCC_MV - 410.0f) / 410.0f;
     TEST_ASSERT_FLOAT_WITHIN(1.0f, expect, doc["co_rs"].as<float>());
+
+    // v2 keys must be present
+    TEST_ASSERT_TRUE(doc["lamax"].is<float>());
+    TEST_ASSERT_TRUE(doc["lceq"].is<float>());
+    TEST_ASSERT_TRUE(doc["lc_minus_la"].is<float>());
+    TEST_ASSERT_TRUE(doc["ppv_mm_s"].is<float>());
+    TEST_ASSERT_TRUE(doc["vib_4hz"].is<float>());
+    TEST_ASSERT_TRUE(doc["vib_125hz"].is<float>());
+}
+
+void test_to_json_lc_minus_la_value() {
+    RecordFields in = sample();  // lamax=46.8, lceq=48.3, laeq=41.2
+    Record r = record_pack(in);
+    JsonDocument doc; record_to_json(r, doc);
+    // lc_minus_la = lceq - laeq = 48.3 - 41.2 = 7.1 dB (±quantization error)
+    TEST_ASSERT_FLOAT_WITHIN(0.2f, 7.1f, doc["lc_minus_la"].as<float>());
 }
 
 void test_to_json_omits_absent_sensor_keys() {
@@ -93,11 +145,14 @@ void test_to_json_omits_absent_sensor_keys() {
 
 int main(int, char**) {
     UNITY_BEGIN();
-    RUN_TEST(test_size_is_71);
+    RUN_TEST(test_size_is_84);
     RUN_TEST(test_roundtrip_preserves_within_quantization);
     RUN_TEST(test_absent_sensors_clear_present_bits);
     RUN_TEST(test_quantization_clamps_high_values);
+    RUN_TEST(test_v2_mic_roundtrip);
+    RUN_TEST(test_v2_accel_roundtrip);
     RUN_TEST(test_to_json_has_expected_keys_and_derived);
+    RUN_TEST(test_to_json_lc_minus_la_value);
     RUN_TEST(test_to_json_omits_absent_sensor_keys);
     return UNITY_END();
 }

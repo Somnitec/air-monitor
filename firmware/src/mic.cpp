@@ -1,11 +1,14 @@
 // INMP441 I2S microphone analysis — see mic.h and docs/SENSORS.md.
 //
-// Pipeline per window:
-//   1. read MIC_FFT_SAMPLES 32-bit I2S slots (INMP441 packs a 24-bit sample in
-//      the upper bits; we shift to a signed sample and treat FULL_SCALE = 2^23).
-//   2. remove DC, compute RMS -> dBFS -> uncalibrated SPL (dBFS + 120).
-//   3. Hann-window + FFT, bin magnitude^2 into octave bands, and apply the
-//      IEC 61672 A-weighting per bin for the dB(A) / LAeq estimate.
+// Each call to mic_capture() runs MIC_WINDOWS consecutive FFT windows (~1.3 s
+// total at 48 kHz / 2048 samples per window).  Per window:
+//   1. Read MIC_FFT_SAMPLES 32-bit I2S slots (24-bit sample in upper bits).
+//   2. Remove DC, compute RMS → dBFS and A-weighted + C-weighted levels.
+//   3. Hann-window + FFT, accumulate octave-band power (unweighted + A-weighted).
+// Across all windows:
+//   - LAeq  = energy-average of per-window A-weighted levels.
+//   - LAmax = maximum per-window level (Dutch/EU aircraft noise metric).
+//   - LCeq  = energy-average of per-window C-weighted levels.
 
 #include <Arduino.h>
 #include <math.h>
@@ -14,13 +17,17 @@
 #include "config.h"
 #include "mic.h"
 
+// Number of consecutive FFT windows per mic_capture() call.
+// 30 × (2048/48000 s) ≈ 1.28 s total — enough to resolve LAmax for slow events.
+static constexpr int MIC_WINDOWS = 30;
+
 const float MIC_BAND_CENTERS[MIC_NBANDS] =
     {31.5f, 63.0f, 125.0f, 250.0f, 500.0f, 1000.0f, 2000.0f, 4000.0f, 8000.0f};
 
 static const i2s_port_t I2S_PORT = I2S_NUM_0;
 static const float FULL_SCALE = 8388608.0f;   // 2^23, magnitude of full-scale 24-bit
 
-// Working buffers (static so they live off the stack).
+// Working buffers (static: live off the stack, reused across windows).
 static int32_t  s_raw[MIC_FFT_SAMPLES];
 static float    s_vReal[MIC_FFT_SAMPLES];
 static float    s_vImag[MIC_FFT_SAMPLES];
@@ -28,7 +35,7 @@ static float    s_vImag[MIC_FFT_SAMPLES];
 static ArduinoFFT<float> s_fft =
     ArduinoFFT<float>(s_vReal, s_vImag, MIC_FFT_SAMPLES, (float)I2S_SAMPLE_RATE_HZ);
 
-// IEC 61672 A-weighting, returned as a linear magnitude gain (1.0 at 1 kHz).
+// IEC 61672 A-weighting — linear gain (1.0 at 1 kHz).
 static float aWeightGain(float f) {
     const float f2 = f * f;
     const float num = 12194.0f * 12194.0f * f2 * f2;
@@ -36,9 +43,18 @@ static float aWeightGain(float f) {
                     * sqrtf((f2 + 107.7f * 107.7f) * (f2 + 737.9f * 737.9f))
                     * (f2 + 12194.0f * 12194.0f);
     const float ra = num / den;
-    // +2.00 dB normalisation so A(1kHz)=0 dB; convert dB offset to linear gain.
-    const float dB = 20.0f * log10f(ra) + 2.0f;
-    return powf(10.0f, dB / 20.0f);
+    // +2.00 dB normalisation so A(1kHz) = 0 dB
+    return powf(10.0f, (20.0f * log10f(ra) + 2.0f) / 20.0f);
+}
+
+// IEC 61672 C-weighting — linear gain (1.0 at 1 kHz).
+// C(f) = 12194² × f² / ((f²+20.6²)(f²+12194²)) ; +0.06 dB normalisation.
+static float cWeightGain(float f) {
+    const float f2 = f * f;
+    const float num = 12194.0f * 12194.0f * f2;
+    const float den = (f2 + 20.6f * 20.6f) * (f2 + 12194.0f * 12194.0f);
+    const float rc  = num / den;
+    return powf(10.0f, (20.0f * log10f(rc) + 0.06f) / 20.0f);
 }
 
 bool mic_begin() {
@@ -69,81 +85,109 @@ bool mic_begin() {
 // Read one full window of samples into s_raw. Returns false on short/failed read.
 static bool readWindow() {
     size_t bytesRead = 0;
-    const size_t want = sizeof(s_raw);
-    const esp_err_t r = i2s_read(I2S_PORT, (void*)s_raw, want, &bytesRead,
+    const esp_err_t r = i2s_read(I2S_PORT, (void*)s_raw, sizeof(s_raw), &bytesRead,
                                  pdMS_TO_TICKS(1000));
-    return (r == ESP_OK && bytesRead == want);
+    return (r == ESP_OK && bytesRead == sizeof(s_raw));
 }
 
-bool mic_capture(MicResult& out) {
-    if (!readWindow()) return false;
-
-    // --- Convert to signed samples, remove DC, accumulate RMS ---
+// Process the current s_raw window; accumulate into caller-provided totals.
+// Returns per-window A-weighted level in dB(A) (for LAmax tracking).
+static float processWindow(double& totPowerA, double& totPowerC, double& totPowerRaw,
+                           double bandPA[MIC_NBANDS], double bandPRaw[MIC_NBANDS],
+                           bool& clipping) {
+    // Convert raw I2S → float, remove DC
     double mean = 0.0;
     for (int i = 0; i < MIC_FFT_SAMPLES; ++i) {
-        // INMP441 sample sits in the top 24 bits of the 32-bit slot.
-        const float s = (float)(s_raw[i] >> 8);
-        s_vReal[i] = s;
-        s_vImag[i] = 0.0f;
-        mean += s;
+        s_vReal[i] = (float)(s_raw[i] >> 8);   // 24-bit sample in upper bits
+        mean += s_vReal[i];
     }
     mean /= MIC_FFT_SAMPLES;
 
-    double sumsq = 0.0;
-    bool clipping = false;
-    const float clip = FULL_SCALE * 0.999f;   // ~AOP, full-scale 24-bit
+    double sumsqA = 0.0, sumsqC = 0.0, sumsqRaw = 0.0;
+    const float clip = FULL_SCALE * 0.999f;
     for (int i = 0; i < MIC_FFT_SAMPLES; ++i) {
         s_vReal[i] -= (float)mean;
-        sumsq += (double)s_vReal[i] * s_vReal[i];
+        s_vImag[i]  = 0.0f;
         if (fabsf(s_vReal[i]) >= clip) clipping = true;
+        sumsqRaw += (double)s_vReal[i] * s_vReal[i];
     }
-    const float rms = sqrtf((float)(sumsq / MIC_FFT_SAMPLES));
-    out.clipping = clipping;
-    out.rms_dbfs = (rms > 0.0f) ? 20.0f * log10f(rms / FULL_SCALE) : -120.0f;
-    out.spl_est  = out.rms_dbfs + MIC_DBFS_TO_SPL_DB;
 
-    // --- FFT for band analysis (DC already removed; Hann reduces leakage) ---
+    // FFT for band analysis
     s_fft.windowing(FFTWindow::Hann, FFTDirection::Forward);
     s_fft.compute(FFTDirection::Forward);
-    s_fft.complexToMagnitude();   // magnitudes now in s_vReal[0..N/2]
+    s_fft.complexToMagnitude();
 
-    // Accumulate band power (unweighted) and A-weighted band power.
-    double bandP[MIC_NBANDS]  = {0};
-    double bandPA[MIC_NBANDS] = {0};
-    double totalPA = 0.0;
     const float binHz = (float)I2S_SAMPLE_RATE_HZ / (float)MIC_FFT_SAMPLES;
-
     for (int i = 1; i < MIC_FFT_SAMPLES / 2; ++i) {
         const float f = i * binHz;
-        if (f < 22.0f || f > I2S_SAMPLE_RATE_HZ / 2.0f) continue;
+        if (f < 22.0f) continue;
         const float mag = s_vReal[i];
-        const float p = mag * mag;                       // bin power
-        const float aGain = aWeightGain(f);
-        const float pa = p * aGain * aGain;              // A-weighted power
-        totalPA += pa;
+        const float p   = mag * mag;
+        const float aG  = aWeightGain(f);
+        const float cG  = cWeightGain(f);
+        const float pa  = p * aG * aG;
+        const float pc  = p * cG * cG;
+        sumsqA  += pa;
+        sumsqC  += pc;
+        totPowerA   += pa;
+        totPowerC   += pc;
+        totPowerRaw += p;
 
-        // octave band = log2(f / 31.5) rounded; bands centred 31.5..8000
         const int b = (int)lroundf(log2f(f / 31.5f));
         if (b >= 0 && b < MIC_NBANDS) {
-            bandP[b]  += p;
-            bandPA[b] += pa;
+            bandPA[b]   += pa;
+            bandPRaw[b] += p;
         }
     }
+    totPowerRaw += sumsqRaw;  // also accumulate time-domain RMS for dBFS
 
-    // Convert powers to dB. Reference = FULL_SCALE^2 so 0 dBFS-power maps near the
-    // SPL anchor; add the same dBFS->SPL offset to keep bands on the SPL scale.
+    // Per-window A-weighted level (for LAmax)
     const double ref = (double)FULL_SCALE * FULL_SCALE * (MIC_FFT_SAMPLES / 2.0);
-    for (int b = 0; b < MIC_NBANDS; ++b) {
-        out.band_db[b]  = (bandP[b]  > 0) ? 10.0f * log10f(bandP[b]  / ref) + MIC_DBFS_TO_SPL_DB : -120.0f;
-        out.band_dba[b] = (bandPA[b] > 0) ? 10.0f * log10f(bandPA[b] / ref) + MIC_DBFS_TO_SPL_DB : -120.0f;
+    return (sumsqA > 0) ? 10.0f * log10f((float)(sumsqA / ref)) + MIC_DBFS_TO_SPL_DB : -120.0f;
+}
+
+bool mic_capture(MicResult& out) {
+    double totalPowerA   = 0.0;
+    double totalPowerC   = 0.0;
+    double totalPowerRaw = 0.0;
+    double bandPA[MIC_NBANDS]   = {0};
+    double bandPRaw[MIC_NBANDS] = {0};
+    float  maxWindowLA = -120.0f;
+    bool   anyClip     = false;
+    int    valid       = 0;
+
+    for (int w = 0; w < MIC_WINDOWS; ++w) {
+        if (!readWindow()) continue;
+        float windowLA = processWindow(totalPowerA, totalPowerC, totalPowerRaw,
+                                       bandPA, bandPRaw, anyClip);
+        if (windowLA > maxWindowLA) maxWindowLA = windowLA;
+        ++valid;
     }
-    out.laeq_est = (totalPA > 0) ? 10.0f * log10f((float)(totalPA / ref)) + MIC_DBFS_TO_SPL_DB : -120.0f;
+    if (valid == 0) return false;
+
+    const double ref = (double)FULL_SCALE * FULL_SCALE * (MIC_FFT_SAMPLES / 2.0);
+
+    // Broadband RMS (time-domain) across all windows
+    double rmsRaw = sqrtf((float)(totalPowerRaw / ((double)valid * MIC_FFT_SAMPLES)));
+    out.rms_dbfs = (rmsRaw > 0) ? 20.0f * log10f((float)(rmsRaw / FULL_SCALE)) : -120.0f;
+    out.spl_est  = out.rms_dbfs + MIC_DBFS_TO_SPL_DB;
+
+    // Energy-averaged A-weighted and C-weighted levels
+    const double refW = ref * valid;
+    out.laeq_est  = (totalPowerA > 0) ? 10.0f * log10f((float)(totalPowerA / refW)) + MIC_DBFS_TO_SPL_DB : -120.0f;
+    out.lceq      = (totalPowerC > 0) ? 10.0f * log10f((float)(totalPowerC / refW)) + MIC_DBFS_TO_SPL_DB : -120.0f;
+    out.lamax_dba = maxWindowLA;
+    out.clipping  = anyClip;
+
+    for (int b = 0; b < MIC_NBANDS; ++b) {
+        out.band_db[b]  = (bandPRaw[b] > 0) ? 10.0f * log10f((float)(bandPRaw[b] / refW)) + MIC_DBFS_TO_SPL_DB : -120.0f;
+        out.band_dba[b] = (bandPA[b]   > 0) ? 10.0f * log10f((float)(bandPA[b]   / refW)) + MIC_DBFS_TO_SPL_DB : -120.0f;
+    }
     return true;
 }
 
 bool mic_selftest(float& out_dbfs) {
     if (!readWindow()) return false;
-    // A present mic gives varying, non-zero data; a missing one is stuck/zero.
     int32_t first = s_raw[0] >> 8;
     bool varied = false;
     double sumsq = 0.0;
