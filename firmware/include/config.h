@@ -19,7 +19,10 @@
 // ANALOG Fermion MEMS boards (SEN0564 / SEN0563), not the I2C gas boards.
 #define PIN_I2C_SDA          16
 #define PIN_I2C_SCL          17
-#define I2C_FREQ_HZ          400000
+// 100 kHz standard mode: the Sensirion SEN66 uses clock-stretching and is unreliable
+// in 400 kHz fast mode (corrupted frames → impossible values like RH 404 %, non-
+// monotonic PM). 100 kHz is rock-solid for every sensor on this bus.
+#define I2C_FREQ_HZ          100000
 
 // Expected I2C addresses (used by the boot self-test).
 #define ADDR_SEN66           0x6B

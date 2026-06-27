@@ -235,12 +235,23 @@
         <label>From</label><input type="datetime-local" id="from" />
         <label>To</label><input type="datetime-local" id="to" />
       </div>
-      <select id="liveintvl" title="Dashboard refresh interval" style="margin-top:8px">
-        <option value="0">Live (WS)</option>
+      <label>Dashboard refresh <span id="liveHint" style="color:var(--mut)">— how often this screen redraws</span></label>
+      <select id="liveintvl" title="How often the dashboard redraws. 'Live' = update instantly as each reading arrives over the WebSocket.">
+        <option value="0">Live (instant, as data arrives)</option>
         <option value="60">Every 1 min</option>
         <option value="300">Every 5 min</option>
         <option value="900">Every 15 min</option>
         <option value="3600">Every 1 hr</option>
+      </select>
+
+      <label>Sensor report interval <span style="color:var(--mut)">— how often the board sends a reading</span></label>
+      <select id="sensorIntvl" title="Pushed to the ESP32: how often it samples & reports. Applied on its next sync.">
+        <option value="">— (leave as configured)</option>
+        <option value="5">Every 5 s</option>
+        <option value="15">Every 15 s</option>
+        <option value="30">Every 30 s</option>
+        <option value="60">Every 1 min</option>
+        <option value="300">Every 5 min</option>
       </select>
     </section>
 
@@ -250,7 +261,7 @@
     </section>
 
     <section id="serialSection">
-      <h2>Sensor readings</h2>
+      <h2>Sensor readings <span style="font-weight:400;text-transform:none;letter-spacing:0">· newest at bottom ↓ · ~ = estimated time</span></h2>
       <div id="serialMon"><span style="color:var(--mut)">waiting for data…</span></div>
     </section>
 
@@ -367,6 +378,8 @@ function fmtRange() {
   return { since: Math.floor(Date.now()/1000) - parseInt(sel), until: null };
 }
 
+let _seenMetrics = new Set();   // metrics auto-selected at least once (so we never re-add an unchecked one)
+
 async function loadMetrics() {
   const [sensorMs, weatherMs] = await Promise.all([
     (await fetch('/api/metrics')).json(),
@@ -374,10 +387,11 @@ async function loadMetrics() {
   ]);
   allMetrics = sensorMs;
   _allWeatherMetrics = weatherMs.map(m => m.name).filter(m => WEATHER_META[m]);
-  if (selected.size === 0) {
-    allMetrics.forEach(m => selected.add(m));
-    _allWeatherMetrics.forEach(m => _selectedWeather.add(m));
-  }
+  // Auto-check only metrics we've never seen before. First load → everything starts
+  // checked; new sensors that appear later auto-add; a metric you unchecked stays off
+  // (loadMetrics runs every 60s, so re-adding it here is exactly the old bug).
+  allMetrics.forEach(m => { if (!_seenMetrics.has(m)) { selected.add(m); _seenMetrics.add(m); } });
+  _allWeatherMetrics.forEach(m => { if (!_seenMetrics.has(m)) { _selectedWeather.add(m); _seenMetrics.add(m); } });
   renderMetricsList();
 }
 
@@ -663,30 +677,40 @@ async function loadWeather() {
 }
 
 // ---- serial monitor -------------------------------------------------------
-const _serialBuf = [];   // last 50 readings, newest last
-const SERIAL_MAX = 50;
-const SERIAL_SKIP = new Set(['ts','up_ms','boot','dev','device','ts_ok','ts_status']);
+// Mirrors the ESP32 serial log. The device buffers readings in a FIFO ring and
+// flushes a whole batch at once, so many rows can arrive together — we sort by
+// timestamp and render oldest→newest (newest at the bottom, like a real monitor).
+// A '~' before the time means the timestamp was reconstructed (device clock was
+// unsynced), so it's an estimate, not a GPS-grade stamp.
+const _serialBuf = [];   // last N readings
+const SERIAL_MAX = 60;
+const SERIAL_SKIP = new Set(['ts','device_ts','up_ms','boot','dev','device','ts_ok','ts_source','bat_cal','noise_clip']);
 
 function _serialPush(rec) {
-  const t = new Date((rec.ts || Date.now()/1000) * 1000);
-  const hms = [t.getHours(), t.getMinutes(), t.getSeconds()].map(n => String(n).padStart(2,'0')).join(':');
+  const ts = rec.ts || Date.now()/1000;
+  const t = new Date(ts * 1000);
+  const p2 = n => String(n).padStart(2, '0');
+  const stamp = `${p2(t.getMonth()+1)}-${p2(t.getDate())} ${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}`;
+  const est = (rec.ts_source && rec.ts_source !== 'device') ? '~' : ' ';
   const vals = Object.entries(rec)
     .filter(([k, v]) => !SERIAL_SKIP.has(k) && typeof v === 'number')
-    .map(([k, v]) => `${k}=${typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(2)) : v}`)
+    .map(([k, v]) => `${k}=${Number.isInteger(v) ? v : v.toFixed(2)}`)
     .join('  ');
   if (!vals) return;
-  _serialBuf.push({ hms, vals });
-  if (_serialBuf.length > SERIAL_MAX) _serialBuf.shift();
+  _serialBuf.push({ ts, stamp, est, vals });
+  _serialBuf.sort((a, b) => a.ts - b.ts);
+  if (_serialBuf.length > SERIAL_MAX) _serialBuf.splice(0, _serialBuf.length - SERIAL_MAX);
   _serialRender();
 }
 
 function _serialRender() {
   const el = document.getElementById('serialMon');
   if (!el) return;
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   el.innerHTML = _serialBuf.map(r =>
-    `<div class="srow"><span class="sts">${r.hms} </span>${r.vals}</div>`
+    `<div class="srow"><span class="sts">${r.est}${r.stamp} </span>${r.vals}</div>`
   ).join('');
-  el.scrollTop = el.scrollHeight;
+  if (atBottom) el.scrollTop = el.scrollHeight;   // keep pinned to newest unless user scrolled up
 }
 
 // ---- live updates over WebSocket ------------------------------------------
@@ -824,6 +848,22 @@ $('#liveintvl').onchange = function() {
     live = false;
     _liveTimer = setInterval(() => { query(); }, v * 1000);
   }
+};
+
+// Sensor report interval → pushed to every known device's config. The board picks
+// it up in its next /ingest reply (server.py adds resp["config"]).
+$('#sensorIntvl').onchange = async function() {
+  const v = this.value;
+  if (!v) return;
+  let devices = [];
+  try { devices = (await (await fetch('/api/devices')).json()).map(d => d.dev); } catch (_) {}
+  if (!devices.length) { alert('No device has reported in yet — try again once the board syncs.'); return; }
+  await Promise.all(devices.map(dev =>
+    fetch(`/api/config/${encodeURIComponent(dev)}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ poll_interval_ms: parseInt(v, 10) * 1000 }),
+    })));
+  $('#liveHint').textContent = `— sensor interval set to ${v}s (applies on next sync)`;
 };
 
 // Home / plane mode toggle
