@@ -14,7 +14,25 @@ from typing import Any
 
 from .base import WeatherObs
 
-_DDL = """
+# Weather variables unpacked from the JSON payload into real, queryable columns
+# (generated VIRTUAL columns — no value duplication, payload stays source of truth).
+# Covers what the project correlates against: temp, humidity, wind, precip + pollution.
+WEATHER_METRIC_COLS = [
+    "temperature_2m", "relative_humidity_2m", "dew_point_2m", "apparent_temperature",
+    "pressure_msl", "precipitation", "rain", "cloud_cover", "shortwave_radiation",
+    "wind_speed_10m", "wind_gusts_10m", "wind_direction_10m",
+    "pm10", "pm2_5", "european_aqi", "no2", "o3", "uv_index",
+]
+
+
+def _metric_col_ddl() -> str:
+    return ",\n    ".join(
+        f"{c} REAL GENERATED ALWAYS AS (json_extract(payload,'$.{c}')) VIRTUAL"
+        for c in WEATHER_METRIC_COLS
+    )
+
+
+_DDL = f"""
 CREATE TABLE IF NOT EXISTS weather (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     valid_ts    INTEGER NOT NULL,
@@ -26,6 +44,7 @@ CREATE TABLE IF NOT EXISTS weather (
     lon         REAL,
     distance_km REAL,
     payload     TEXT NOT NULL,
+    {_metric_col_ddl()},
     UNIQUE(source, station_id, valid_ts, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_weather_valid  ON weather(valid_ts);
@@ -35,6 +54,23 @@ CREATE INDEX IF NOT EXISTS idx_weather_source ON weather(source, valid_ts);
 
 def init_weather_table(conn: sqlite3.Connection) -> None:
     conn.executescript(_DDL)
+    # Migrate older DBs: add any missing generated columns (table_xinfo lists them).
+    cols = {r[1] for r in conn.execute("PRAGMA table_xinfo(weather)")}
+    for c in WEATHER_METRIC_COLS:
+        if c not in cols:
+            conn.execute(
+                f"ALTER TABLE weather ADD COLUMN {c} REAL "
+                f"GENERATED ALWAYS AS (json_extract(payload,'$.{c}')) VIRTUAL"
+            )
+    # Human-readable view: local-time + the unpacked variables + provenance.
+    conn.executescript(
+        "DROP VIEW IF EXISTS weather_h;"
+        "CREATE VIEW weather_h AS SELECT id,"
+        " datetime(valid_ts,'unixepoch','localtime') AS time,"
+        " source, round(distance_km,1) AS dist_km, "
+        + ", ".join(WEATHER_METRIC_COLS)
+        + " FROM weather ORDER BY valid_ts;"
+    )
     conn.commit()
 
 
