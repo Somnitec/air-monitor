@@ -27,3 +27,8 @@
 // Used later for weather + aircraft correlation. Decimal degrees.
 #define STATION_LAT    52.179722
 #define STATION_LON     5.284722
+
+// ---- Dashboard password ----
+// HTTP Basic Auth password for the web dashboard (any username is accepted).
+// Set AIRMON_PASSWORD env var to override without editing this file.
+#define DASHBOARD_PASSWORD  "change-me"

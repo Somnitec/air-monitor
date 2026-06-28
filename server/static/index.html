@@ -343,7 +343,8 @@ const META = {
   pm4:{g:'Particulates',n:'PM4'}, pm10:{g:'Particulates',n:'PM10'},
   // All gases on one chart: levels/indices/mV on the left, Rs (Ω) on the right.
   co2:{g:'Gases',n:'CO₂'}, voc:{g:'Gases',n:'VOC'}, nox:{g:'Gases',n:'NOx'},
-  co_mv:{g:'Gases',n:'CO'}, hcho_mv:{g:'Gases',n:'HCHO'},
+  co_ppm:{g:'Gases',n:'CO ppm'}, hcho_ppm:{g:'Gases',n:'HCHO ppm'},
+  co_mv:{g:'Gases',n:'CO mV',a:2}, hcho_mv:{g:'Gases',n:'HCHO mV',a:2},
   co_rs:{g:'Gases',n:'CO Rs',a:2}, hcho_rs:{g:'Gases',n:'HCHO Rs',a:2},
   temp:{g:'Temp / Humidity',n:'Temp'}, rh:{g:'Temp / Humidity',n:'RH',a:2},
   bme_temp:{g:'Temp / Humidity',n:'BME temp'}, bme_rh:{g:'Temp / Humidity',n:'BME RH',a:2},
@@ -355,7 +356,7 @@ const META = {
   lc_minus_la:{g:'Noise & Vibration',n:'LC−LA'}, noise_dbfs:{g:'Noise & Vibration',n:'Signal'},
   rumble:{g:'Noise & Vibration',n:'Rumble',a:2}, rumble_peak:{g:'Noise & Vibration',n:'Rumble peak',a:2},
   accel_mag:{g:'Noise & Vibration',n:'|a|',a:2},
-  soil_pct:{g:'Soil',n:'Soil'}, soil_mv:{g:'Soil',n:'Soil raw',a:2},
+  soil_pct:{g:'Soil',n:'Soil'},
   bat_v:{g:'Battery',n:'Voltage'}, bat_pct:{g:'Battery',n:'Charge',a:2},
   // (bat_raw_mv intentionally absent → kept in the DB, not plotted)
 };
@@ -413,11 +414,11 @@ const WEATHER_META = {
 // Units per metric — appended to the legend value, e.g. "CO₂ = 1020 ppm".
 const UNITS = {
   pm1:'µg/m³', pm25:'µg/m³', pm4:'µg/m³', pm10:'µg/m³', pm2_5:'µg/m³',
-  co2:'ppm', voc:'', nox:'', co_mv:'mV', hcho_mv:'mV', co_rs:'Ω', hcho_rs:'Ω',
+  co2:'ppm', voc:'', nox:'', co_ppm:'ppm', hcho_ppm:'ppm', co_mv:'mV', hcho_mv:'mV', co_rs:'Ω', hcho_rs:'Ω',
   temp:'°C', rh:'%', bme_temp:'°C', bme_rh:'%', pressure_hpa:'hPa', pressure_msl:'hPa',
   lux:'lux', noise_dba:'dB(A)', noise_spl:'dB', noise_dbfs:'dBFS', lamax:'dB(A)', lceq:'dB(C)',
   lc_minus_la:'dB', rumble:'m/s²', rumble_peak:'m/s²', accel_mag:'m/s²', ppv_mm_s:'mm/s', accel_dom_hz:'Hz',
-  soil_pct:'%', soil_mv:'mV', bat_raw_mv:'mV', bat_v:'V', bat_pct:'%',
+  soil_pct:'%', bat_raw_mv:'mV', bat_v:'V', bat_pct:'%',
   temperature_2m:'°C', apparent_temperature:'°C', dew_point_2m:'°C', relative_humidity_2m:'%',
   precipitation:'mm', rain:'mm', rain_live:'mm', cloud_cover:'%', shortwave_radiation:'W/m²',
   global_radiation:'W/m²', direct_radiation:'W/m²', wind_speed_10m:'m/s', wind_gusts_10m:'m/s',
@@ -430,8 +431,9 @@ const METRIC_SENSOR = {
   temp:'SEN66 (RH/T)', rh:'SEN66 (RH/T)', bme_temp:'BME280', bme_rh:'BME280', pressure_hpa:'BME280 (barometer)',
   lux:'BH1750 (ambient light)', noise_dba:'INMP441 MEMS mic', noise_spl:'INMP441 MEMS mic',
   noise_dbfs:'INMP441 MEMS mic', lamax:'INMP441 MEMS mic', lceq:'INMP441 MEMS mic',
+  co_ppm:'DFRobot MEMS CO (computed)', hcho_ppm:'DFRobot MEMS HCHO (computed)',
   co_mv:'DFRobot MEMS CO (analog)', hcho_mv:'DFRobot MEMS HCHO (analog)',
-  soil_mv:'capacitive soil probe', soil_pct:'capacitive soil probe',
+  soil_pct:'capacitive soil probe',
   rumble:'ADXL345 accelerometer', rumble_peak:'ADXL345 accelerometer', accel_mag:'ADXL345 accelerometer',
   bat_v:'battery ADC divider', bat_pct:'battery ADC divider',
   temperature_2m:'outdoor weather feed', relative_humidity_2m:'outdoor weather feed',
@@ -449,6 +451,7 @@ const METRIC_NORM = {
   lux:'dark <1 · dim room 50–200 · office 300–500 · daylight >1000',
   noise_dba:'WHO night <40 dB(A); >65 annoying; >85 hearing risk', lamax:'peak level; NL counts events >65/>70 dB(A)',
   lceq:'C-weighted; LC−LA >6 dB flags low-frequency (aircraft) noise',
+  co_ppm:'CO estimate (qualitative; ±order-of-magnitude); outdoor <10 ppm, smoky >50 ppm', hcho_ppm:'HCHO estimate (qualitative); WHO 30-min limit 0.08 ppm; off-gassing from furniture',
   co_mv:'higher mV = more CO; ventilate if rising fast', hcho_mv:'formaldehyde proxy; off-gassing from furniture/paint',
   soil_pct:'0% dry → 100% saturated', bat_v:'Li-ion 3.0 empty → 4.2 full', bat_pct:'charge remaining',
   european_aqi:'0–20 good · 40–60 moderate · >80 poor', no2:'traffic/combustion marker', o3:'ground-level ozone; higher on hot sunny days',
@@ -492,12 +495,13 @@ async function loadMetrics() {
 const METRIC_DESC = {
   pm1:'PM1 — particulates smaller than 1 µm (ultrafine dust, combustion)', pm25:'PM2.5 — fine particles <2.5 µm; penetrate lungs', pm4:'PM4 — particles <4 µm', pm10:'PM10 — coarse dust <10 µm; natural sources, road dust',
   co2:'CO₂ concentration — elevated when ventilation is poor (>1000 ppm stuffy, >2000 ppm poor)', voc:'VOC index — volatile organic compounds; 0–500, higher is worse', nox:'NOx index — nitrogen oxide equivalent; 0–500 scale',
+  co_ppm:'CO concentration estimate — derived from GM-702B log-log curve (R0=41.9 kΩ). Qualitative: ±order-of-magnitude; cross-sensitive to H₂, CH₄, alcohol.', hcho_ppm:'HCHO concentration estimate — derived from SMD1001 Vs/V0 curve (V0=216 mV). Qualitative; cross-sensitive to other VOCs.',
   co_mv:'CO sensor raw millivolts (electrochemical cell)', co_rs:'CO sensor resistance Ω (lower = more CO)', hcho_mv:'Formaldehyde sensor raw mV', hcho_rs:'Formaldehyde sensor resistance Ω',
   temp:'Indoor temperature °C', rh:'Indoor relative humidity % (40–60% ideal)', bme_temp:'BME680 temperature °C (on-board sensor)', bme_rh:'BME680 relative humidity %',
   pressure_hpa:'Barometric pressure hPa (sea-level ~1013 hPa)', lux:'Ambient light level in lux',
   noise_dba:'Sound level dB(A) — A-weighted, matches human hearing', noise_spl:'Sound pressure level (unweighted)', noise_dbfs:'Signal level dBFS (relative to full scale)',
   rumble:'Vibration RMS m/s² (low-frequency ground/structure rumble)', rumble_peak:'Peak rumble acceleration m/s²', accel_mag:'Total accelerometer magnitude m/s²',
-  soil_pct:'Soil moisture percentage (0% dry → 100% saturated)', soil_mv:'Soil moisture raw sensor voltage mV',
+  soil_pct:'Soil moisture percentage (0% dry → 100% saturated)',
   bat_raw_mv:'Battery ADC raw millivolts', bat_v:'Battery voltage (3.0–4.2 V for Li-ion)', bat_pct:'Battery charge percentage',
   // weather
   temperature_2m:'Outdoor temperature at 2 m height °C', apparent_temperature:'Feels-like temperature accounting for wind and humidity', dew_point_2m:'Dew point — temperature at which air becomes saturated',
@@ -1281,7 +1285,7 @@ function drawMapPaths() {
     const lls = pts.map(p => [p.lat, p.lon]);
     const col = _pathColor({ type: _pathMeta[hex]?.type, hex });
     _mapPathLines[hex] = _fadedPath(_mapPathLines[hex], lls, {color:col, weight:1.5, opacity:0.55});
-    if (_mapPathLines[hex]) _mapPathLines[hex].bindPopup(_pathPopupHtml(hex));   // click → identity
+    if (_mapPathLines[hex]) _mapPathLines[hex].bindPopup(() => _pathPopupHtml(hex));  // lazy: read _pathMeta at click time
     else { delete _mapPathLines[hex]; }
 
     // Drop a heading chevron at logged readings (decluttered by global stride + spacing).

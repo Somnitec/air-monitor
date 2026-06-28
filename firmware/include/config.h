@@ -103,7 +103,9 @@
 #define BAT_CALIBRATED          1     // verified against multimeter (two points, both ~1.50).
                                       // While 0: raw mV is logged; V/% are flagged uncalibrated.
 #define BAT_FULL_V            4.2f
-#define BAT_EMPTY_V           3.0f
+// Empirical: device (ESP32 + WiFi) brownouts at ~3.42-3.45 V under load.
+// Raised from 3.0 V (which showed 35% remaining at brownout — misleading).
+#define BAT_EMPTY_V           3.45f
 #define GAS_ADC_OVERSAMPLE   32   // average N samples per reading to fight ADC noise
 #define GAS_CO_RL_OHMS       4700.0f  // RL on SEN0564 CO board
 #define GAS_HCHO_RL_OHMS    10000.0f  // RL on SEN0563 HCHO board (different!)

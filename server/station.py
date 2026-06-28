@@ -72,6 +72,25 @@ def coords() -> tuple[float, float]:
     return _PLACEHOLDER
 
 
+def dashboard_password() -> str:
+    """Read DASHBOARD_PASSWORD from env or secrets.h. Returns '' if not configured."""
+    env = os.environ.get("AIRMON_PASSWORD")
+    if env is not None:
+        return env
+    for path in _CANDIDATE_PATHS:
+        if path.exists():
+            m = re.search(r'^\s*#define\s+DASHBOARD_PASSWORD\s+"([^"]+)"', path.read_text(), re.MULTILINE)
+            if m:
+                print(f"[station] dashboard password from {path}", file=sys.stderr)
+                return m.group(1)
+    print(
+        "[station] WARNING: no DASHBOARD_PASSWORD in secrets.h or AIRMON_PASSWORD env"
+        " — dashboard is unprotected",
+        file=sys.stderr,
+    )
+    return ""
+
+
 def _env_float(name: str, default):
     try:
         v = os.environ.get(name)
