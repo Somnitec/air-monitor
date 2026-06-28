@@ -22,7 +22,10 @@ Database location (default ./data/air-monitor.db) is overridable:
 from __future__ import annotations
 
 import asyncio
+import base64
+import hmac
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -34,6 +37,10 @@ from typing import Any
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+
+import station
 
 from weather import config as weather_config
 from weather import scheduler as weather_scheduler
@@ -43,6 +50,10 @@ from aircraft import config as aircraft_config
 from aircraft import scheduler as aircraft_scheduler
 from aircraft import store as aircraft_store
 from aircraft import usb as aircraft_usb
+
+# Load .env before reading any env vars so CLOUDFLARED_TUNNEL (and API keys) are
+# available at module level. A second load inside lifespan is harmless (setdefault).
+weather_config.load_dotenv(Path(__file__).parent / ".env")
 
 # --------------------------------------------------------------------------- #
 # Storage
@@ -560,7 +571,80 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Air Monitor", lifespan=lifespan)
 
+# --------------------------------------------------------------------------- #
+# Basic Auth — gates the dashboard and all API routes; /ingest is exempted so
+# the ESP32 can keep posting without credentials.
+# --------------------------------------------------------------------------- #
+_DASHBOARD_PASSWORD = station.dashboard_password()
+
+
+class _BasicAuth(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if not _DASHBOARD_PASSWORD or request.url.path == "/ingest":
+            return await call_next(request)
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth[6:]).decode("utf-8", errors="replace")
+                _, _, pw = decoded.partition(":")
+                if hmac.compare_digest(pw.encode(), _DASHBOARD_PASSWORD.encode()):
+                    return await call_next(request)
+            except Exception:
+                pass
+        return Response(
+            "Unauthorized",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Air Monitor"'},
+        )
+
+
+app.add_middleware(_BasicAuth)
+
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+# --------------------------------------------------------------------------- #
+# Gas-concentration helpers — approximate, qualitative (see docs/SENSORS.md).
+# --------------------------------------------------------------------------- #
+_CO_R0   = 41_900.0   # Ω clean-air baseline (measured: Vout=333 mV, RL=4.7 kΩ)
+_HCHO_V0 = 216.0      # mV clean-air baseline voltage (used for Vs/V0 curve)
+
+# (Vs/V0 ratio, ppm) pairs read from SMD1001 datasheet Fig 1 (log-log).
+_HCHO_CURVE: list[tuple[float, float]] = [
+    (1.22, 0.10), (1.45, 0.20), (1.78, 0.40), (1.87, 0.60),
+    (2.12, 0.80), (2.20, 1.00), (2.65, 1.20),
+]
+
+
+def _co_ppm(co_rs: float | None) -> float | None:
+    """CO estimate from sensor resistance — GM-702B log-log fit (SENSORS.md).
+    Returns None when Rs is missing or implausibly low (saturated / short)."""
+    if not co_rs or co_rs < 1000:
+        return None
+    ratio = co_rs / _CO_R0
+    if ratio <= 0:
+        return None
+    ppm = 10 ** ((math.log10(ratio) - 0.4) / -0.45)
+    return round(max(0.0, ppm), 1)
+
+
+def _hcho_ppm(hcho_mv: float | None) -> float | None:
+    """HCHO estimate from sensor voltage — SMD1001 log-log interpolation (SENSORS.md).
+    Returns None when voltage is missing or below baseline (implausible)."""
+    if not hcho_mv or hcho_mv <= 0:
+        return None
+    ratio = hcho_mv / _HCHO_V0   # Vs/V0
+    if ratio < _HCHO_CURVE[0][0]:
+        return 0.0                # below detection range
+    if ratio >= _HCHO_CURVE[-1][0]:
+        return _HCHO_CURVE[-1][1] # saturated at top of curve
+    # Log-log linear interpolation between the two bracketing curve points.
+    for (r1, p1), (r2, p2) in zip(_HCHO_CURVE, _HCHO_CURVE[1:]):
+        if r1 <= ratio <= r2:
+            t = (math.log10(ratio) - math.log10(r1)) / (math.log10(r2) - math.log10(r1))
+            ppm = 10 ** (math.log10(p1) + t * (math.log10(p2) - math.log10(p1)))
+            return round(ppm, 3)
+    return None
 
 
 def _flatten(row: sqlite3.Row) -> dict:
@@ -576,6 +660,16 @@ def _flatten(row: sqlite3.Row) -> dict:
         out["ts_source"] = row["ts_source"]
     if "device_ts" in keys:
         out["device_ts"] = row["device_ts"]
+    # Derived gas concentrations (approximate — see docs/SENSORS.md).
+    if (v := _co_ppm(out.get("co_rs"))) is not None:
+        out["co_ppm"] = v
+    if (v := _hcho_ppm(out.get("hcho_mv"))) is not None:
+        out["hcho_ppm"] = v
+    # Recalibrate battery %: firmware used BAT_EMPTY_V=3.0 V which showed 35% at brownout.
+    # Recompute from bat_v using empirical empty threshold (3.45 V under WiFi load).
+    bat_v = out.get("bat_v")
+    if bat_v is not None:
+        out["bat_pct"] = round(max(0.0, min(100.0, (bat_v - 3.45) / (4.2 - 3.45) * 100)), 1)
     return out
 
 
@@ -1083,7 +1177,15 @@ async def ws(ws: WebSocket):
 # ---- dashboard ------------------------------------------------------------- #
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(
+        (STATIC_DIR / "index.html").read_text(encoding="utf-8"),
+        headers={"X-Robots-Tag": "noindex, nofollow"},
+    )
+
+
+@app.get("/robots.txt")
+async def robots():
+    return Response("User-agent: *\nDisallow: /\n", media_type="text/plain")
 
 
 if STATIC_DIR.exists():

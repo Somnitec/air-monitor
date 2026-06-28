@@ -7,6 +7,7 @@ import importlib
 import os
 
 os.environ["AIRMON_DB"] = ":memory:"     # don't touch the real db
+os.environ["AIRMON_PASSWORD"] = ""      # disable auth in tests
 
 import pytest
 from fastapi.testclient import TestClient

@@ -13,6 +13,8 @@ pure Python so it runs the same on macOS / Fedora / Windows for development.
 - **Logs home-mode events** (door, ventilation, occupancy, devices, sleep) and
   overlays them on the graphs
 
+  - run tunnel with "cloudflared tunnel run air-monitor-tunnel"
+
 ## Setup
 
 ```bash
