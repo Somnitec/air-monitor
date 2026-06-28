@@ -237,8 +237,33 @@ The V4 has two well-known gotchas. Do these once on the box the dongle is plugge
    instead (`cmake ../ -DINSTALL_UDEV_RULES=ON && make && sudo make install && sudo ldconfig`).
    The udev rules also let you run it without `sudo`.
 
-Once `rtl_test` is happy, install and run **readsb** pointed at the V4; it writes the
-`aircraft.json` this server polls. Verify the feed with `curl http://localhost:8000/api/aircraft`.
+### Running readsb (so aircraft come from *your* SDR, not the internet)
+
+Until readsb runs, the dashboard still shows planes — but tagged **`source: public`**
+(the airplanes.live reference feed), *not* your dongle. The server detects the V4 on USB
+(the SDR badge goes green) but nothing decodes 1090 MHz until readsb is running. Once it
+is, locally-heard aircraft are tagged **`sdr`** (or **`both`** when also seen publicly),
+the side-view altitude panel fills in, and every sighting is logged for path reconstruction.
+
+Install readsb and run it as a service writing `/run/readsb/aircraft.json`:
+
+```bash
+# Wiedehopf's installer is the easy path on Debian/RPi OS/Ubuntu:
+sudo bash -c "$(wget -nv -O - https://github.com/wiedehopf/adsb-scripts/raw/master/readsb-install.sh)"
+
+# Point it at your station and emit aircraft.json. Edit /etc/default/readsb:
+#   DECODER_OPTIONS="--device-type rtlsdr --lat <STATION_LAT> --lon <STATION_LON>"
+#   JSON_OPTIONS="--write-json /run/readsb --write-json-every 1"
+sudo systemctl restart readsb
+sudo systemctl enable readsb            # start on boot
+
+# Verify readsb is decoding, then that the server sees local planes:
+cat /run/readsb/aircraft.json | head    # should list aircraft with "seen" fields
+curl -s localhost:8000/api/aircraft | grep -o '"source":"[a-z]*"' | sort | uniq -c
+```
+
+When that last command starts showing `"source":"sdr"` / `"both"`, your dongle is feeding
+the dashboard. If `aircraft.json` lives elsewhere, set `AIRCRAFT_JSON_PATH` in `.env`.
 
 ## Data model
 

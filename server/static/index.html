@@ -37,7 +37,16 @@
   /* layout */
   .wrap { display:flex; gap:14px; padding:14px; align-items:flex-start; }
   #charts { flex:1; min-width:0; }
-  .chart { background:var(--panel); border:1px solid var(--line); border-radius:12px; margin-bottom:12px; }
+  .chart { background:var(--panel); border:1px solid var(--line); border-radius:12px; margin-bottom:12px; padding-bottom:4px; }
+  .chart .plot { height:228px; }
+  /* per-chart custom legend (replaces the metrics checkbox list) */
+  .clegend { display:flex; flex-wrap:wrap; gap:6px 8px; padding:2px 12px 8px; }
+  .cchip { display:inline-flex; align-items:center; gap:5px; font-size:11px; color:var(--fg);
+    cursor:pointer; padding:2px 8px; border-radius:12px; background:#1b1f28; border:1px solid var(--line);
+    white-space:nowrap; user-select:none; }
+  .cchip i { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+  .cchip:hover { background:#222633; }
+  .cchip.off { opacity:.4; text-decoration:line-through; }
 
   /* controls become a slide-in drawer */
   .controls { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; width:300px; flex:0 0 auto; }
@@ -51,10 +60,6 @@
   button:active { filter:brightness(1.15); }
   .row { display:flex; gap:8px; }
   .row > * { flex:1; }
-  .metrics { max-height:42vh; overflow:auto; border:1px solid var(--line); border-radius:10px; padding:4px; -webkit-overflow-scrolling:touch; }
-  .metrics label { display:flex; align-items:center; gap:12px; margin:0; padding:11px 8px; color:var(--fg); cursor:pointer; border-radius:8px; font-size:15px; }
-  .metrics label:active { background:#222633; }
-  .metrics input { width:24px; height:24px; min-height:0; flex:0 0 auto; }
   .events-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
   .events-grid button { font-size:14px; min-height:var(--tap); padding:0 6px; }
   /* toggle buttons: dim when off, green when on */
@@ -96,16 +101,36 @@
 
   /* --- aircraft panel (live map + table) --- */
   .acpanel { background:var(--panel); border:1px solid var(--line); border-radius:12px; margin:14px 14px 0; overflow:hidden; }
-  .acpanel.collapsed .acbody { display:none; }
-  .achead { display:flex; align-items:center; gap:10px; padding:11px 14px; cursor:pointer; }
+  .achead { display:flex; align-items:center; gap:10px; padding:11px 14px; }
   .achead h2 { font-size:14px; margin:0; font-weight:600; }
   .achead .account { color:var(--accent); font-size:13px; font-weight:600; }
   .achead .acrange { color:var(--mut); font-size:12px; }
-  .achead .acchev { margin-left:auto; color:var(--mut); transition:transform .2s; }
-  .acpanel.collapsed .acchev { transform:rotate(-90deg); }
   .acbody { display:flex; flex-wrap:wrap; }
-  #pathSide { height:360px; flex:0 0 360px; width:360px; background:#0e1117; border-right:1px solid var(--line); cursor:default; }
+  #pathSideWrap { position:relative; flex:0 0 360px; width:360px; border-right:1px solid var(--line); }
+  #pathSide { display:block; height:360px; width:360px; background:#0e1117; cursor:pointer; }
+  /* side-view click info box */
+  #sideInfo { position:absolute; display:none; max-width:200px; z-index:5; pointer-events:none;
+    background:rgba(14,17,23,0.94); border:1px solid var(--line); border-radius:7px; padding:7px 9px;
+    font-size:11px; line-height:1.5; color:var(--fg); box-shadow:0 2px 10px rgba(0,0,0,.5); }
+  #sideInfo b { color:var(--accent); }
+  #sideInfo .si-close { float:right; color:var(--mut); cursor:pointer; pointer-events:auto; margin-left:8px; }
   #acmap { height:360px; flex:2 1 360px; min-width:260px; background:#0e1117; }
+  /* research panel */
+  #researchHead { cursor:pointer; }
+  #researchChev { margin-left:auto; color:var(--mut); transition:transform .2s; }
+  #researchPanel.rcollapsed #researchChev { transform:rotate(-90deg); }
+  #researchPanel.rcollapsed .rbody { display:none; }
+  .rbody { display:flex; flex-wrap:wrap; gap:18px; padding:14px; }
+  .research-block { flex:1 1 300px; min-width:280px; }
+  .research-block h3 { font-size:13px; margin:0 0 8px; font-weight:600; }
+  .research-block h3 small { color:var(--mut); font-weight:400; font-size:11px; }
+  .rtable-wrap { max-height:300px; overflow:auto; border:1px solid var(--line); border-radius:8px; }
+  .rtable { width:100%; border-collapse:collapse; font-size:12px; }
+  .rtable th, .rtable td { padding:5px 8px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--line); }
+  .rtable th:first-child, .rtable td:first-child { text-align:left; }
+  .rtable th { position:sticky; top:0; background:#1b1f28; color:var(--mut); font-weight:600; font-size:10px; text-transform:uppercase; letter-spacing:.04em; }
+  .rtable td { -webkit-user-select:text; user-select:text; }
+  .rbar { display:inline-block; height:8px; background:#4ea1ff; border-radius:2px; vertical-align:middle; margin-left:6px; }
   .actablewrap { flex:1 1 300px; max-height:360px; overflow:auto; border-left:1px solid var(--line); -webkit-overflow-scrolling:touch; }
   .actable { width:100%; border-collapse:collapse; font-size:13px; }
   .actable th, .actable td { padding:7px 9px; text-align:left; white-space:nowrap; border-bottom:1px solid var(--line); }
@@ -160,6 +185,11 @@
   #weatherStrip .witem strong { color:#cfd5e3; }
   #weatherStrip .wsrc { margin-left:auto; color:#556; font-size:10px; }
   .windArrow { display:inline-block; font-size:14px; line-height:1; }
+  /* CO2 health badge in the header — colour ramps green→red with concentration */
+  #co2Badge { font-size:14px; font-weight:800; padding:4px 12px; border-radius:9px; white-space:nowrap;
+    color:#06130a; background:#3a3f4b; letter-spacing:.01em; transition:background .4s; min-width:74px; text-align:center; }
+  #co2Badge.warn { animation:co2pulse 1.6s ease-in-out infinite; }
+  @keyframes co2pulse { 0%,100%{ filter:brightness(1); } 50%{ filter:brightness(1.25); } }
   /* Leaflet weather control */
   .leaflet-weather-ctrl { background:rgba(14,17,23,0.82); color:#cfd5e3; padding:6px 8px;
     border-radius:6px; font-size:11px; line-height:1.6; pointer-events:none; }
@@ -173,7 +203,8 @@
   #serialMon .srow .sts { color:var(--mut); user-select:none; }
 
   @media (max-width: 820px) { .acpanel { margin:10px 10px 0; } #acmap { flex-basis:100%; height:300px; }
-    #pathSide { flex-basis:100%; height:240px; width:100%; border-right:none; border-bottom:1px solid var(--line); }
+    #pathSideWrap { flex-basis:100%; width:100%; border-right:none; border-bottom:1px solid var(--line); }
+    #pathSide { height:240px; width:100%; }
     .actablewrap { border-left:none; border-top:1px solid var(--line); } }
 </style>
 </head>
@@ -183,6 +214,7 @@
   <h1>🌫️ Air Monitor</h1>
   <button type="button" id="modeBtn" class="modebtn" title="Toggle home/plane mode">🏠 Home</button>
   <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt" class="hide-sm">connecting…</span></span>
+  <span id="co2Badge" title="Indoor CO₂ — green is fresh, red means open a window">—</span>
   <span class="grow"></span>
   <span class="pill hide-sm" id="stats"></span>
   <button id="fs" class="iconbtn" aria-label="Fullscreen">⛶</button>
@@ -200,10 +232,12 @@
     <span class="sdrbadge" id="sdrBadge" title="RTL-SDR dongle">SDR —</span>
     <button type="button" class="howlbtn" id="howlBtn" title="Mark: I heard the howl">🔊 Heard it howl</button>
     <span class="howllast" id="howlLast"></span>
-    <span class="acchev">▾</span>
   </div>
   <div class="acbody">
-    <canvas id="pathSide" width="360" height="360" title="Side view — altitude cross-section (W←→E)"></canvas>
+    <div id="pathSideWrap">
+      <canvas id="pathSide" width="360" height="360" title="Side view — altitude cross-section (W←→E). Click a track for details."></canvas>
+      <div id="sideInfo"></div>
+    </div>
     <div id="acmap"></div>
     <div class="actablewrap">
       <table class="actable">
@@ -215,6 +249,29 @@
 </div>
 
 <div id="weatherStrip" style="display:none"></div>
+
+<div id="researchPanel" class="acpanel rcollapsed">
+  <div class="achead" id="researchHead">
+    <h2>📊 Research</h2>
+    <span class="account">noise · flights · air quality</span>
+    <button type="button" class="howlbtn" id="researchRefresh" title="Refresh">↻</button>
+    <span class="acchev" id="researchChev">▾</span>
+  </div>
+  <div class="rbody">
+    <div class="research-block">
+      <h3>Per day <small>flights overhead, loud events, air quality</small></h3>
+      <div class="rtable-wrap"><table class="rtable" id="resDaily"></table></div>
+    </div>
+    <div class="research-block">
+      <h3>Loudest aircraft types <small>avg / peak dB(A) when overhead</small></h3>
+      <div class="rtable-wrap"><table class="rtable" id="resLoud"></table></div>
+    </div>
+    <div class="research-block">
+      <h3>Recent noise events <small>loud reading → closest plane</small></h3>
+      <div class="rtable-wrap"><table class="rtable" id="resEvents"></table></div>
+    </div>
+  </div>
+</div>
 
 <div class="wrap">
   <div class="controls" id="drawer">
@@ -235,34 +292,22 @@
         <label>From</label><input type="datetime-local" id="from" />
         <label>To</label><input type="datetime-local" id="to" />
       </div>
-      <label>Dashboard refresh <span id="liveHint" style="color:var(--mut)">— how often this screen redraws</span></label>
-      <select id="liveintvl" title="How often the dashboard redraws. 'Live' = update instantly as each reading arrives over the WebSocket.">
-        <option value="0">Live (instant, as data arrives)</option>
-        <option value="60">Every 1 min</option>
-        <option value="300">Every 5 min</option>
-        <option value="900">Every 15 min</option>
-        <option value="3600">Every 1 hr</option>
-      </select>
-
-      <label>Sensor report interval <span style="color:var(--mut)">— how often the board sends a reading</span></label>
-      <select id="sensorIntvl" title="Pushed to the ESP32: how often it samples & reports. Applied on its next sync.">
+      <label>Sensor interval <span id="liveHint" style="color:var(--mut)">— how often the board samples &amp; sends</span></label>
+      <select id="sensorIntvl" title="Pushed to the ESP32. Picking an interval also switches it to live streaming so readings arrive in real time. Applied within ~1 min (or instantly if the board just booted).">
         <option value="">— (leave as configured)</option>
-        <option value="5">Every 5 s</option>
-        <option value="15">Every 15 s</option>
-        <option value="30">Every 30 s</option>
+        <option value="5">Live · every 5 s</option>
+        <option value="10" selected>Live · every 10 s</option>
+        <option value="15">Live · every 15 s</option>
+        <option value="30">Live · every 30 s</option>
         <option value="60">Every 1 min</option>
         <option value="300">Every 5 min</option>
       </select>
-    </section>
-
-    <section>
-      <h2>Metrics</h2>
-      <div class="metrics" id="metrics"></div>
     </section>
 
     <section id="serialSection">
-      <h2>Sensor readings <span style="font-weight:400;text-transform:none;letter-spacing:0">· newest at bottom ↓ · ~ = estimated time</span></h2>
+      <h2>Last reading</h2>
       <div id="serialMon"><span style="color:var(--mut)">waiting for data…</span></div>
+      <div id="batStat" style="margin-top:8px;font-size:12px;color:var(--mut)"></div>
     </section>
 
     <section id="homeSection">
@@ -290,34 +335,39 @@
 // ---- friendly labels + grouping so related metrics share a chart ----------
 // a:2 puts the metric on the chart's right-hand (secondary) y-axis — used when
 // two related series share a chart but have very different units/scales.
+// Labels carry NO units (the unit is shown once, after the live value). a:2 puts the
+// metric on the chart's right-hand y-axis (for series sharing a chart but on a very
+// different scale). Group names match between sensor + public so they share a chart.
 const META = {
-  pm1:{g:'Particulates (µg/m³)',n:'PM1'}, pm25:{g:'Particulates (µg/m³)',n:'PM2.5'},
-  pm4:{g:'Particulates (µg/m³)',n:'PM4'}, pm10:{g:'Particulates (µg/m³)',n:'PM10'},
+  pm1:{g:'Particulates',n:'PM1'}, pm25:{g:'Particulates',n:'PM2.5'},
+  pm4:{g:'Particulates',n:'PM4'}, pm10:{g:'Particulates',n:'PM10'},
   // All gases on one chart: levels/indices/mV on the left, Rs (Ω) on the right.
-  co2:{g:'Gases',n:'CO₂ ppm'},
-  voc:{g:'Gases',n:'VOC index'}, nox:{g:'Gases',n:'NOx index'},
-  co_mv:{g:'Gases',n:'CO mV'}, hcho_mv:{g:'Gases',n:'HCHO mV'},
+  co2:{g:'Gases',n:'CO₂'}, voc:{g:'Gases',n:'VOC'}, nox:{g:'Gases',n:'NOx'},
+  co_mv:{g:'Gases',n:'CO'}, hcho_mv:{g:'Gases',n:'HCHO'},
   co_rs:{g:'Gases',n:'CO Rs',a:2}, hcho_rs:{g:'Gases',n:'HCHO Rs',a:2},
-  temp:{g:'Temp / Humidity',n:'Temp °C'}, rh:{g:'Temp / Humidity',n:'RH %',a:2},
-  bme_temp:{g:'Temp / Humidity',n:'BME temp °C'}, bme_rh:{g:'Temp / Humidity',n:'BME RH %',a:2},
-  pressure_hpa:{g:'Pressure (hPa)',n:'Pressure'},
-  lux:{g:'Light (lux)',n:'Light'},
-  noise_dba:{g:'Noise (dB)',n:'dB(A)'}, noise_spl:{g:'Noise (dB)',n:'SPL'},
-  noise_dbfs:{g:'Noise (dBFS)',n:'dBFS'},
-  // Motion: rumble (left) + accel magnitude (right) on one chart
-  rumble:{g:'Motion (m/s²)',n:'Rumble RMS'}, rumble_peak:{g:'Motion (m/s²)',n:'Rumble peak'},
-  accel_mag:{g:'Motion (m/s²)',n:'|a| magnitude',a:2},
-  // Soil: moisture % (left) + raw mV (right) on one chart
-  soil_pct:{g:'Soil',n:'Soil %'}, soil_mv:{g:'Soil',n:'Soil mV',a:2},
-  bat_v:{g:'Battery',n:'Bat V'}, bat_pct:{g:'Battery',n:'Bat %',a:2},
+  temp:{g:'Temp / Humidity',n:'Temp'}, rh:{g:'Temp / Humidity',n:'RH',a:2},
+  bme_temp:{g:'Temp / Humidity',n:'BME temp'}, bme_rh:{g:'Temp / Humidity',n:'BME RH',a:2},
+  pressure_hpa:{g:'Pressure',n:'Pressure'},
+  lux:{g:'Light',n:'Light'},
+  // All noise + vibration on one chart: dB levels on the left, m/s² on the right.
+  noise_dba:{g:'Noise & Vibration',n:'LAeq'}, noise_spl:{g:'Noise & Vibration',n:'SPL'},
+  lamax:{g:'Noise & Vibration',n:'LAmax'}, lceq:{g:'Noise & Vibration',n:'LCeq'},
+  lc_minus_la:{g:'Noise & Vibration',n:'LC−LA'}, noise_dbfs:{g:'Noise & Vibration',n:'Signal'},
+  rumble:{g:'Noise & Vibration',n:'Rumble',a:2}, rumble_peak:{g:'Noise & Vibration',n:'Rumble peak',a:2},
+  accel_mag:{g:'Noise & Vibration',n:'|a|',a:2},
+  soil_pct:{g:'Soil',n:'Soil'}, soil_mv:{g:'Soil',n:'Soil raw',a:2},
+  bat_v:{g:'Battery',n:'Voltage'}, bat_pct:{g:'Battery',n:'Charge',a:2},
+  // (bat_raw_mv intentionally absent → kept in the DB, not plotted)
 };
 // Per-chart axis titles for the dual-axis groups (left = y, right = y2).
 const GROUP_AXES = {
-  'Temp / Humidity': { y:'°C', y2:'% RH' },
-  'Gases':           { y:'ppm / index / mV', y2:'Rs (Ω)' },
-  'Motion (m/s²)':   { y:'rumble m/s²', y2:'|a| m/s²' },
-  'Soil':            { y:'%', y2:'mV' },
-  'Battery':         { y:'V', y2:'%' },
+  'Temp / Humidity':   { y:'°C', y2:'% RH' },
+  'Gases':             { y:'ppm / index / mV', y2:'Rs (Ω)' },
+  'Noise & Vibration': { y:'dB', y2:'m/s²' },
+  'Soil':              { y:'%', y2:'mV' },
+  'Battery':           { y:'V', y2:'%' },
+  'Wind':              { y:'m/s', y2:'°' },
+  'Cloud & Radiation': { y:'%', y2:'W/m²' },
 };
 // Fixed y-axis ranges per group (optional; overrides Plotly autoscale).
 const GROUP_Y_RANGE = {
@@ -325,8 +375,8 @@ const GROUP_Y_RANGE = {
 };
 // Chart stacking order (top→bottom). Battery is always forced last regardless.
 const GROUP_ORDER = [
-  'Particulates (µg/m³)','Gases','Temp / Humidity','Pressure (hPa)',
-  'Light (lux)','Noise (dB)','Noise (dBFS)','Soil','Motion (m/s²)',
+  'Particulates','Gases','Air Quality Index','Temp / Humidity','Pressure',
+  'Cloud & Radiation','Wind','Precipitation','Light','Noise & Vibration','Soil',
 ];
 function groupRank(g) {
   if (g === 'Battery') return 1e6;
@@ -334,37 +384,84 @@ function groupRank(g) {
   return i < 0 ? 5e5 : i;
 }
 
-// Weather metric metadata (variables returned by /api/weather).
-// Groups that overlap with META (e.g. 'Particulates') share the same Plotly chart.
+// Public weather/air-quality metadata (variables returned by /api/weather).
+// Group names match META so e.g. public PM shares the Particulates chart.
 const WEATHER_META = {
-  temperature_2m:       { g:'Temp / Humidity', n:'Outdoor °C' },
-  apparent_temperature: { g:'Temp / Humidity', n:'Feels like °C' },
-  dew_point_2m:         { g:'Temp / Humidity', n:'Dew point °C' },
-  relative_humidity_2m: { g:'Temp / Humidity', n:'Outdoor RH %', a:2 },
-  pressure_msl:         { g:'Pressure (hPa)', n:'Outdoor hPa' },
-  precipitation:        { g:'Precipitation (mm)', n:'Precip mm' },
-  rain:                 { g:'Precipitation (mm)', n:'Rain mm' },
-  rain_live:            { g:'Precipitation (mm)', n:'Rain live mm' },
-  cloud_cover:          { g:'Cloud & Radiation', n:'Cloud %' },
-  shortwave_radiation:  { g:'Cloud & Radiation', n:'Solar W/m²' },
-  global_radiation:     { g:'Cloud & Radiation', n:'Global rad W/m²' },
-  direct_radiation:     { g:'Cloud & Radiation', n:'Direct W/m²' },
-  wind_speed_10m:       { g:'Wind', n:'Wind m/s' },
-  wind_gusts_10m:       { g:'Wind', n:'Gusts m/s' },
-  wind_direction_10m:   { g:'Wind', n:'Wind dir °' },
-  pm10:                 { g:'Particulates (µg/m³)', n:'Outdoor PM10' },
-  pm2_5:                { g:'Particulates (µg/m³)', n:'Outdoor PM2.5' },
+  temperature_2m:       { g:'Temp / Humidity', n:'Public temp' },
+  apparent_temperature: { g:'Temp / Humidity', n:'Feels like' },
+  dew_point_2m:         { g:'Temp / Humidity', n:'Dew point' },
+  relative_humidity_2m: { g:'Temp / Humidity', n:'Public RH', a:2 },
+  pressure_msl:         { g:'Pressure', n:'Public pressure' },
+  precipitation:        { g:'Precipitation', n:'Precip' },
+  rain:                 { g:'Precipitation', n:'Rain' },
+  rain_live:            { g:'Precipitation', n:'Rain live' },
+  cloud_cover:          { g:'Cloud & Radiation', n:'Cloud' },
+  shortwave_radiation:  { g:'Cloud & Radiation', n:'Solar', a:2 },
+  global_radiation:     { g:'Cloud & Radiation', n:'Global rad', a:2 },
+  direct_radiation:     { g:'Cloud & Radiation', n:'Direct rad', a:2 },
+  wind_speed_10m:       { g:'Wind', n:'Wind' },
+  wind_gusts_10m:       { g:'Wind', n:'Gusts' },
+  wind_direction_10m:   { g:'Wind', n:'Wind dir', a:2 },
+  pm10:                 { g:'Particulates', n:'Public PM10' },
+  pm2_5:                { g:'Particulates', n:'Public PM2.5' },
   european_aqi:         { g:'Air Quality Index', n:'EU AQI' },
-  no2:                  { g:'Air Quality Index', n:'NO₂ µg/m³' },
-  o3:                   { g:'Air Quality Index', n:'O₃ µg/m³' },
-  uv_index:             { g:'Air Quality Index', n:'UV index' },
+  no2:                  { g:'Air Quality Index', n:'NO₂' },
+  o3:                   { g:'Air Quality Index', n:'O₃' },
+  uv_index:             { g:'Air Quality Index', n:'UV index', a:2 },
 };
 
-let live = true, selected = new Set(), allMetrics = [];
+// Units per metric — appended to the legend value, e.g. "CO₂ = 1020 ppm".
+const UNITS = {
+  pm1:'µg/m³', pm25:'µg/m³', pm4:'µg/m³', pm10:'µg/m³', pm2_5:'µg/m³',
+  co2:'ppm', voc:'', nox:'', co_mv:'mV', hcho_mv:'mV', co_rs:'Ω', hcho_rs:'Ω',
+  temp:'°C', rh:'%', bme_temp:'°C', bme_rh:'%', pressure_hpa:'hPa', pressure_msl:'hPa',
+  lux:'lux', noise_dba:'dB(A)', noise_spl:'dB', noise_dbfs:'dBFS', lamax:'dB(A)', lceq:'dB(C)',
+  lc_minus_la:'dB', rumble:'m/s²', rumble_peak:'m/s²', accel_mag:'m/s²', ppv_mm_s:'mm/s', accel_dom_hz:'Hz',
+  soil_pct:'%', soil_mv:'mV', bat_raw_mv:'mV', bat_v:'V', bat_pct:'%',
+  temperature_2m:'°C', apparent_temperature:'°C', dew_point_2m:'°C', relative_humidity_2m:'%',
+  precipitation:'mm', rain:'mm', rain_live:'mm', cloud_cover:'%', shortwave_radiation:'W/m²',
+  global_radiation:'W/m²', direct_radiation:'W/m²', wind_speed_10m:'m/s', wind_gusts_10m:'m/s',
+  wind_direction_10m:'°', european_aqi:'', no2:'µg/m³', o3:'µg/m³', uv_index:'',
+};
+// Which physical sensor produces each metric (shown in the hover explanation).
+const METRIC_SENSOR = {
+  pm1:'Sensirion SEN66 (laser PM)', pm25:'Sensirion SEN66 (laser PM)', pm4:'Sensirion SEN66 (laser PM)', pm10:'Sensirion SEN66 (laser PM)',
+  co2:'Sensirion SEN66 (NDIR CO₂)', voc:'SEN66 (SGP41 gas)', nox:'SEN66 (SGP41 gas)',
+  temp:'SEN66 (RH/T)', rh:'SEN66 (RH/T)', bme_temp:'BME280', bme_rh:'BME280', pressure_hpa:'BME280 (barometer)',
+  lux:'BH1750 (ambient light)', noise_dba:'INMP441 MEMS mic', noise_spl:'INMP441 MEMS mic',
+  noise_dbfs:'INMP441 MEMS mic', lamax:'INMP441 MEMS mic', lceq:'INMP441 MEMS mic',
+  co_mv:'DFRobot MEMS CO (analog)', hcho_mv:'DFRobot MEMS HCHO (analog)',
+  soil_mv:'capacitive soil probe', soil_pct:'capacitive soil probe',
+  rumble:'ADXL345 accelerometer', rumble_peak:'ADXL345 accelerometer', accel_mag:'ADXL345 accelerometer',
+  bat_v:'battery ADC divider', bat_pct:'battery ADC divider',
+  temperature_2m:'outdoor weather feed', relative_humidity_2m:'outdoor weather feed',
+  wind_speed_10m:'outdoor weather feed', wind_direction_10m:'outdoor weather feed',
+  precipitation:'outdoor weather feed', european_aqi:'outdoor air-quality feed',
+  pm2_5:'outdoor air-quality feed', no2:'outdoor air-quality feed', o3:'outdoor air-quality feed',
+};
+// How each metric relates to health / comfort norms.
+const METRIC_NORM = {
+  pm25:'WHO 24h guideline <15 µg/m³; >35 unhealthy', pm10:'WHO 24h guideline <45 µg/m³',
+  pm1:'no formal limit; ultrafine, tracks combustion', co2:'<800 fresh · >1000 stuffy · >1500 ventilate',
+  voc:'Sensirion index 1–500; 100≈typical, higher=more VOCs', nox:'index 1–500; needs days to learn a baseline',
+  temp:'comfort 20–24 °C', rh:'comfort 40–60 %; mould risk >70 %', bme_temp:'comfort 20–24 °C (BME runs warm)', bme_rh:'comfort 40–60 %',
+  pressure_hpa:'sea-level ≈1013 hPa; falling = weather coming',
+  lux:'dark <1 · dim room 50–200 · office 300–500 · daylight >1000',
+  noise_dba:'WHO night <40 dB(A); >65 annoying; >85 hearing risk', lamax:'peak level; NL counts events >65/>70 dB(A)',
+  lceq:'C-weighted; LC−LA >6 dB flags low-frequency (aircraft) noise',
+  co_mv:'higher mV = more CO; ventilate if rising fast', hcho_mv:'formaldehyde proxy; off-gassing from furniture/paint',
+  soil_pct:'0% dry → 100% saturated', bat_v:'Li-ion 3.0 empty → 4.2 full', bat_pct:'charge remaining',
+  european_aqi:'0–20 good · 40–60 moderate · >80 poor', no2:'traffic/combustion marker', o3:'ground-level ozone; higher on hot sunny days',
+};
+// Distinct line colours so each legend swatch matches its trace (dark-theme friendly).
+const TRACE_COLORS = ['#4ea1ff','#2ecc71','#ff8c69','#ffce6b','#b39ddb','#7ec8e3','#f06292','#a8e6a3','#ffd76b','#ff6b6b','#9de8b3','#c0a0ff'];
+
+let live = true, allMetrics = [];
 let dataCache = [];   // current query result (array of flat records)
 let weatherCache = [];
 let eventsCache = [];
-let _allWeatherMetrics = [], _selectedWeather = new Set();
+let _allWeatherMetrics = [];
+let _hiddenMetrics = new Set();   // metrics toggled off via a legend-chip click
 
 const $ = s => document.querySelector(s);
 
@@ -378,21 +475,17 @@ function fmtRange() {
   return { since: Math.floor(Date.now()/1000) - parseInt(sel), until: null };
 }
 
-let _seenMetrics = new Set();   // metrics auto-selected at least once (so we never re-add an unchecked one)
-
 async function loadMetrics() {
   const [sensorMs, weatherMs] = await Promise.all([
     (await fetch('/api/metrics')).json(),
     fetch('/api/weather/metrics').then(r => r.json()).catch(() => []),
   ]);
+  const prevN = allMetrics.length + _allWeatherMetrics.length;
   allMetrics = sensorMs;
   _allWeatherMetrics = weatherMs.map(m => m.name).filter(m => WEATHER_META[m]);
-  // Auto-check only metrics we've never seen before. First load → everything starts
-  // checked; new sensors that appear later auto-add; a metric you unchecked stays off
-  // (loadMetrics runs every 60s, so re-adding it here is exactly the old bug).
-  allMetrics.forEach(m => { if (!_seenMetrics.has(m)) { selected.add(m); _seenMetrics.add(m); } });
-  _allWeatherMetrics.forEach(m => { if (!_seenMetrics.has(m)) { _selectedWeather.add(m); _seenMetrics.add(m); } });
-  renderMetricsList();
+  // Every metric is plotted; the per-chart legend toggles individual lines. Re-render
+  // only when the set of available metrics changed (a new sensor appeared).
+  if (allMetrics.length + _allWeatherMetrics.length !== prevN) render();
 }
 
 // Short explanations shown as hover tooltips on each metric label.
@@ -416,64 +509,29 @@ const METRIC_DESC = {
   european_aqi:'European Air Quality Index (0=good, 100=very poor)', no2:'NO₂ concentration µg/m³', o3:'Ozone O₃ µg/m³', uv_index:'UV index (0=none, 11+=extreme)',
 };
 
-function renderMetricsList() {
-  const box = $('#metrics'); if (!box) return;
-  box.innerHTML = '';
-
-  // Select-all / deselect-all row
-  const btnRow = document.createElement('div');
-  btnRow.style.cssText = 'display:flex;gap:6px;margin-bottom:6px';
-  ['All','None'].forEach(lbl => {
-    const b = document.createElement('button');
-    b.textContent = lbl; b.className = 'sec';
-    b.style.cssText = 'font-size:11px;min-height:28px;padding:0 10px;width:auto;flex:1';
-    b.onclick = () => {
-      if (lbl === 'All') {
-        allMetrics.forEach(m => selected.add(m));
-        _allWeatherMetrics.forEach(m => _selectedWeather.add(m));
-      } else {
-        selected.clear(); _selectedWeather.clear();
-      }
-      render(); renderMetricsList();
-    };
-    btnRow.appendChild(b);
-  });
-  box.appendChild(btnRow);
-
-  const makeRow = (m, isWeather) => {
-    const lbl = document.createElement('label');
-    const desc = METRIC_DESC[m];
-    if (desc) lbl.title = desc;
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = isWeather ? _selectedWeather.has(m) : selected.has(m);
-    cb.onchange = () => {
-      if (isWeather) { cb.checked ? _selectedWeather.add(m) : _selectedWeather.delete(m); }
-      else           { cb.checked ? selected.add(m) : selected.delete(m); }
-      render();
-    };
-    const meta = isWeather ? WEATHER_META[m] : META[m];
-    const name = meta?.n || m;
-    const cur  = isWeather ? (_weatherLatest[m] ?? null)
-                           : (dataCache.length ? (dataCache.at(-1)[m] ?? null) : null);
-    const curStr = cur != null ? ` <span class="curval">${typeof cur === 'number' ? cur.toFixed(cur < 10 ? 1 : 0) : cur}</span>` : '';
-    lbl.appendChild(cb);
-    lbl.innerHTML += ` ${name}${curStr}`;
-    return lbl;
-  };
-
-  if (allMetrics.length) {
-    const h = document.createElement('div');
-    h.className = 'metrics-head'; h.textContent = 'Sensor';
-    box.appendChild(h);
-    allMetrics.forEach(m => box.appendChild(makeRow(m, false)));
+// Latest numeric value for a metric (sensor: newest non-null in dataCache;
+// weather: from the merged latest, falling back to the cache).
+function _latestValue(m, isWeather) {
+  if (isWeather) {
+    if (_weatherLatest[m] != null) return _weatherLatest[m];
+    for (let i = weatherCache.length - 1; i >= 0; i--) if (weatherCache[i][m] != null) return weatherCache[i][m];
+    return null;
   }
-  if (_allWeatherMetrics.length) {
-    const h = document.createElement('div');
-    h.className = 'metrics-head'; h.textContent = 'Outdoor weather';
-    box.appendChild(h);
-    _allWeatherMetrics.forEach(m => box.appendChild(makeRow(m, true)));
-  }
+  for (let i = dataCache.length - 1; i >= 0; i--) if (dataCache[i][m] != null) return dataCache[i][m];
+  return null;
+}
+
+function _fmtVal(v) {
+  if (typeof v !== 'number') return v;
+  return Math.abs(v) >= 100 ? Math.round(v) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+}
+
+// Hover explanation for a metric: what it means · which sensor · health norm.
+function _metricTitle(m) {
+  const parts = [METRIC_DESC[m] || m];
+  if (METRIC_SENSOR[m]) parts.push(`Sensor: ${METRIC_SENSOR[m]}`);
+  if (METRIC_NORM[m])   parts.push(`Healthy: ${METRIC_NORM[m]}`);
+  return parts.join('\n\n');
 }
 
 async function query() {
@@ -491,12 +549,12 @@ async function query() {
   ]);
   render();
   restoreToggleStates();
-  checkBattery();
+  checkBattery(); updateCo2Badge();
   loadStats();
-  renderMetricsList();   // refresh current-value readout
-  // Seed serial monitor with the last few loaded readings
-  _serialBuf.length = 0;
-  dataCache.slice(-SERIAL_MAX).forEach(_serialPush);
+  if (typeof loadFlightPaths === 'function') loadFlightPaths();   // map paths follow the window
+  // Seed the last-reading indicator from the newest loaded reading
+  _lastReadingTs = 0;
+  if (dataCache.length) _serialPush(dataCache[dataCache.length - 1]);
 }
 
 async function loadStats() {
@@ -507,36 +565,58 @@ async function loadStats() {
   $('#stats').textContent = `${s.readings} readings · ${s.events} events · ${span}`;
 }
 
-// group selected metrics by their chart group, one Plotly chart per group
-function render() {
-  // Which traces to show per group (determined by checkbox selection)
-  const selectedGroups = {};
-  [...selected].forEach(m => {
-    const g = META[m]?.g || m;
-    (selectedGroups[g] ||= []).push({ m, isWeather:false });
-  });
-  [..._selectedWeather].forEach(m => {
-    const wm = WEATHER_META[m]; if (!wm) return;
-    (selectedGroups[wm.g] ||= []).push({ m, isWeather:true });
-  });
+// Cap on plotted points per trace. Beyond this we min/max-bucket the series so the
+// curve keeps its shape AND its spikes (important for catching loud-noise events),
+// but the chart stays snappy at any time window.
+const MAX_TRACE_POINTS = 1500;
 
-  // All groups that have any known metric — charts stay visible regardless of selection.
-  const availGroups = new Set();
-  allMetrics.forEach(m => availGroups.add(META[m]?.g || m));
-  _allWeatherMetrics.forEach(m => { const wm = WEATHER_META[m]; if (wm) availGroups.add(wm.g); });
+// Min/max bucket decimation: preserves the envelope (peaks + troughs) of `ys` while
+// shrinking to ~maxPoints. xs/ys are plain numbers; returns {xs, ys, decimated}.
+function _decimate(xs, ys, maxPoints) {
+  const n = xs.length;
+  if (n <= maxPoints) return { xs, ys, decimated:false };
+  const buckets = Math.max(1, Math.floor(maxPoints / 2));
+  const size = n / buckets;
+  const ox = [], oy = [];
+  for (let b = 0; b < buckets; b++) {
+    const s = Math.floor(b * size), e = Math.min(n, Math.floor((b + 1) * size));
+    if (e <= s) continue;
+    let mi = s, ma = s;
+    for (let i = s; i < e; i++) { if (ys[i] < ys[mi]) mi = i; if (ys[i] > ys[ma]) ma = i; }
+    const a = Math.min(mi, ma), z = Math.max(mi, ma);   // keep time order
+    ox.push(xs[a]); oy.push(ys[a]);
+    if (z !== a) { ox.push(xs[z]); oy.push(ys[z]); }
+  }
+  return { xs:ox, ys:oy, decimated:true };
+}
+
+// One Plotly chart per group. Every KNOWN metric is plotted (dots mark real samples at
+// small windows); the per-chart legend chips show the latest value + unit, explain the
+// metric on hover, and toggle the line on click (greyed when off). No checkbox list.
+function render() {
+  const groups = {};   // group -> [{m, isWeather}]
+  // Only plot metrics we have metadata for (skips raw helper fields like bat_raw_mv).
+  allMetrics.forEach(m => { if (META[m]) (groups[META[m].g] ||= []).push({ m, isWeather:false }); });
+  _allWeatherMetrics.forEach(m => { const wm = WEATHER_META[m]; if (wm) (groups[wm.g] ||= []).push({ m, isWeather:true }); });
+  // Within each chart, cluster same-unit series together (all °C adjacent, then % …),
+  // left-axis before right-axis.
+  const metaOf = e => e.isWeather ? WEATHER_META[e.m] : META[e.m];
+  Object.values(groups).forEach(list => list.sort((p, q) => {
+    const mp = metaOf(p), mq = metaOf(q);
+    return (mp.a||1) - (mq.a||1) || (UNITS[p.m]||'').localeCompare(UNITS[q.m]||'') || mp.n.localeCompare(mq.n);
+  }));
 
   const host = $('#charts');
-  // Only remove chart divs for groups that have disappeared from the metric list entirely.
+  const availGroups = new Set(Object.keys(groups));
   [...host.children].forEach(c => { if (!availGroups.has(c.dataset.group)) c.remove(); });
 
   // Shared x-axis range: [window start, now] so all charts are time-aligned.
   const { since, until } = fmtRange();
   const xNow  = until ? new Date(until * 1000) : new Date();
-  const xFrom = since ? new Date(since * 1000)
-                      : new Date(xNow.getTime() - 3600 * 1000);
+  const xFrom = since ? new Date(since * 1000) : new Date(xNow.getTime() - 3600 * 1000);
   const xRange = [xFrom, xNow];
 
-  // Flyover annotations from aircraft path history
+  // Flyover + home-event markers (vertical dotted lines + side labels).
   const flyovers = _computeFlyovers(since, until);
   const flyShapes = flyovers.map(f => ({
     type:'line', x0:new Date(f.ts*1000), x1:new Date(f.ts*1000), yref:'paper', y0:0, y1:1,
@@ -556,24 +636,40 @@ function render() {
     font:{size:9, color:'#ffce6b'}, textangle:-90, xanchor:'left', yanchor:'top',
   }));
 
-  availGroups.forEach(g => {
+  Object.entries(groups).forEach(([g, mlist]) => {
     let div = [...host.children].find(c => c.dataset.group === g);
     if (!div) {
       div = document.createElement('div');
-      div.className = 'chart'; div.dataset.group = g; div.style.height = '260px';
+      div.className = 'chart'; div.dataset.group = g;
+      div.innerHTML = '<div class="plot"></div><div class="clegend"></div>';
       host.appendChild(div);
     }
-    const mlist = selectedGroups[g] || [];
+    const plotEl = div.querySelector('.plot');
+    const legEl  = div.querySelector('.clegend');
+    const colorOf = i => TRACE_COLORS[i % TRACE_COLORS.length];
     const hasRight = mlist.some(({m, isWeather}) => (isWeather ? WEATHER_META[m] : META[m])?.a === 2);
-    const traces = mlist.map(({m, isWeather}) => {
+
+    const traces = mlist.map(({m, isWeather}, i) => {
       const meta = isWeather ? WEATHER_META[m] : META[m];
       const cache = isWeather ? weatherCache : dataCache;
       const tsKey = isWeather ? 'valid_ts' : 'ts';
+      const color = colorOf(i);
+      // Keep only real (non-null) samples so the line connects them — fixes public
+      // weather showing isolated dots (rows interleave sources with null fields).
+      const xs = [], ys = [];
+      for (const r of cache) { const v = r[m]; if (v != null) { xs.push(r[tsKey]*1000); ys.push(v); } }
+      const dec = _decimate(xs, ys, MAX_TRACE_POINTS);
       return {
-        x: cache.map(r => new Date(r[tsKey]*1000)),
-        y: cache.map(r => r[m] ?? null),
-        name: meta?.n || m, mode:'lines', line:{width:1.6}, connectgaps:false,
+        x: dec.xs.map(t => new Date(t)),
+        y: dec.ys,
+        name: meta?.n || m,
+        // dots mark real samples at small windows; drop them once decimated (too dense + slow)
+        mode: dec.decimated ? 'lines' : 'lines+markers',
+        line: { width:1.6, color }, marker: { size:3, color },
+        connectgaps: false,
         yaxis: meta?.a === 2 ? 'y2' : 'y',
+        visible: _hiddenMetrics.has(m) ? 'legendonly' : true,
+        hovertemplate: `${meta?.n || m}: %{y} ${UNITS[m] || ''}<extra></extra>`,
       };
     });
     const ax = GROUP_AXES[g] || {};
@@ -582,11 +678,10 @@ function render() {
       title:{text:g, font:{size:13, color:'#cfd5e3'}, x:0.01},
       paper_bgcolor:'#171a21', plot_bgcolor:'#171a21',
       font:{color:'#9aa3b5', size:11},
-      margin:{l:48, r:hasRight ? 52 : 14, t:30, b:30}, height:260,
+      margin:{l:48, r:hasRight ? 52 : 14, t:28, b:22}, height:228,
       xaxis:{ gridcolor:'#252a35', range:xRange },
-      yaxis:{ gridcolor:'#252a35', title:{text:ax.y || '', font:{size:10}},
-              ...(yr.y ? {range:yr.y} : {}) },
-      showlegend:true, legend:{orientation:'h', y:-0.18, font:{size:10}},
+      yaxis:{ gridcolor:'#252a35', title:{text:ax.y || '', font:{size:10}}, ...(yr.y ? {range:yr.y} : {}) },
+      showlegend:false,
       shapes:[...eventShapes, ...flyShapes],
       annotations:[...eventAnnot, ...flyAnnot],
     };
@@ -595,7 +690,31 @@ function render() {
                         title:{text:ax.y2 || '', font:{size:10}}, zeroline:false,
                         ...(yr.y2 ? {range:yr.y2} : {}) };
     }
-    Plotly.react(div, traces, layout, {displayModeBar:false, responsive:true});
+    Plotly.react(plotEl, traces, layout, {displayModeBar:false, responsive:true});
+
+    // Custom legend chips: colour swatch · name · latest value+unit. Hover = explanation.
+    legEl.innerHTML = '';
+    mlist.forEach(({m, isWeather}, i) => {
+      const meta = isWeather ? WEATHER_META[m] : META[m];
+      const off = _hiddenMetrics.has(m);
+      const val = _latestValue(m, isWeather);
+      const unit = UNITS[m] || '';
+      const valStr = val != null ? ` = ${_fmtVal(val)}${unit ? ' ' + unit : ''}` : '';
+      const chip = document.createElement('span');
+      chip.className = 'cchip' + (off ? ' off' : '');
+      chip.title = _metricTitle(m);
+      chip.innerHTML = `<i style="background:${colorOf(i)}"></i>${meta?.n || m}${valStr}`;
+      // Toggle the line instantly via Plotly.restyle on just this trace (chip index ==
+      // trace index) — no full re-render, so it disappears the moment you click.
+      const traceIdx = i;
+      chip.onclick = () => {
+        const nowHidden = !_hiddenMetrics.has(m);
+        if (nowHidden) _hiddenMetrics.add(m); else _hiddenMetrics.delete(m);
+        chip.classList.toggle('off', nowHidden);
+        Plotly.restyle(plotEl, { visible: nowHidden ? 'legendonly' : true }, [traceIdx]);
+      };
+      legEl.appendChild(chip);
+    });
   });
 
   // Keep charts in a stable order, Battery always pinned to the bottom
@@ -676,41 +795,31 @@ async function loadWeather() {
   } catch (_) {}
 }
 
-// ---- serial monitor -------------------------------------------------------
-// Mirrors the ESP32 serial log. The device buffers readings in a FIFO ring and
-// flushes a whole batch at once, so many rows can arrive together — we sort by
-// timestamp and render oldest→newest (newest at the bottom, like a real monitor).
-// A '~' before the time means the timestamp was reconstructed (device clock was
-// unsynced), so it's an estimate, not a GPS-grade stamp.
-const _serialBuf = [];   // last N readings
-const SERIAL_MAX = 60;
+// ---- last-reading indicator -----------------------------------------------
+// Just shows when the most recent reading arrived + its values. A '~' means the
+// timestamp was reconstructed (device clock was unsynced), so it's an estimate.
+let _lastReadingTs = 0;
 const SERIAL_SKIP = new Set(['ts','device_ts','up_ms','boot','dev','device','ts_ok','ts_source','bat_cal','noise_clip']);
 
 function _serialPush(rec) {
   const ts = rec.ts || Date.now()/1000;
+  if (ts < _lastReadingTs) return;          // only track the newest
+  _lastReadingTs = ts;
   const t = new Date(ts * 1000);
-  const p2 = n => String(n).padStart(2, '0');
-  const stamp = `${p2(t.getMonth()+1)}-${p2(t.getDate())} ${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}`;
-  const est = (rec.ts_source && rec.ts_source !== 'device') ? '~' : ' ';
+  const est = (rec.ts_source && rec.ts_source !== 'device') ? '~' : '';
+  const stamp = `${est}${t.toLocaleString()}`;
   const vals = Object.entries(rec)
     .filter(([k, v]) => !SERIAL_SKIP.has(k) && typeof v === 'number')
     .map(([k, v]) => `${k}=${Number.isInteger(v) ? v : v.toFixed(2)}`)
     .join('  ');
-  if (!vals) return;
-  _serialBuf.push({ ts, stamp, est, vals });
-  _serialBuf.sort((a, b) => a.ts - b.ts);
-  if (_serialBuf.length > SERIAL_MAX) _serialBuf.splice(0, _serialBuf.length - SERIAL_MAX);
-  _serialRender();
+  _serialRender(stamp, vals);
 }
 
-function _serialRender() {
+function _serialRender(stamp, vals) {
   const el = document.getElementById('serialMon');
   if (!el) return;
-  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-  el.innerHTML = _serialBuf.map(r =>
-    `<div class="srow"><span class="sts">${r.est}${r.stamp} </span>${r.vals}</div>`
-  ).join('');
-  if (atBottom) el.scrollTop = el.scrollHeight;   // keep pinned to newest unless user scrolled up
+  el.innerHTML = `<div class="srow"><span class="sts">Last reading: ${stamp || '—'}</span></div>`
+               + (vals ? `<div class="srow">${vals}</div>` : '');
 }
 
 // ---- live updates over WebSocket ------------------------------------------
@@ -724,7 +833,7 @@ function connectWS() {
     if (msg.type === 'aircraft') { renderSdr(msg.sdr); updateAircraft(msg.data); return; }
     if (msg.type === 'weather')  { Object.assign(_weatherLatest, msg.data); _weatherLatest._source = msg.data.source || _weatherLatest._source; renderWeather(); return; }
     if (!live) return;
-    if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); checkBattery(); loadStats(); _serialPush(msg.data); }
+    if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); checkBattery(); updateCo2Badge(); loadStats(); _serialPush(msg.data); }
     if (msg.type === 'device')  { /* device mode changes silently ignored (section removed) */ }
     if (msg.type === 'event')   {
       eventsCache.push(msg.data); render();
@@ -813,8 +922,54 @@ async function addMarker() {
   $('#evstat').textContent = `marker: "${ev.label}" @ ${new Date(ev.ts*1000).toLocaleTimeString()}`;
 }
 
-// ---- low-battery warning --------------------------------------------------
+// ---- low-battery warning + runtime estimate -------------------------------
 const BAT_LOW_PCT = 15, BAT_LOW_V = 3.3;
+
+// Battery % from voltage when the device only reports bat_v (Li-ion 3.0–4.2 V).
+function _pctFromV(v) { return Math.max(0, Math.min(100, (v - 3.0) / (4.2 - 3.0) * 100)); }
+
+// Estimate time-to-empty / time-to-full from the discharge (or charge) slope over the
+// loaded window. Least-squares fit of pct vs hours; needs a few points over ≥3 min.
+function _batEstimate() {
+  const pts = [];
+  for (const r of dataCache) {
+    const p = r.bat_pct != null ? r.bat_pct : (r.bat_v != null ? _pctFromV(r.bat_v) : null);
+    if (p != null && r.ts) pts.push({ h: r.ts / 3600, p });
+  }
+  if (pts.length < 4) return null;
+  const spanH = pts[pts.length - 1].h - pts[0].h;
+  if (spanH < 0.05) return null;                       // < 3 min of data → too noisy
+  const n = pts.length;
+  let sh = 0, sp = 0, shp = 0, shh = 0;
+  for (const { h, p } of pts) { sh += h; sp += p; shp += h * p; shh += h * h; }
+  const denom = n * shh - sh * sh;
+  if (Math.abs(denom) < 1e-9) return null;
+  const slope = (n * shp - sh * sp) / denom;           // %/hour (negative = discharging)
+  const cur = pts[pts.length - 1].p;
+  const fmtH = h => h >= 48 ? `${(h/24).toFixed(1)} d` : h >= 1 ? `${h.toFixed(1)} h` : `${Math.round(h*60)} min`;
+  if (slope <= -0.3) return { cur, txt: `~${fmtH(cur / -slope)} left`, rate: `${slope.toFixed(1)}%/h`, mode:'discharge' };
+  if (slope >=  0.3) return { cur, txt: `charging · ~${fmtH((100 - cur) / slope)} to full`, rate: `+${slope.toFixed(1)}%/h`, mode:'charge' };
+  return { cur, txt: cur > 95 ? 'full / on power' : 'stable (on power)', rate: '~0%/h', mode:'stable' };
+}
+
+// CO₂ health badge: green (fresh) → amber → red (open a window!). Thresholds follow
+// common indoor-air guidance: <800 good, 800–1200 ok, 1200–1500 stuffy, >1500 poor.
+function updateCo2Badge() {
+  const el = $('#co2Badge'); if (!el) return;
+  let co2 = null;
+  for (let i = dataCache.length - 1; i >= 0; i--) {
+    if (dataCache[i].co2 != null) { co2 = dataCache[i].co2; break; }
+  }
+  if (co2 == null || co2 <= 0 || co2 > 40000) { el.textContent = '—'; el.style.background = '#3a3f4b'; el.classList.remove('warn'); return; }
+  // map 450→1800 ppm onto a green→amber→red hue ramp (120°→0°)
+  const t = Math.max(0, Math.min(1, (co2 - 450) / (1800 - 450)));
+  const hue = 120 * (1 - t);                       // 120=green, 60=amber, 0=red
+  const label = co2 < 800 ? 'fresh' : co2 < 1200 ? 'ok' : co2 < 1500 ? 'stuffy' : 'open a window';
+  el.style.background = `hsl(${hue.toFixed(0)},75%,55%)`;
+  el.textContent = `CO₂ ${Math.round(co2)} · ${label}`;
+  el.classList.toggle('warn', co2 >= 1500);
+}
+
 function checkBattery() {
   let pct = null, v = null;
   for (let i = dataCache.length - 1; i >= 0; i--) {     // newest reading with battery data
@@ -827,6 +982,18 @@ function checkBattery() {
   const el = $('#batwarn');
   el.classList.toggle('show', low);
   if (low) el.textContent = `🔋 Battery low — ${pct != null ? pct.toFixed(0) + '%' : v.toFixed(2) + ' V'} · charge soon`;
+
+  // Runtime estimate line
+  const bs = $('#batStat');
+  if (bs) {
+    if (pct == null && v == null) { bs.textContent = ''; }
+    else {
+      const est = _batEstimate();
+      const icon = est?.mode === 'charge' ? '⚡' : '🔋';
+      const head = `${icon} ${pct != null ? pct.toFixed(0) + '%' : ''}${v != null ? ' · ' + v.toFixed(2) + ' V' : ''}`;
+      bs.textContent = est ? `${head} · ${est.txt} (${est.rate})` : `${head}`;
+    }
+  }
 }
 
 // ---- wire up controls -----------------------------------------------------
@@ -837,33 +1004,34 @@ $('#range').onchange = () => {
 };
 $('#markerAdd').onclick = addMarker;
 $('#markerText').addEventListener('keydown', e => { if (e.key === 'Enter') addMarker(); });
-// Live/interval selector
-let _liveTimer = null;
-$('#liveintvl').onchange = function() {
-  const v = parseInt(this.value, 10);
-  if (_liveTimer) { clearInterval(_liveTimer); _liveTimer = null; }
-  if (v === 0) {
-    live = true;
-  } else {
-    live = false;
-    _liveTimer = setInterval(() => { query(); }, v * 1000);
-  }
-};
 
-// Sensor report interval → pushed to every known device's config. The board picks
-// it up in its next /ingest reply (server.py adds resp["config"]).
+// The dashboard is always live: readings render the instant they arrive over the WS.
+live = true;
+
+// Sensor interval → pushed to every known device. Intervals ≤30 s also flip the board
+// into live-streaming mode so each sample is uploaded immediately (server delivers both
+// the config and the set_mode command in the device's next /ingest reply).
 $('#sensorIntvl').onchange = async function() {
   const v = this.value;
   if (!v) return;
+  const secs = parseInt(v, 10);
   let devices = [];
   try { devices = (await (await fetch('/api/devices')).json()).map(d => d.dev); } catch (_) {}
-  if (!devices.length) { alert('No device has reported in yet — try again once the board syncs.'); return; }
-  await Promise.all(devices.map(dev =>
+  if (!devices.length) { $('#liveHint').textContent = '— no device has reported in yet'; return; }
+  const liveStream = secs <= 30;
+  await Promise.all(devices.flatMap(dev => [
     fetch(`/api/config/${encodeURIComponent(dev)}`, {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ poll_interval_ms: parseInt(v, 10) * 1000 }),
-    })));
-  $('#liveHint').textContent = `— sensor interval set to ${v}s (applies on next sync)`;
+      body: JSON.stringify({ poll_interval_ms: secs * 1000 }),
+    }),
+    fetch(`/api/device/${encodeURIComponent(dev)}/mode`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ mode: liveStream ? 'testing' : 'normal' }),
+    }),
+  ]));
+  $('#liveHint').textContent = liveStream
+    ? `— live every ${secs}s (applies within ~1 min)`
+    : `— every ${secs}s (applies within ~1 min)`;
 };
 
 // Home / plane mode toggle
@@ -952,9 +1120,7 @@ async function initAircraft() {
   const slh = $('#acRangeHead'); slh.value = acRange;
   slh.addEventListener('input',     e => { e.stopPropagation(); $('#acRangeLbl').textContent = `· ≤ ${fmtKm(parseFloat(slh.value))}`; });
   slh.addEventListener('change',    e => { e.stopPropagation(); setAcRange(parseFloat(slh.value)); });
-  slh.addEventListener('click',     e => e.stopPropagation());
-  slh.addEventListener('mousedown', e => e.stopPropagation());
-  $('#acHead').onclick = () => $('#aircraftPanel').classList.toggle('collapsed');
+  // (the aircraft panel is never collapsed — the flight map stays open)
 
   try { updateAircraft(await (await fetch('/api/aircraft')).json()); } catch (_) {}
   setTimeout(() => { if (acMap) { acMap.invalidateSize(); fitToRing(); } }, 250);   // layout pass, then frame the range
@@ -1007,6 +1173,38 @@ function _regFlag(reg) {
 
 // Leaflet polylines for historical paths overlaid on the map
 let _mapPathLines = {};
+let _pathMeta = {};          // hex -> {flight,type,reg,desc,category,operator,year}
+let _pathChevrons = null;    // featureGroup of per-reading direction markers
+
+// Initial compass bearing (deg) from point A to point B.
+function _bearing(la1, lo1, la2, lo2) {
+  const φ1 = la1*Math.PI/180, φ2 = la2*Math.PI/180, Δλ = (lo2-lo1)*Math.PI/180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+  return (Math.atan2(y, x) * 180/Math.PI + 360) % 360;
+}
+
+// A small "›" chevron rotated to the aircraft's heading (the glyph points east at 0°,
+// so rotate track−90 to align it with the compass track). Non-interactive so clicks
+// fall through to the underlying path line (which carries the identity popup).
+function _chevronIcon(track, color, op) {
+  return L.divIcon({ className:'', iconSize:[14,14], iconAnchor:[7,7],
+    html:`<div style="transform:rotate(${((track||0)-90).toFixed(0)}deg);color:${color};`
+       + `opacity:${op.toFixed(2)};font:700 14px/14px system-ui;text-align:center">›</div>` });
+}
+
+// Identity popup for a logged track — "what kind of aircraft was this?"
+function _pathPopupHtml(hex) {
+  const m = _pathMeta[hex] || {};
+  const { flag } = _regFlag(m.reg);
+  const airline = acAirline(m.flight), kind = acKind(m.category, m.flight);
+  const wt = acWeight(m.type, m.category), age = acAge(m.year);
+  const flightId = (m.flight || '').trim();
+  return `<b>${flightId || hex}</b>${flag ? ' ' + flag : ''}`
+    + `${airline ? ' · ' + airline : ''}${kind ? ' <small>(' + kind + ')</small>' : ''}<br>`
+    + `${m.desc || m.type || '—'}${wt ? ' · ' + wt : ''}${age ? ' · ' + age : ''}`
+    + (m.operator ? `<br><small>${m.operator}</small>` : '');
+}
 
 function _pathColor(p) {
   const w = ICAO_MTOW[(p.type||'').toUpperCase()];
@@ -1019,6 +1217,50 @@ function _pathColor(p) {
   return _hexColor(p.hex || '');
 }
 
+// Radial fade: a line is fully opaque inside the range ring, fades linearly from the
+// ring out to 1.5× range, and is invisible beyond that. distKm = distance from home.
+function _fadeAt(distKm) {
+  if (distKm <= acRange) return 1;
+  if (distKm >= acRange * 1.5) return 0;
+  return 1 - (distKm - acRange) / (acRange * 0.5);
+}
+
+// Draw a polyline as per-segment pieces so opacity can fade with distance from home.
+// Returns an L.layerGroup (replaces `prev` if given). Segments fully inside the ring
+// stay solid; segments crossing the range→1.5× band are subdivided so the fade is a
+// smooth gradient (not a step); segments past 1.5× range are dropped.
+function _fadedPath(prev, latlngs, style, onClick) {
+  if (prev) acMap.removeLayer(prev);
+  if (!acHome || latlngs.length < 2) return null;
+  const grp = L.featureGroup();   // featureGroup so a popup can bind across all segments
+  const base = style.opacity ?? 1;
+  const stepKm = Math.max(0.08, acRange * 0.03);   // fade-band resolution (~17 steps)
+  const dHome = (la, lo) => haversineKm(acHome[0], acHome[1], la, lo);
+  const addSeg = (p0, p1, op) => {
+    if (op <= 0.03) return;
+    const seg = L.polyline([p0, p1], { ...style, opacity: op });
+    if (onClick) seg.on('click', onClick);
+    seg.addTo(grp);
+  };
+  for (let i = 0; i < latlngs.length - 1; i++) {
+    const a = latlngs[i], b = latlngs[i + 1];
+    const da = dHome(a[0], a[1]), db = dHome(b[0], b[1]);
+    if (da <= acRange && db <= acRange) { addSeg(a, b, base); continue; }   // fully inside → solid
+    if (da >= acRange * 1.5 && db >= acRange * 1.5) continue;               // fully outside → drop
+    // crosses the fade band → subdivide for a smooth opacity gradient
+    const segKm = haversineKm(a[0], a[1], b[0], b[1]);
+    const subs = Math.max(1, Math.min(60, Math.ceil(segKm / stepKm)));
+    for (let s = 0; s < subs; s++) {
+      const t0 = s / subs, t1 = (s + 1) / subs;
+      const p0 = [a[0] + (b[0]-a[0]) * t0, a[1] + (b[1]-a[1]) * t0];
+      const p1 = [a[0] + (b[0]-a[0]) * t1, a[1] + (b[1]-a[1]) * t1];
+      addSeg(p0, p1, _fadeAt(dHome((p0[0]+p1[0]) / 2, (p0[1]+p1[1]) / 2)) * base);
+    }
+  }
+  grp.addTo(acMap);
+  return grp;
+}
+
 function drawMapPaths() {
   if (!acMap) return;
   // remove old lines that are no longer in _pathData
@@ -1026,15 +1268,37 @@ function drawMapPaths() {
   Object.keys(_mapPathLines).forEach(h => {
     if (!activeHex.has(h)) { acMap.removeLayer(_mapPathLines[h]); delete _mapPathLines[h]; }
   });
+  // Rebuild the per-reading direction chevrons from scratch each refresh.
+  if (_pathChevrons) acMap.removeLayer(_pathChevrons);
+  _pathChevrons = L.featureGroup().addTo(acMap);
+  // Global budget so a wide time window can't flood the map with markers.
+  const CHEV_BUDGET = 600;
+  const chevStride = Math.max(1, Math.ceil(_pathData.length / CHEV_BUDGET));
+  let gci = 0;
+
   const groups = _groupByHex(_pathData);
   for (const [hex, pts] of Object.entries(groups)) {
     const lls = pts.map(p => [p.lat, p.lon]);
-    const col = _pathColor(pts[0]);
-    if (_mapPathLines[hex]) {
-      _mapPathLines[hex].setLatLngs(lls).setStyle({color: col});
-    } else {
-      _mapPathLines[hex] = L.polyline(lls, {color:col, weight:1.5, opacity:0.55}).addTo(acMap);
-    }
+    const col = _pathColor({ type: _pathMeta[hex]?.type, hex });
+    _mapPathLines[hex] = _fadedPath(_mapPathLines[hex], lls, {color:col, weight:1.5, opacity:0.55});
+    if (_mapPathLines[hex]) _mapPathLines[hex].bindPopup(_pathPopupHtml(hex));   // click → identity
+    else { delete _mapPathLines[hex]; }
+
+    // Drop a heading chevron at logged readings (decluttered by global stride + spacing).
+    let last = null;
+    pts.forEach((p, i) => {
+      if (p.lat == null || p.lon == null) return;
+      if (gci++ % chevStride) return;
+      const d = haversineKm(acHome[0], acHome[1], p.lat, p.lon);
+      const op = _fadeAt(d) * 0.95;
+      if (op <= 0.05) return;
+      if (last && haversineKm(last[0], last[1], p.lat, p.lon) < Math.max(0.12, acRange * 0.03)) return;
+      last = [p.lat, p.lon];
+      const trk = p.track != null ? p.track
+                : (i < pts.length - 1 ? _bearing(p.lat, p.lon, pts[i+1].lat, pts[i+1].lon)
+                : i > 0 ? _bearing(pts[i-1].lat, pts[i-1].lon, p.lat, p.lon) : 0);
+      L.marker([p.lat, p.lon], { icon:_chevronIcon(trk, col, op), interactive:false }).addTo(_pathChevrons);
+    });
   }
 }
 
@@ -1042,10 +1306,16 @@ let _pathData = [];
 
 async function loadFlightPaths() {
   try {
-    // Fetch 2× range so drawPredPaths() has history for incoming planes
-    const resp = await fetch(`/api/aircraft/paths?range_km=${acRange * 2}`);
+    // Fetch 2× range (so drawPredPaths has history for incoming planes) over the same
+    // window the charts show, so the map matches the selected time range.
+    const { since } = fmtRange();
+    const winH = since ? (Math.floor(Date.now()/1000) - since) / 3600 : 1;
+    const hours = Math.min(168, Math.max(0.25, winH));
+    const resp = await fetch(`/api/aircraft/paths?range_km=${acRange * 2}&hours=${hours.toFixed(2)}`);
     if (!resp.ok) return;
-    _pathData = (await resp.json()).points || [];
+    const j = await resp.json();
+    _pathData = j.points || [];
+    _pathMeta = j.meta || {};
   } catch (_) { return; }
   drawMapPaths();
   drawSideView();
@@ -1159,14 +1429,19 @@ function drawSideView() {
   ctx.textBaseline = 'alphabetic';
 }
 
-// Side-view click: find closest drawn path segment and highlight that aircraft.
-$('#pathSide').style.cursor = 'crosshair';
+// Side-view click: find the closest track (live plane or logged path) and pop up
+// its details right on the side view, plus highlight it on the map + table.
+function _sideHideInfo() { const b = $('#sideInfo'); if (b) b.style.display = 'none'; }
+
 $('#pathSide').addEventListener('click', e => {
-  if (!_sideXform || !_pathData.length) return;
-  const rect = e.target.getBoundingClientRect();
-  const mx = (e.clientX - rect.left) * (e.target.width / rect.width);
-  const my = (e.clientY - rect.top)  * (e.target.height / rect.height);
+  if (!_sideXform) return;
+  const cv = e.target;
+  const rect = cv.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (cv.width / rect.width);
+  const my = (e.clientY - rect.top)  * (cv.height / rect.height);
+
   let closestHex = null, minDist = Infinity;
+  // 1) logged history polylines
   for (const [hex, pts] of Object.entries(_groupByHex(_pathData))) {
     const vp = pts.filter(p => p.alt_baro != null && p.lon != null);
     for (let i = 0; i < vp.length - 1; i++) {
@@ -1176,8 +1451,51 @@ $('#pathSide').addEventListener('click', e => {
       if (d < minDist) { minDist = d; closestHex = hex; }
     }
   }
-  if (!closestHex || minDist > 18) return;
-  const ac = acData.find(a => a.hex === closestHex);
+  // 2) live aircraft plotted points (works even with no logged history / no readsb)
+  for (const a of (acData || [])) {
+    if (a.lon == null || a.alt_baro == null || a.distance_km == null || a.distance_km > acRange) continue;
+    const [x, y] = _sideXY(a.lon, a.alt_baro);
+    const d = Math.hypot(mx - x, my - y);
+    if (d < minDist) { minDist = d; closestHex = a.hex; }
+  }
+  if (!closestHex || minDist > 22) { _sideHideInfo(); return; }
+
+  const ac = (acData || []).find(a => a.hex === closestHex);
+  const hist = (_groupByHex(_pathData)[closestHex] || []);
+  const last = hist.length ? hist[hist.length - 1] : null;
+  const info = ac || last || { hex: closestHex };
+
+  // Build the detail box
+  const { flag, country } = _regFlag(info.reg);
+  const airline = acAirline(info.flight);
+  const kind = acKind(info.category, info.flight);
+  const vr = info.baro_rate || 0;
+  const trend = vr > 64 ? '▲ climbing' : vr < -64 ? '▼ descending' : 'level';
+  const srcTxt = info.source === 'public' ? 'reference feed'
+               : info.source === 'both' ? 'our SDR + reference'
+               : info.source === 'sdr' ? 'our SDR' : 'logged track';
+  const rows = [
+    `<b>${(info.flight || '').trim() || info.hex}</b>${flag ? ' ' + flag : ''}`,
+    airline || kind ? `${airline}${airline && kind ? ' · ' : ''}${kind}` : '',
+    info.desc || info.type || '',
+    info.alt_baro != null ? `Alt ${info.alt_baro} ft · ${trend}` : '',
+    info.gs != null ? `Spd ${Math.round(info.gs)} kt` : '',
+    info.distance_km != null ? `Dist ${(+info.distance_km).toFixed(1)} km` : '',
+    `<span style="color:var(--mut)">via ${srcTxt}</span>`,
+  ].filter(Boolean);
+
+  const box = $('#sideInfo');
+  box.innerHTML = `<span class="si-close" onclick="_sideHideInfo()">✕</span>` + rows.join('<br>');
+  // position near the click, clamped inside the canvas wrapper
+  const wrap = $('#pathSideWrap').getBoundingClientRect();
+  let lx = e.clientX - wrap.left + 8, ty = e.clientY - wrap.top + 8;
+  if (lx > wrap.width - 150) lx = wrap.width - 150;
+  if (ty > wrap.height - 90) ty = wrap.height - 90;
+  box.style.left = Math.max(4, lx) + 'px';
+  box.style.top  = Math.max(4, ty) + 'px';
+  box.style.display = 'block';
+
+  // also reflect on the map + table
   if (ac && ac.lat != null && acMap)
     acMap.setView([ac.lat, ac.lon], Math.max(acMap.getZoom(), 11), {animate:true});
   if (acIcons[closestHex]) acIcons[closestHex].openPopup();
@@ -1518,14 +1836,14 @@ function drawPredPaths() {
     };
 
     if (trailLLs && trailLLs.length > 1) {
-      if (pc.trail) pc.trail.setLatLngs(trailLLs).setStyle({color:col});
-      else { pc.trail = L.polyline(trailLLs, {color:col, weight:2, opacity:0.65}).addTo(acMap); pc.trail.on('click', onCurveClick); }
-    } else { if (pc.trail) { acMap.removeLayer(pc.trail); delete pc.trail; } }
+      pc.trail = _fadedPath(pc.trail, trailLLs, {color:col, weight:2, opacity:0.65}, onCurveClick);
+      if (!pc.trail) delete pc.trail;
+    } else if (pc.trail) { acMap.removeLayer(pc.trail); delete pc.trail; }
 
     if (predLLs && predLLs.length > 1) {
-      if (pc.pred) pc.pred.setLatLngs(predLLs).setStyle({color:col});
-      else { pc.pred = L.polyline(predLLs, {color:col, weight:1.5, opacity:0.5, dashArray:'5 7'}).addTo(acMap); pc.pred.on('click', onCurveClick); }
-    } else { if (pc.pred) { acMap.removeLayer(pc.pred); delete pc.pred; } }
+      pc.pred = _fadedPath(pc.pred, predLLs, {color:col, weight:1.5, opacity:0.5, dashArray:'5 7'}, onCurveClick);
+      if (!pc.pred) delete pc.pred;
+    } else if (pc.pred) { acMap.removeLayer(pc.pred); delete pc.pred; }
   }
 
   // Clean up curves for planes no longer in extended range
@@ -1551,7 +1869,7 @@ function planeIcon(track, source, type, category) {
 }
 
 $('#howlBtn').addEventListener('click', e => {
-  e.stopPropagation();   // don't bubble to acHead and collapse the panel
+  e.stopPropagation();
   const ts = Math.floor(Date.now() / 1000);
   fetch('/api/event', { method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({kind:'howl', ts}) });
@@ -1564,11 +1882,13 @@ $('#howlBtn').addEventListener('click', e => {
 function renderAircraft() {
   if (!acMap) return;
   const inRange = acData.filter(a => a.distance_km != null && a.distance_km <= acRange);
-  const nLocal = inRange.filter(a => a.source !== 'public').length;   // 'local' or 'both'
-  const nPublic = inRange.length - nLocal;
-  $('#acCount').textContent = nPublic
-    ? `${nLocal} local · ${nPublic} ref`
-    : `${inRange.length} in range`;
+  const nSdr = inRange.filter(a => a.source !== 'public').length;   // 'sdr' or 'both'
+  const nPublic = inRange.length - nSdr;
+  $('#acCount').textContent = nPublic && nSdr
+    ? `${nSdr} SDR · ${nPublic} ref`
+    : nPublic
+    ? `${nPublic} in range (internet — SDR offline)`
+    : `${nSdr} in range (SDR)`;
   $('#acRangeLbl').textContent = `· ≤ ${fmtKm(acRange)}`;
 
   const seen = new Set();
@@ -1600,7 +1920,7 @@ function renderAircraft() {
       acIcons[a.hex] = L.marker([a.lat, a.lon], { icon: planeIcon(a.track, a.source, a.type, a.category) }).addTo(acMap);
     }
     const src = a.source === 'public' ? ' · reference feed'
-              : a.source === 'both' ? ' · local + reference' : ' · local SDR';
+              : a.source === 'both' ? ' · our SDR + reference' : ' · our SDR';
     const al = acAirline(a.flight); const kd = acKind(a.category, a.flight);
     acIcons[a.hex].bindPopup(
       `<b>${a.flight || a.hex}</b>${al ? ' · ' + al : ''}${kd ? ' <small>(' + kd + ')</small>' : ''}<br>`
@@ -1660,6 +1980,63 @@ function renderAircraft() {
   drawSideView();
 }
 
+// ---- research panel -------------------------------------------------------
+// Build a table from column specs. Each col: {h: header, k: key} or {h, f: row=>cell}.
+function _rtable(el, cols, rows) {
+  if (!el) return;
+  const head = '<thead><tr>' + cols.map(c => `<th>${c.h}</th>`).join('') + '</tr></thead>';
+  const body = '<tbody>' + (rows.length
+    ? rows.map(r => '<tr>' + cols.map(c => {
+        const v = c.f ? c.f(r) : r[c.k];
+        return `<td>${v == null || v === '' ? '—' : v}</td>`;
+      }).join('') + '</tr>').join('')
+    : `<tr><td colspan="${cols.length}" style="color:var(--mut)">no data yet</td></tr>`) + '</tbody>';
+  el.innerHTML = head + body;
+}
+
+async function loadResearch() {
+  try {
+    const [daily, loud, events] = await Promise.all([
+      fetch('/api/research/daily?limit=14').then(r => r.json()),
+      fetch('/api/research/loudness?limit=15').then(r => r.json()),
+      fetch('/api/research/noise_events?limit=60').then(r => r.json()),
+    ]);
+    _rtable($('#resDaily'), [
+      { h:'Day', f:r => r.day },
+      { h:'Flights', k:'flights' },
+      { h:'Max dB', k:'max_db' },
+      { h:'≥65', k:'n_ge65' },
+      { h:'≥70', k:'n_ge70' },
+      { h:'Night≥65', k:'n_ge65_night' },
+      { h:'PM2.5', k:'avg_pm25' },
+      { h:'CO₂', k:'avg_co2' },
+    ], daily);
+    const maxAvg = Math.max(1, ...loud.map(r => r.avg_dba || 0));
+    _rtable($('#resLoud'), [
+      { h:'Type', f:r => r.type },
+      { h:'N', k:'n_samples' },
+      { h:'Avg dB', f:r => `${r.avg_dba}<span class="rbar" style="width:${Math.round((r.avg_dba/maxAvg)*60)}px"></span>` },
+      { h:'Max dB', k:'max_dba' },
+    ], loud);
+    _rtable($('#resEvents'), [
+      { h:'Time', f:r => (r.time || '').slice(5, 16) },
+      { h:'dB', f:r => r.lamax ?? r.noise_dba },
+      { h:'Flight', f:r => r.flight },
+      { h:'Type', f:r => r.type },
+      { h:'Alt ft', k:'alt_baro' },
+      { h:'Dist km', k:'dist_km' },
+    ], events);
+  } catch (_) {}
+}
+
+$('#researchHead').addEventListener('click', e => {
+  if (e.target.id === 'researchRefresh') return;
+  const p = $('#researchPanel');
+  p.classList.toggle('rcollapsed');
+  if (!p.classList.contains('rcollapsed')) loadResearch();
+});
+$('#researchRefresh').addEventListener('click', e => { e.stopPropagation(); loadResearch(); });
+
 (async function init(){
   renderToggles();
   await loadMetrics();
@@ -1674,6 +2051,8 @@ function renderAircraft() {
   connectWS();
   keepAwake();
   setInterval(loadMetrics, 60000);
+  // refresh the research panel periodically while it's open
+  setInterval(() => { if (!$('#researchPanel').classList.contains('rcollapsed')) loadResearch(); }, 120000);
 })();
 </script>
 </body>

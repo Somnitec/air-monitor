@@ -9,7 +9,7 @@
 
 DeviceConfig devconfig_load() {
     DeviceConfig cfg;
-    cfg.poll_interval_ms = 60000;  // default 60 s
+    cfg.poll_interval_ms = 10000;  // default 10 s (override from dashboard)
 
     if (!LittleFS.exists(CONFIG_FILE)) {
         return cfg;

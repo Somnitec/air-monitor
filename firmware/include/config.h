@@ -66,9 +66,13 @@
 // Drop to 16000 if you only care about levels below ~4 kHz and want less CPU.
 #define I2S_SAMPLE_RATE_HZ   48000
 #define MIC_FFT_SAMPLES      2048    // power of two; ~43 ms window @ 48 kHz
-// INMP441 sensitivity anchor: -26 dBFS @ 94 dB SPL  =>  SPL ~= dBFS + 120.
-// UNCALIBRATED — calibrate this offset against a reference meter for absolute dB.
-#define MIC_DBFS_TO_SPL_DB   120.0f
+// INMP441 SPL anchor: SPL ≈ dBFS + MIC_DBFS_TO_SPL_DB.
+// Field-calibrated 2026-06-28 against a phone SPL meter (two passes):
+//   pass 1: firmware 69 vs ref 30.4  → offset 81.4
+//   pass 2: our 5-min LAeq 25.4 vs ref 29 → +3.6  → offset 85.0
+// LAmax already tracked the phone closely; this aligns the LAeq average too.
+// Re-check against a class-2 meter for absolute accuracy when possible.
+#define MIC_DBFS_TO_SPL_DB   85.0f
 #define MIC_NOISE_FLOOR_DBA  33.0f   // datasheet equiv. input noise; can't read quieter
 
 // ---- SD card (VSPI defaults) ----
@@ -148,7 +152,7 @@
 // --- Baseline sampling cadence ---
 // One full record of every sensor at this interval. Adaptive (5–10 s) sampling
 // is Phase 2; Phase 1 is fixed-cadence on purpose to gather a clean baseline.
-#define SAMPLE_BASELINE_MS   60000UL    // 60 s
+#define SAMPLE_BASELINE_MS   10000UL    // 60 s
 
 // --- Accelerometer vibration capture ---
 // Poll at ~400 Hz (I2C overhead + gap ≈ 2.5 ms/sample), capture 512 samples (~1.3 s).
@@ -179,13 +183,14 @@
 #define RING_META_PATH       "/ring.meta"     // old ring metadata   (deleted on boot)
 
 // --- Duty-cycled sync + modes ---
-// NORMAL: WiFi off between sessions; attempt to offload every SYNC_ATTEMPT_INTERVAL_MS,
-//         or early once SYNC_THRESHOLD_RECORDS are buffered.
-// TESTING: WiFi stays on, every record pushed live. Entered/left via dashboard command.
-// BOOT_WINDOW: after every power-on WiFi is up for this long so a dashboard
-//              "enter testing" press lands immediately.
-#define SYNC_ATTEMPT_INTERVAL_MS  (15UL * 60UL * 1000UL)   // 15 min
-#define SYNC_THRESHOLD_RECORDS    120                       // early-trigger for bursts
+// NORMAL: offload every SYNC_ATTEMPT_INTERVAL_MS, or early once SYNC_THRESHOLD_RECORDS
+//         are buffered. WiFi stays on (mains-powered), so a short interval is cheap and
+//         keeps the dashboard ~live and makes pushed config/commands land within ~1 min.
+// TESTING: WiFi stays on, every record pushed live the instant it's sampled.
+// BOOT_WINDOW: after every power-on WiFi is up + syncs every 5 s so a dashboard
+//              command (e.g. enter testing / change interval) lands immediately.
+#define SYNC_ATTEMPT_INTERVAL_MS  (10UL * 1000UL)           // 10 s — near-live uploads
+#define SYNC_THRESHOLD_RECORDS    20                         // early-trigger for bursts
 #define BOOT_WINDOW_MS            (5UL * 60UL * 1000UL)      // 5 min
 
 // --- Time ---

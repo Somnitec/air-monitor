@@ -135,6 +135,9 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
     how loud, how often, which aircraft, day vs night, plane-noise correlation. They
     join readings↔aircraft by time proximity, so they only fill in once the mic is
     reporting noise_dba/lamax. Cheap to (re)define; nothing computes until queried."""
+    # Physically-plausible bounds so corrupted frames (old garbage like 222 dB / RH
+    # 404 % / PM 5000) never pollute the analysis — non-destructive (rows stay in the
+    # table; the views just ignore the impossible ones).
     conn.executescript(
         """
         -- Every reading at/above 65 dB(A), tagged with hour + night flag (23:00–07:00).
@@ -148,7 +151,7 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
                (CAST(strftime('%H', ts,'unixepoch','localtime') AS INTEGER) < 7 OR
                 CAST(strftime('%H', ts,'unixepoch','localtime') AS INTEGER) >= 23) AS night
         FROM readings
-        WHERE COALESCE(lamax, noise_dba) >= 65
+        WHERE COALESCE(lamax, noise_dba) BETWEEN 65 AND 140
         ORDER BY ts;
 
         -- Each loud-ish reading joined to the closest aircraft overhead within ±30 s.
@@ -166,7 +169,7 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
             SELECT a2.id FROM aircraft a2
             WHERE ABS(a2.ts - r.ts) <= 30
             ORDER BY a2.distance_km ASC LIMIT 1)
-        WHERE COALESCE(r.lamax, r.noise_dba) >= 60
+        WHERE COALESCE(r.lamax, r.noise_dba) BETWEEN 60 AND 140
         ORDER BY r.ts;
 
         -- Which aircraft TYPES are loudest (avg + peak), for types seen overhead (≤8 km).
@@ -178,7 +181,8 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
                round(MAX(COALESCE(r.lamax, r.noise_dba)), 1) AS max_dba
         FROM aircraft a
         JOIN readings r ON ABS(r.ts - a.ts) <= 15
-        WHERE a.distance_km <= 8 AND a.type IS NOT NULL AND r.noise_dba IS NOT NULL
+        WHERE a.distance_km <= 8 AND a.type IS NOT NULL
+          AND r.noise_dba BETWEEN 0 AND 140
         GROUP BY a.type
         HAVING n_samples >= 3
         ORDER BY avg_dba DESC;
@@ -195,17 +199,20 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
             (SELECT COUNT(DISTINCT hex) FROM aircraft
                WHERE date(ts,'unixepoch','localtime')=day AND distance_km<=10) AS flights,
             (SELECT round(MAX(COALESCE(lamax,noise_dba)),1) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day) AS max_db,
+               WHERE date(ts,'unixepoch','localtime')=day
+                 AND COALESCE(lamax,noise_dba) BETWEEN 0 AND 140) AS max_db,
             (SELECT COUNT(*) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba)>=65) AS n_ge65,
+               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba) BETWEEN 65 AND 140) AS n_ge65,
             (SELECT COUNT(*) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba)>=70) AS n_ge70,
+               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba) BETWEEN 70 AND 140) AS n_ge70,
             (SELECT COUNT(*) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba)>=65
+               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba) BETWEEN 65 AND 140
                  AND (CAST(strftime('%H',ts,'unixepoch','localtime') AS INTEGER)<7
                    OR CAST(strftime('%H',ts,'unixepoch','localtime') AS INTEGER)>=23)) AS n_ge65_night,
-            (SELECT round(AVG(pm25),1) FROM readings WHERE date(ts,'unixepoch','localtime')=day) AS avg_pm25,
-            (SELECT round(AVG(co2),0)  FROM readings WHERE date(ts,'unixepoch','localtime')=day) AS avg_co2
+            (SELECT round(AVG(pm25),1) FROM readings
+               WHERE date(ts,'unixepoch','localtime')=day AND pm25 BETWEEN 0 AND 1000) AS avg_pm25,
+            (SELECT round(AVG(co2),0)  FROM readings
+               WHERE date(ts,'unixepoch','localtime')=day AND co2 BETWEEN 0 AND 40000) AS avg_co2
         FROM days ORDER BY day DESC;
         """
     )
@@ -429,6 +436,33 @@ async def _start_mdns():
 
 
 # --------------------------------------------------------------------------- #
+# Optional Cloudflare Tunnel — start it alongside the server so the dashboard is
+# reachable remotely without port-forwarding. Opt in by setting CLOUDFLARED_TUNNEL
+# to your tunnel name (e.g. CLOUDFLARED_TUNNEL=air-monitor-tunnel). Runs
+# `cloudflared tunnel run <name>` as a child process and cleans it up on shutdown.
+# --------------------------------------------------------------------------- #
+import shutil
+import subprocess
+
+
+def _start_cloudflared():
+    name = os.environ.get("CLOUDFLARED_TUNNEL")
+    if not name:
+        return None
+    exe = shutil.which("cloudflared")
+    if not exe:
+        print("[tunnel] CLOUDFLARED_TUNNEL set but `cloudflared` is not installed — skipping")
+        return None
+    try:
+        proc = subprocess.Popen([exe, "tunnel", "run", name])
+        print(f"[tunnel] cloudflared tunnel run {name} (pid {proc.pid})")
+        return proc
+    except Exception as e:
+        print(f"[tunnel] failed to start cloudflared: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
 async def _broadcast_weather(observations) -> None:
@@ -472,6 +506,7 @@ async def lifespan(app: FastAPI):
     _conn = _init_db()
     print(f"[air-monitor] DB: {DB_PATH}")
     aiozc, info = await _start_mdns()
+    cloudflared = _start_cloudflared()   # opt-in remote access (CLOUDFLARED_TUNNEL=...)
 
     # Weather/air-quality importer: a background poll loop alongside mDNS.
     weather_config.load_dotenv(Path(__file__).parent / ".env")
@@ -514,6 +549,12 @@ async def lifespan(app: FastAPI):
     if aiozc is not None:
         await aiozc.async_unregister_service(info)
         await aiozc.async_close()
+    if cloudflared is not None:
+        cloudflared.terminate()
+        try:
+            cloudflared.wait(timeout=5)
+        except Exception:
+            cloudflared.kill()
     _conn.close()
 
 
@@ -663,6 +704,38 @@ async def stats():
         ).fetchone()
         nev = _conn.execute("SELECT COUNT(*) n FROM events").fetchone()["n"]
     return {"readings": row["n"], "first_ts": row["lo"], "last_ts": row["hi"], "events": nev}
+
+
+# ---- research / analysis views --------------------------------------------- #
+@app.get("/api/research/daily")
+async def research_daily(limit: int = 30):
+    """Per-day rollup: flights overhead, loudness, >65/>70 dB counts (incl. night),
+    avg PM2.5 / CO2. Backed by the `daily_summary` view."""
+    async with _db_lock:
+        rows = _conn.execute("SELECT * FROM daily_summary LIMIT ?", (int(limit),)).fetchall()
+    return JSONResponse([dict(r) for r in rows])
+
+
+@app.get("/api/research/loudness")
+async def research_loudness(limit: int = 25):
+    """Average + peak noise per aircraft type seen overhead — which types are loudest."""
+    async with _db_lock:
+        rows = _conn.execute("SELECT * FROM loudness_by_type LIMIT ?", (int(limit),)).fetchall()
+    return JSONResponse([dict(r) for r in rows])
+
+
+@app.get("/api/research/noise_events")
+async def research_noise_events(limit: int = 100, since: int | None = None):
+    """Loud readings attributed to the closest aircraft overhead at that moment.
+    Newest first. Backed by the `noise_with_aircraft` view."""
+    sql = "SELECT * FROM noise_with_aircraft"
+    args: list[Any] = []
+    if since is not None:
+        sql += " WHERE ts >= ?"; args.append(int(since))
+    sql += " ORDER BY ts DESC LIMIT ?"; args.append(int(limit))
+    async with _db_lock:
+        rows = _conn.execute(sql, args).fetchall()
+    return JSONResponse([dict(r) for r in rows])
 
 
 # ---- Dutch / EU aircraft noise statistics -------------------------------- #
@@ -941,17 +1014,25 @@ async def get_aircraft(range_km: float | None = None):
 
 @app.get("/api/aircraft/paths")
 async def aircraft_paths(range_km: float = 1.0, hours: float = 48.0):
-    """Historical sightings within range_km, for flight-path graphs."""
+    """Historical sightings within range_km, for flight-path graphs. `points` carry
+    per-sample geometry (incl. track, for direction chevrons); `meta` carries each
+    aircraft's identity once per hex (for the click-to-identify popup)."""
     since = int(time.time()) - int(min(hours, 168) * 3600)
     rows = aircraft_store.query(_conn, since=since, limit=200_000)
-    pts = [
-        {"hex": r["hex"], "flight": r["flight"], "ts": r["ts"],
-         "lat": r["lat"], "lon": r["lon"], "alt_baro": r["alt_baro"]}
-        for r in rows
-        if r["distance_km"] is not None and r["distance_km"] <= range_km
-        and r["lat"] is not None and r["lon"] is not None
-    ]
-    return JSONResponse({"points": pts})
+    pts = []
+    meta: dict[str, dict] = {}
+    for r in rows:
+        if r["distance_km"] is None or r["distance_km"] > range_km:
+            continue
+        if r["lat"] is None or r["lon"] is None:
+            continue
+        pts.append({"hex": r["hex"], "ts": r["ts"], "lat": r["lat"], "lon": r["lon"],
+                    "alt_baro": r["alt_baro"], "track": r["track"], "source": r["source"]})
+        m = meta.setdefault(r["hex"], {})
+        for k in ("flight", "type", "reg", "desc", "category", "operator", "year"):
+            if not m.get(k) and r[k] is not None:
+                m[k] = r[k]
+    return JSONResponse({"points": pts, "meta": meta})
 
 
 # ---- events (home mode) ---------------------------------------------------- #

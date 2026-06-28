@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS aircraft (
     desc        TEXT,                  -- model description (e.g. "AIRBUS A-320")
     category    TEXT,                  -- ADS-B emitter category (A3, A7, ...)
     year        TEXT,                  -- year of manufacture
-    source      TEXT DEFAULT 'local'   -- 'local' | 'public' | 'both'
+    source      TEXT DEFAULT 'sdr'     -- 'sdr' | 'public' | 'both'
 );
 CREATE INDEX IF NOT EXISTS idx_aircraft_ts  ON aircraft(ts);
 CREATE INDEX IF NOT EXISTS idx_aircraft_hex ON aircraft(hex);
@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_aircraft_hex ON aircraft(hex);
 
 # Columns added after the initial release; each gets a plain ALTER on older DBs.
 _ADDED_COLS = {
-    "source": "TEXT DEFAULT 'local'", "seen": "REAL", "operator": "TEXT",
+    "source": "TEXT DEFAULT 'sdr'", "seen": "REAL", "operator": "TEXT",
     "desc": "TEXT", "category": "TEXT", "year": "TEXT",
 }
 

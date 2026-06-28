@@ -95,7 +95,9 @@ static uint32_t g_bootStartMs    = 0;
 static uint32_t g_lastSyncAttempt = 0;
 
 static bool inBootWindow() { return (millis() - g_bootStartMs) < BOOT_WINDOW_MS; }
-static bool wifiShouldStayOn() { return g_mode == MODE_TESTING || inBootWindow(); }
+// Mains-powered: keep WiFi connected continuously (never duty-cycle/sleep it) so
+// uploads are immediate and the radio never misses the AP between sends.
+static bool wifiShouldStayOn() { return true; }
 
 struct WifiCred { const char* ssid; const char* pass; };
 #ifdef WIFI_NETWORKS
@@ -135,6 +137,17 @@ static float gasRs(float vout_mv, float rl_ohms) {
 // ---------------------------------------------------------------------------
 static bool timeIsValid() {
     return (uint32_t)time(nullptr) > EPOCH_VALID_AFTER;
+}
+// Wall-clock prefix for serial logs, e.g. "14:03:21Z ". Empty until the clock is
+// set (NTP or adopted server time), so logs stay readable before sync too.
+static String clockStr() {
+    if (!timeIsValid()) return String();
+    time_t t = time(nullptr);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    char buf[16];
+    strftime(buf, sizeof(buf), "%H:%M:%SZ ", &tm);
+    return String(buf);
 }
 static void syncTimeIfNeeded() {
     if (timeIsValid()) return;
@@ -316,7 +329,7 @@ static void buildFields(RecordFields& f) {
 
 // Print a human-readable snapshot of all sensor values in f to Serial.
 static void printFields(const RecordFields& f) {
-    Serial.printf("[snap] ts=%u up=%.1fs\n", f.ts, f.up_ms / 1000.0f);
+    Serial.printf("%s[snap] ts=%u up=%.1fs\n", clockStr().c_str(), f.ts, f.up_ms / 1000.0f);
     if (f.has_sen66)
         Serial.printf("  SEN66   PM1=%.1f PM2.5=%.1f PM4=%.1f PM10=%.1f ug/m3"
                       "  CO2=%u ppm  VOC=%.0f  NOx=%.0f  T=%.1fC  RH=%.1f%%\n",
@@ -356,7 +369,7 @@ static void printFields(const RecordFields& f) {
 
 // Comprehensive latest-capture serial logging.
 static void logCapturedValues(const RecordFields& f) {
-    Serial.printf("[latest] ts=%u up=%u.%us\n", f.ts, f.up_ms / 1000, (f.up_ms % 1000) / 100);
+    Serial.printf("%s[latest] ts=%u up=%u.%us\n", clockStr().c_str(), f.ts, f.up_ms / 1000, (f.up_ms % 1000) / 100);
 
     if (f.has_sen66)
         Serial.printf("  SEN66   PM2.5=%.1f PM10=%.1f ug/m3  CO2=%u ppm  T=%.1fC  RH=%.1f%%\n",
@@ -457,7 +470,7 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
             applyServerConfig(rdoc);
         }
         ringstore_mark_synced(lastSeq);
-        Serial.printf("[sync] %u acked (unsynced now %u)\n", n, ringstore_unsynced());
+        Serial.printf("%s[sync] %u acked (unsynced now %u)\n", clockStr().c_str(), n, ringstore_unsynced());
         ledPulse();
         return code;
     }
@@ -511,7 +524,12 @@ static void initSensors() {
     Serial.printf("  ADXL345: %s\n", present.adxl ? "ok" : "absent");
 
     if (i2cAck(ADDR_BH1750)) {
-        present.bh1750 = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, ADDR_BH1750);
+        // HIGH_RES_MODE_2 = 0.5 lx steps; raising MTreg to its max (254) pushes the
+        // resolution to ~0.11 lx so dim/near-dark light (moonlight, standby LEDs) is
+        // measurable instead of flooring at 0. Trade-off: max range drops to ~7000 lx,
+        // so only direct sunlight saturates — fine for this indoor/low-light station.
+        present.bh1750 = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE_2, ADDR_BH1750);
+        if (present.bh1750) bh1750.setMTreg(254);
     }
     Serial.printf("  BH1750:  %s\n", present.bh1750 ? "ok" : "absent");
 
@@ -615,8 +633,8 @@ void loop() {
         Record rec = record_pack(f);
         if (s_ringReady) {
             ringstore_push(rec);
-            Serial.printf("[rec] seq=%u ts=%u buffered=%u mode=%s\n",
-                          rec.seq, rec.ts, ringstore_unsynced(),
+            Serial.printf("%s[rec] seq=%u ts=%u buffered=%u mode=%s\n",
+                          clockStr().c_str(), rec.seq, rec.ts, ringstore_unsynced(),
                           g_mode == MODE_TESTING ? "testing" : "normal");
         } else {
             Serial.printf("[rec] ts=%u (ring not ready, discarding)\n", rec.ts);

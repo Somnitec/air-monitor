@@ -12,7 +12,7 @@ import sqlite3
 import time
 
 from . import store
-from .base import merge_sources, normalize, select_for_logging
+from .base import normalize, select_for_logging
 from .public import fetch_public
 from .source import read_source
 
@@ -20,21 +20,24 @@ from .source import read_source
 async def poll_once(conn: sqlite3.Connection, db_lock, *, settings: dict,
                     last_logged: dict[str, float], on_snapshot=None,
                     public_records: list | None = None):
-    """One tick: read the local readsb snapshot, locate aircraft relative to home,
-    merge in the cached `public_records` (cross-correlation), push via `on_snapshot`,
-    and log the locally-received aircraft due per the throttle. Returns the merged
-    records (empty list if neither feed is available)."""
+    """One tick. Our own RTL-SDR (readsb) is the source of truth: whenever its feed
+    is readable we show *only* its aircraft, tagged 'sdr'. The public reference feed
+    is a fallback used solely when the dongle/readsb is unavailable (file missing /
+    URL unreachable) — so unplugging the dongle transparently switches to internet
+    data, and plugging it back in switches straight back. Returns the snapshot."""
     s = settings
     raw = read_source(s["json_path"], s["json_url"])
-    local = ([] if raw is None
-             else normalize(raw, s["lat"], s["lon"], stale_sec=s["stale_sec"],
-                            max_range_km=s["max_range_km"], source="local"))
-    records = merge_sources(local, public_records) if public_records else local
+    if raw is not None:
+        # Dongle is feeding — trust it exclusively.
+        records = normalize(raw, s["lat"], s["lon"], stale_sec=s["stale_sec"],
+                            max_range_km=s["max_range_km"], source="sdr")
+    else:
+        # No local feed — fall back to the public reference feed (already tagged 'public').
+        records = list(public_records or [])
     if on_snapshot is not None:
         await on_snapshot(records)
     now = int(time.time())
-    # Log all received aircraft (local SDR + public reference feed) so the DB
-    # and side view populate even before readsb is running as a service.
+    # Log whatever we're actually showing, so the side view + path history populate.
     due = select_for_logging(records, last_logged, now=now, interval_sec=s["log_sec"])
     if due:
         async with db_lock:
@@ -55,8 +58,10 @@ async def _refresh_public(settings: dict) -> list:
 
 
 async def run_loop(conn: sqlite3.Connection, db_lock, *, settings: dict, on_snapshot=None):
-    """Poll the local readsb snapshot every `poll_sec`. When enabled, refresh the
-    public reference feed on its own slower cadence and merge it each tick."""
+    """Poll the local readsb snapshot every `poll_sec`. Keep a warm copy of the public
+    reference feed (refreshed on its own slower cadence) so that if the dongle drops,
+    `poll_once` can fall back to it instantly. While the dongle is feeding, the public
+    copy is just kept warm and never shown."""
     last_logged: dict[str, float] = {}
     public_records: list = []
     last_public = 0.0
