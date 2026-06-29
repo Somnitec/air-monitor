@@ -3,8 +3,9 @@ import asyncio
 import sqlite3
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from aircraft import store
+from aircraft import scheduler, store
 from aircraft.scheduler import poll_once
 
 FIXTURE = Path(__file__).parent / "fixtures" / "aircraft_sample.json"
@@ -53,6 +54,29 @@ class TestPollOnce(unittest.IsolatedAsyncioTestCase):
                                last_logged={})
         self.assertEqual(recs, [])
         self.assertEqual(self._count(), 0)
+
+    async def test_sdr_poll_runs_when_public_feed_is_down(self):
+        """No internet: the public refresh raises, but the local SDR poll must still
+        run (the readsb feed needs no internet) and the stale public copy is dropped."""
+        seen = {}
+        settings = _settings(public_enabled=True, public_poll_sec=0.0, poll_sec=0.0)
+
+        async def boom(_s):                       # internet unreachable
+            raise RuntimeError("no internet")
+
+        async def fake_poll(conn, lock, *, settings, last_logged,
+                            on_snapshot=None, public_records=None):
+            seen["reached"] = True
+            seen["public_records"] = public_records
+            raise asyncio.CancelledError          # break out of the infinite loop
+
+        with patch.object(scheduler, "_refresh_public", boom), \
+             patch.object(scheduler, "poll_once", fake_poll):
+            with self.assertRaises(asyncio.CancelledError):
+                await scheduler.run_loop(self.conn, self.lock, settings=settings)
+
+        self.assertTrue(seen.get("reached"))      # SDR poll ran despite the public failure
+        self.assertEqual(seen["public_records"], [])  # stale internet copy dropped
 
 
 if __name__ == "__main__":

@@ -12,9 +12,25 @@
 #include <stdint.h>
 #include <ArduinoJson.h>   // header-only; record_to_json takes a real JsonDocument
 
-static constexpr uint8_t  RECORD_SCHEMA_VERSION = 2;
+static constexpr uint8_t  RECORD_SCHEMA_VERSION = 3;   // v3: per-group tri-state status word
 static constexpr int      REC_NBANDS      = 9;   // must match MIC_NBANDS
 static constexpr int      REC_ACCEL_BANDS = 6;   // must match ACCEL_NBANDS: 4,8,16,31.5,63,125 Hz
+
+// ---- per-sensor-group status (v3) ----
+// Each group records one of four states so the server can tell "no new value"
+// (carry the last one forward) from "sensor returned bad data" (a real gap, NULL)
+// from "sensor not installed" (omit). Packed 2 bits per group into Record.status2.
+enum FieldStatus : uint8_t {
+    FS_ABSENT    = 0,   // sensor not present on this unit
+    FS_OK        = 1,   // freshly read this record, value valid
+    FS_UNCHANGED = 2,   // not re-read this cycle — value carried forward (omit on wire)
+    FS_INVALID   = 3,   // present but read failed / out of range — a real gap (null on wire)
+};
+enum RecGroup : uint8_t {
+    GRP_SEN66 = 0, GRP_BH1750, GRP_BME, GRP_ADXL,
+    GRP_CO, GRP_HCHO, GRP_SOIL, GRP_BATTERY, GRP_MIC,
+    REC_NGROUPS                                   // = 9; uses 18 bits of status2
+};
 
 // ---- flag bits ----
 enum : uint16_t {
@@ -38,8 +54,9 @@ struct Record {
     uint32_t seq;          // monotonic record number
     uint32_t ts;           // unix epoch (UTC); < EPOCH_VALID_AFTER => clock unsynced
     uint32_t up_ms;        // millis() at capture
-    uint16_t flags;        // FLAG_* | PRESENT_*
+    uint16_t flags;        // FLAG_* | PRESENT_* (present bit = status != FS_ABSENT)
     uint16_t boot;         // low 16 bits of per-boot id
+    uint32_t status2;      // v3: FieldStatus per RecGroup, 2 bits each (bits 2*g, 2*g+1)
 
     uint16_t pm1, pm25, pm4, pm10;  // ug/m3 x10
     uint16_t co2;                   // ppm
@@ -75,14 +92,20 @@ struct Record {
 };
 #pragma pack(pop)
 
-static constexpr unsigned RECORD_SIZE = 84;
-static_assert(sizeof(Record) == RECORD_SIZE, "Record must be tightly packed to 84 bytes");
+static constexpr unsigned RECORD_SIZE = 88;
+static_assert(sizeof(Record) == RECORD_SIZE, "Record must be tightly packed to 88 bytes");
 
 // Plain (Arduino-free) inputs to pack. firmware.cpp fills this from live sensors.
 struct RecordFields {
     uint32_t seq = 0, ts = 0, up_ms = 0;
     uint16_t boot = 0;
     bool ts_ok = false, bat_cal = false, noise_clip = false;
+
+    // Per-group state (v3). Authoritative source for pack/unpack/json; the has_*
+    // bools below are kept as a convenience mirror (true when a value is available,
+    // i.e. status is FS_OK or FS_UNCHANGED) for the serial snapshot printers.
+    uint8_t status[REC_NGROUPS] = { FS_ABSENT, FS_ABSENT, FS_ABSENT, FS_ABSENT,
+                                    FS_ABSENT, FS_ABSENT, FS_ABSENT, FS_ABSENT, FS_ABSENT };
 
     bool  has_sen66 = false;
     float pm1 = 0, pm25 = 0, pm4 = 0, pm10 = 0, voc = 0, nox = 0, temp = 0, rh = 0;

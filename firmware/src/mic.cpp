@@ -27,6 +27,11 @@ const float MIC_BAND_CENTERS[MIC_NBANDS] =
 static const i2s_port_t I2S_PORT = I2S_NUM_0;
 static const float FULL_SCALE = 8388608.0f;   // 2^23, magnitude of full-scale 24-bit
 
+// Active sample rate. Defaults to the compile-time rate; POWER_SAVING lowers it at
+// runtime via mic_set_rate() to halve FFT CPU. The band/bin math reads this, not the
+// macro, so a rate change takes effect on the next capture.
+static uint32_t s_sampleRate = I2S_SAMPLE_RATE_HZ;
+
 // Working buffers (static: live off the stack, reused across windows).
 static int32_t  s_raw[MIC_FFT_SAMPLES];
 static float    s_vReal[MIC_FFT_SAMPLES];
@@ -79,6 +84,18 @@ bool mic_begin() {
     };
     if (i2s_driver_install(I2S_PORT, &cfg, 0, nullptr) != ESP_OK) return false;
     if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) return false;
+    s_sampleRate = I2S_SAMPLE_RATE_HZ;
+    return true;
+}
+
+// Change the I2S clock at runtime (POWER_SAVING uses a lower rate to cut FFT CPU).
+// No-op if the rate is unchanged. Returns false on driver error (rate left as-was).
+bool mic_set_rate(uint32_t hz) {
+    if (hz == s_sampleRate) return true;
+    // 32-bit slots, single (mono) channel — must match mic_begin()'s i2s_config_t.
+    if (i2s_set_clk(I2S_PORT, hz, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO) != ESP_OK)
+        return false;
+    s_sampleRate = hz;
     return true;
 }
 
@@ -117,7 +134,7 @@ static float processWindow(double& totPowerA, double& totPowerC, double& totPowe
     s_fft.compute(FFTDirection::Forward);
     s_fft.complexToMagnitude();
 
-    const float binHz = (float)I2S_SAMPLE_RATE_HZ / (float)MIC_FFT_SAMPLES;
+    const float binHz = (float)s_sampleRate / (float)MIC_FFT_SAMPLES;
     for (int i = 1; i < MIC_FFT_SAMPLES / 2; ++i) {
         const float f = i * binHz;
         if (f < 22.0f) continue;

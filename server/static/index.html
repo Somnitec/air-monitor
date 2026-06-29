@@ -206,6 +206,15 @@
     #pathSideWrap { flex-basis:100%; width:100%; border-right:none; border-bottom:1px solid var(--line); }
     #pathSide { height:240px; width:100%; }
     .actablewrap { border-left:none; border-top:1px solid var(--line); } }
+  /* closest-approach scatter in the aircraft panel */
+  #approachScatterWrap { padding:6px 10px 4px; border-top:1px solid var(--line); }
+  #approachScatterTitle { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); margin-bottom:2px; }
+  #approachScatter { height:160px; }
+  /* permanent Leaflet tooltips for path endpoints */
+  .path-end-tip { background:rgba(14,17,23,0.88) !important; border:1px solid #252a35 !important;
+    color:#e6e9ef !important; font:10px/1.4 system-ui !important; white-space:nowrap !important;
+    box-shadow:none !important; padding:2px 6px !important; border-radius:4px !important; }
+  .path-end-tip::before { display:none !important; }
 </style>
 </head>
 <body>
@@ -241,10 +250,14 @@
     <div id="acmap"></div>
     <div class="actablewrap">
       <table class="actable">
-        <thead><tr><th></th><th>Flight</th><th>Airline</th><th>Kind</th><th>Model</th><th>Wt</th><th>Age</th><th>Alt (ft)</th><th>Spd (kt)</th><th>Dist (km)</th><th title="Bearing from station">Dir °</th><th></th></tr></thead>
+        <thead><tr><th></th><th>Flight</th><th>Airline</th><th>Kind</th><th>Model</th><th>Wt</th><th>Age</th><th>Alt (m)</th><th>Spd (km/h)</th><th>Dist (km)</th><th title="Bearing from station">Dir °</th><th title="Origin → Destination">Route</th><th></th></tr></thead>
         <tbody id="acRows"></tbody>
       </table>
     </div>
+  </div>
+  <div id="approachScatterWrap">
+    <div id="approachScatterTitle">Closest approach per aircraft · selected window</div>
+    <div id="approachScatter"></div>
   </div>
 </div>
 
@@ -301,6 +314,13 @@
         <option value="30">Live · every 30 s</option>
         <option value="60">Every 1 min</option>
         <option value="300">Every 5 min</option>
+      </select>
+      <label style="margin-top:8px">Power mode <span id="modeHint" style="color:var(--mut)">— mains vs. battery</span></label>
+      <select id="deviceMode" title="Pushed to the ESP32 like the interval. NORMAL/TESTING keep WiFi always on (mains). POWER_SAVING duty-cycles WiFi, light-sleeps between captures, and gates the gas heaters + SEN66 — for battery operation. Applied within ~1 min (or its next sync in power-saving).">
+        <option value="" selected>— (leave as configured)</option>
+        <option value="normal">Normal (mains)</option>
+        <option value="testing">Testing (live stream)</option>
+        <option value="power_saving">Power saving (battery)</option>
       </select>
     </section>
 
@@ -556,6 +576,7 @@ async function query() {
   checkBattery(); updateCo2Badge();
   loadStats();
   if (typeof loadFlightPaths === 'function') loadFlightPaths();   // map paths follow the window
+  if (typeof drawClosestApproachScatter === 'function') drawClosestApproachScatter();
   // Seed the last-reading indicator from the newest loaded reading
   _lastReadingTs = 0;
   if (dataCache.length) _serialPush(dataCache[dataCache.length - 1]);
@@ -832,12 +853,23 @@ function connectWS() {
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.onopen  = () => { $('#livedot').classList.add('live'); $('#livetxt').textContent = 'live'; };
   ws.onclose = () => { $('#livedot').classList.remove('live'); $('#livetxt').textContent = 'reconnecting…'; setTimeout(connectWS, 2000); };
+  let _renderPending = false;
+  function _scheduleRender() {
+    if (!_renderPending) {
+      _renderPending = true;
+      requestAnimationFrame(() => {
+        _renderPending = false;
+        render(); checkBattery(); updateCo2Badge(); loadStats();
+      });
+    }
+  }
+
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'aircraft') { renderSdr(msg.sdr); updateAircraft(msg.data); return; }
     if (msg.type === 'weather')  { Object.assign(_weatherLatest, msg.data); _weatherLatest._source = msg.data.source || _weatherLatest._source; renderWeather(); return; }
     if (!live) return;
-    if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); render(); checkBattery(); updateCo2Badge(); loadStats(); _serialPush(msg.data); }
+    if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); _scheduleRender(); _serialPush(msg.data); }
     if (msg.type === 'device')  { /* device mode changes silently ignored (section removed) */ }
     if (msg.type === 'event')   {
       eventsCache.push(msg.data); render();
@@ -1038,6 +1070,26 @@ $('#sensorIntvl').onchange = async function() {
     : `— every ${secs}s (applies within ~1 min)`;
 };
 
+// Explicit power-mode override → pushed to every known device. NORMAL/TESTING keep
+// WiFi always on (mains); POWER_SAVING duty-cycles WiFi + gates sensors for battery.
+// In power-saving the board only checks in every few minutes, so a mode change lands
+// on its next sync rather than within ~1 min.
+$('#deviceMode').onchange = async function() {
+  const mode = this.value;
+  if (!mode) return;
+  let devices = [];
+  try { devices = (await (await fetch('/api/devices')).json()).map(d => d.dev); } catch (_) {}
+  if (!devices.length) { $('#modeHint').textContent = '— no device has reported in yet'; return; }
+  await Promise.all(devices.map(dev =>
+    fetch(`/api/device/${encodeURIComponent(dev)}/mode`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ mode }),
+    })));
+  $('#modeHint').textContent = mode === 'power_saving'
+    ? '— battery mode (applies on next sync, ~5 min)'
+    : `— ${mode} (applies within ~1 min)`;
+};
+
 // Home / plane mode toggle
 let _appMode = 'plane';   // always start in airplane mode
 function applyMode(m) {
@@ -1078,9 +1130,155 @@ document.addEventListener('visibilitychange', () => {
 });
 
 
+// ---- aircraft helpers -------------------------------------------------------
+
+// 16-point compass from bearing degrees
+function _compassDir(deg) {
+  const d = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+  return d[Math.round(((deg % 360) + 360) % 360 / 22.5) % 16];
+}
+
+// Closest-approach point between two consecutive path readings p0→p1 and home.
+// Returns { t, distKm, ts } where t ∈ [0,1] and ts is the interpolated Unix timestamp.
+function _interpClosestApproach(p0, p1, hLat, hLon) {
+  const lonKm = Math.cos(hLat * Math.PI / 180) * 111.32;
+  const ax = (p0.lat - hLat) * 111.32, ay = (p0.lon - hLon) * lonKm;
+  const bx = (p1.lat - hLat) * 111.32, by = (p1.lon - hLon) * lonKm;
+  const dx = bx - ax, dy = by - ay, len2 = dx*dx + dy*dy;
+  if (len2 < 1e-10) return { t:0, distKm: Math.hypot(ax, ay), ts: p0.ts };
+  const t = Math.max(0, Math.min(1, -(ax*dx + ay*dy) / len2));
+  return { t, distKm: Math.hypot(ax + t*dx, ay + t*dy), ts: p0.ts + t*(p1.ts - p0.ts) };
+}
+
+// For each aircraft in the window, compute interpolated min distance and ts.
+// maxDistKm: if set, only include aircraft whose closest point was ≤ maxDistKm.
+function _computeClosestApproaches(since, until, maxDistKm = null) {
+  if (!acHome || !_pathData.length) return [];
+  const [hLat, hLon] = acHome;
+  const grouped = _groupByHex(_pathData);
+  const out = [];
+  for (const [hex, pts] of Object.entries(grouped)) {
+    const win = pts.filter(p => p.lat != null && p.lon != null
+                             && (!since || p.ts >= since) && (!until || p.ts <= until));
+    if (!win.length) continue;
+    let minDist = Infinity, minTs = null;
+    for (let i = 0; i < win.length; i++) {
+      const d = haversineKm(hLat, hLon, win[i].lat, win[i].lon);
+      if (d < minDist) { minDist = d; minTs = win[i].ts; }
+      if (i + 1 < win.length) {
+        const ca = _interpClosestApproach(win[i], win[i+1], hLat, hLon);
+        if (ca.distKm < minDist) { minDist = ca.distKm; minTs = ca.ts; }
+      }
+    }
+    if (maxDistKm != null && minDist > maxDistKm) continue;
+    out.push({ hex, flight: (_pathMeta[hex] || {}).flight || hex, distKm: minDist, ts: minTs });
+  }
+  return out.sort((a, b) => a.ts - b.ts);
+}
+
+// Highlight the table row for `hex`; pass on=false to clear all selections.
+// Also thickens the map path and redraws the side view so all three panels stay in sync.
+function _highlightRow(hex, on) {
+  const NORM_HIST  = {weight:1.5, opacity:0.55};
+  const NORM_TRAIL = {weight:2,   opacity:0.65};
+  const HI_HIST    = {weight:3,   opacity:0.85};
+  const HI_TRAIL   = {weight:4,   opacity:0.90};
+
+  const _setMapStyle = (h, hist, trail) => {
+    const ml = _mapPathLines[h]; if (ml) ml.setStyle(hist);
+    const pc = _predCurves[h];
+    if (pc?.trail) pc.trail.setStyle(trail);
+    if (pc?.pred)  pc.pred.setStyle({weight: trail.weight * 0.75, opacity: trail.opacity * 0.75});
+  };
+
+  if (on) {
+    if (_highlightedHex && _highlightedHex !== hex) _setMapStyle(_highlightedHex, NORM_HIST, NORM_TRAIL);
+    _highlightedHex = hex;
+    _setMapStyle(hex, HI_HIST, HI_TRAIL);
+  } else {
+    if (_highlightedHex === hex) {
+      _setMapStyle(hex, NORM_HIST, NORM_TRAIL);
+      _highlightedHex = null;
+    }
+  }
+  $('#acRows').querySelectorAll('tr[data-hex]').forEach(r => {
+    r.classList.toggle('selected', on && r.dataset.hex === hex);
+  });
+  drawSideView();
+}
+
 // ---- aircraft (ADS-B live map + table) ------------------------------------
 let acMap, acRing, acIcons = {}, _predCurves = {}, _acAnimState = {}, acData = [], acHome = null;
 let acRange = 5;   // always start at 5 km
+let _highlightedHex = null;   // hex currently highlighted across all panels
+let _routeInfo = {};           // hex -> {from, to, fromCity, toCity} route info
+let _routeFetched = new Set(); // callsigns already queried (avoid re-fetching)
+
+// ICAO airport code → city name (major airports serving European hub traffic)
+const ICAO_CITY = {
+  EHAM:'Amsterdam', EHRD:'Rotterdam', EHBK:'Maastricht',
+  EGLL:'London', EGKK:'London Gatwick', EGSS:'London Stansted', EGGW:'London Luton', EGLC:'London City',
+  LFPG:'Paris CDG', LFPO:'Paris Orly', LFMN:'Nice', LFLL:'Lyon', LFBO:'Toulouse',
+  EDDF:'Frankfurt', EDDM:'Munich', EDDB:'Berlin', EDDL:'Düsseldorf', EDDS:'Stuttgart', EDDH:'Hamburg', EDDC:'Dresden',
+  LEMD:'Madrid', LEBL:'Barcelona', LEPA:'Palma', LEAL:'Alicante', LEMG:'Malaga', LEVC:'Valencia',
+  LIRF:'Rome', LIML:'Milan Linate', LIMC:'Milan Malpensa', LIPZ:'Venice', LIRN:'Naples',
+  EBBR:'Brussels', ELLX:'Luxembourg', EBCI:'Charleroi',
+  EKCH:'Copenhagen', ESSA:'Stockholm', ESGG:'Gothenburg', ESMS:'Malmö',
+  ENGM:'Oslo', ENBR:'Bergen', ENTC:'Tromsø', ENKB:'Kristiansund',
+  EFHK:'Helsinki', EFTP:'Tampere',
+  BIKF:'Reykjavik', BIRK:'Reykjavik City',
+  EPWA:'Warsaw', EPKK:'Krakow', EPGD:'Gdansk',
+  LKPR:'Prague', LZIB:'Bratislava', LHBP:'Budapest',
+  LOWW:'Vienna', LSZH:'Zurich', LSGG:'Geneva', LSZB:'Bern',
+  LDZA:'Zagreb', LJLJ:'Ljubljana', LYBE:'Belgrade',
+  LGAV:'Athens', LGTS:'Thessaloniki', LGRP:'Rhodes', LGKR:'Corfu',
+  LTBA:'Istanbul Atatürk', LTFM:'Istanbul', LTAI:'Antalya', LTBJ:'Izmir',
+  UKBB:'Kyiv Boryspil', UKKK:'Kyiv Zhuliany',
+  UMMS:'Minsk', EVRA:'Riga', EYVI:'Vilnius', EETN:'Tallinn',
+  UUEE:'Moscow Sheremetyevo', UUDD:'Moscow Domodedovo', ULLI:'St Petersburg',
+  OMDB:'Dubai', OMAA:'Abu Dhabi', OTHH:'Doha', OERK:'Riyadh', OEDF:'Dammam', OOMS:'Muscat',
+  LLBG:'Tel Aviv', HECA:'Cairo', DTTA:'Tunis', DAAG:'Algiers', GMMN:'Casablanca',
+  FACT:'Cape Town', FAOR:'Johannesburg', HAAB:'Addis Ababa', DNMM:'Lagos', HSSS:'Khartoum',
+  KATL:'Atlanta', KJFK:'New York JFK', KLAX:'Los Angeles', KORD:'Chicago', KDFW:'Dallas',
+  KIAH:'Houston', KSFO:'San Francisco', KMIA:'Miami', KBOS:'Boston', KIAD:'Washington Dulles',
+  CYVR:'Vancouver', CYYZ:'Toronto', CYUL:'Montreal', CYYC:'Calgary',
+  SBGR:'São Paulo', SCEL:'Santiago', SEQM:'Quito', SKBO:'Bogotá', SPIM:'Lima',
+  VHHH:'Hong Kong', RJTT:'Tokyo Haneda', RJAA:'Tokyo Narita', RKSI:'Seoul Incheon',
+  WSSS:'Singapore', VTBS:'Bangkok', VOMM:'Chennai', VIDP:'Delhi', VABB:'Mumbai',
+  YSSY:'Sydney', YMML:'Melbourne', YBBN:'Brisbane', NZAA:'Auckland',
+  WMKK:'Kuala Lumpur', RPLL:'Manila', WIII:'Jakarta',
+  ZBAA:'Beijing Capital', ZSPD:'Shanghai Pudong', ZGGG:'Guangzhou', ZUCK:'Chongqing',
+};
+
+async function _fetchRoute(callsign) {
+  if (!callsign || _routeFetched.has(callsign)) return;
+  _routeFetched.add(callsign);
+  try {
+    const r = await fetch(`/api/route?callsign=${encodeURIComponent(callsign)}`);
+    if (!r.ok) return;
+    const data = await r.json();
+    const route = data.route || [];
+    if (route.length < 2) return;
+    const fromCity = ICAO_CITY[route[0]] || route[0];
+    const toCity   = ICAO_CITY[route[route.length - 1]] || route[route.length - 1];
+    // Find any hex using this callsign and store city names
+    for (const [hex, ri] of Object.entries(_routeInfo)) {
+      const flight = (_pathMeta[hex] || {}).flight || (acData || []).find(a => a.hex === hex)?.flight;
+      if ((flight || '').trim().toUpperCase() === callsign) {
+        ri.fromCity = fromCity;
+        ri.toCity   = toCity;
+      }
+    }
+    // Also pre-populate for live aircraft not yet in _routeInfo
+    for (const a of (acData || [])) {
+      if ((a.flight || '').trim().toUpperCase() === callsign) {
+        if (!_routeInfo[a.hex]) _routeInfo[a.hex] = {};
+        _routeInfo[a.hex].fromCity = fromCity;
+        _routeInfo[a.hex].toCity   = toCity;
+      }
+    }
+  } catch (_) {}
+}
 const fmtKm = km => km < 1 ? `${Math.round(km * 1000)} m` : `${km} km`;
 const fitToRing = () => { if (acMap && acRing) acMap.fitBounds(acRing.getBounds(), { padding:[20, 20] }); };
 
@@ -1204,10 +1402,15 @@ function _pathPopupHtml(hex) {
   const airline = acAirline(m.flight), kind = acKind(m.category, m.flight);
   const wt = acWeight(m.type, m.category), age = acAge(m.year);
   const flightId = (m.flight || '').trim();
+  const ri = _routeInfo[hex];
+  const fromName = ri ? (ri.fromCity || ri.from || '?') : null;
+  const toName   = ri ? (ri.toCity   || ri.to   || '?') : null;
+  const routeLine = ri ? `<br><small>${fromName} → ${toName}${ri.fromAMS ? ' · ' + ri.fromAMS : ''}${ri.toAMS ? ' · ' + ri.toAMS : ''}</small>` : '';
   return `<b>${flightId || hex}</b>${flag ? ' ' + flag : ''}`
     + `${airline ? ' · ' + airline : ''}${kind ? ' <small>(' + kind + ')</small>' : ''}<br>`
     + `${m.desc || m.type || '—'}${wt ? ' · ' + wt : ''}${age ? ' · ' + age : ''}`
-    + (m.operator ? `<br><small>${m.operator}</small>` : '');
+    + (m.operator ? `<br><small>${m.operator}</small>` : '')
+    + routeLine;
 }
 
 function _pathColor(p) {
@@ -1284,9 +1487,21 @@ function drawMapPaths() {
   for (const [hex, pts] of Object.entries(groups)) {
     const lls = pts.map(p => [p.lat, p.lon]);
     const col = _pathColor({ type: _pathMeta[hex]?.type, hex });
+    // Compute from/to compass directions from the track endpoints for the table Route column.
+    if (pts.length >= 2) {
+      const p0 = pts[0], p1 = pts[1], pN2 = pts[pts.length-2], pN = pts[pts.length-1];
+      const fromHdg = _bearing(p0.lat, p0.lon, p1.lat, p1.lon);
+      const toHdg   = _bearing(pN2.lat, pN2.lon, pN.lat, pN.lon);
+      if (!_routeInfo[hex]) _routeInfo[hex] = {};
+      _routeInfo[hex].from = _compassDir((fromHdg + 180) % 360);
+      _routeInfo[hex].to   = _compassDir(toHdg);
+    }
     _mapPathLines[hex] = _fadedPath(_mapPathLines[hex], lls, {color:col, weight:1.5, opacity:0.55});
-    if (_mapPathLines[hex]) _mapPathLines[hex].bindPopup(() => _pathPopupHtml(hex));  // lazy: read _pathMeta at click time
-    else { delete _mapPathLines[hex]; }
+    if (_mapPathLines[hex]) {
+      _mapPathLines[hex].bindTooltip(() => _pathPopupHtml(hex), { sticky:true, direction:'top' });
+      _mapPathLines[hex].on('mouseover', () => _highlightRow(hex, true));
+      _mapPathLines[hex].on('mouseout',  () => _highlightRow(hex, false));
+    } else { delete _mapPathLines[hex]; }
 
     // Drop a heading chevron at logged readings (decluttered by global stride + spacing).
     let last = null;
@@ -1320,10 +1535,15 @@ async function loadFlightPaths() {
     const j = await resp.json();
     _pathData = j.points || [];
     _pathMeta = j.meta || {};
+    // Kick off route lookups for historical tracks.
+    for (const m of Object.values(_pathMeta)) {
+      if (m.flight) _fetchRoute(m.flight.trim().toUpperCase());
+    }
   } catch (_) { return; }
   drawMapPaths();
   drawSideView();
   drawPredPaths();
+  drawClosestApproachScatter();
 }
 
 function _hexColor(hex) {
@@ -1374,14 +1594,15 @@ function drawSideView() {
   _sideXform = { hLon, lonKm, PAD_L, PAD_R, PAD_T, PAD_B, drawW, drawH, ceilAlt };
   const toXY = (lon, alt) => _sideXY(lon, alt);
 
-  // altitude grid
+  // altitude grid (internal values in ft, labels shown in m)
   const step = ceilAlt <= 10000 ? 2000 : ceilAlt <= 20000 ? 5000 : 10000;
   for (let a = 0; a <= ceilAlt; a += step) {
     const y = PAD_T + drawH - a / ceilAlt * drawH;
     ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(W-PAD_R, y);
     ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 1; ctx.stroke();
     ctx.fillStyle = 'rgba(255,255,255,.28)'; ctx.font = '8px sans-serif'; ctx.textAlign = 'right';
-    ctx.fillText(a === 0 ? '0' : (a/1000)+'k', PAD_L-2, y+3);
+    const mAlt = Math.round(a * 0.3048);
+    ctx.fillText(mAlt === 0 ? '0' : mAlt >= 1000 ? (mAlt/1000).toFixed(1)+'k' : mAlt, PAD_L-2, y+3);
   }
 
   // "you are here" vertical
@@ -1396,22 +1617,37 @@ function drawSideView() {
   ctx.fillStyle = 'rgba(255,255,255,.3)'; ctx.font = '9px sans-serif';
   ctx.textAlign = 'left';  ctx.fillText('W', PAD_L+2, PAD_T-3);
   ctx.textAlign = 'right'; ctx.fillText('E', W-PAD_R-2, PAD_T-3);
-  ctx.textAlign = 'left';  ctx.fillText('ft', 0, PAD_T+3);
+  ctx.textAlign = 'left';  ctx.fillText('m', 0, PAD_T+3);
 
   if (!_pathData.length) {
     ctx.fillStyle = 'rgba(255,255,255,.2)'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
     ctx.fillText('no local data yet', W/2, H/2+4);
   } else {
-    for (const [hex, pts] of Object.entries(_groupByHex(_pathData))) {
+    const grouped = _groupByHex(_pathData);
+    for (const [hex, pts] of Object.entries(grouped)) {
+      if (hex === _highlightedHex) continue;   // draw on top after the others
       const validPts = pts.filter(p => p.alt_baro != null);
       if (!validPts.length) continue;
-      ctx.strokeStyle = _hexColor(hex); ctx.lineWidth = 1.5; ctx.beginPath();
+      ctx.strokeStyle = _pathColor({ type: _pathMeta[hex]?.type, hex }); ctx.lineWidth = 1.5; ctx.beginPath();
       let first = true;
       for (const p of validPts) {
         const [x, y] = toXY(p.lon, p.alt_baro);
         first ? ctx.moveTo(x, y) : ctx.lineTo(x, y); first = false;
       }
       ctx.stroke();
+    }
+    // Selected track redrawn last at double weight so it reads over all others.
+    if (_highlightedHex) {
+      const selPts = (grouped[_highlightedHex] || []).filter(p => p.alt_baro != null);
+      if (selPts.length > 1) {
+        ctx.strokeStyle = _pathColor({ type: _pathMeta[_highlightedHex]?.type, hex: _highlightedHex }); ctx.lineWidth = 3; ctx.beginPath();
+        let first = true;
+        for (const p of selPts) {
+          const [x, y] = toXY(p.lon, p.alt_baro);
+          first ? ctx.moveTo(x, y) : ctx.lineTo(x, y); first = false;
+        }
+        ctx.stroke();
+      }
     }
   }
 
@@ -1482,8 +1718,8 @@ $('#pathSide').addEventListener('click', e => {
     `<b>${(info.flight || '').trim() || info.hex}</b>${flag ? ' ' + flag : ''}`,
     airline || kind ? `${airline}${airline && kind ? ' · ' : ''}${kind}` : '',
     info.desc || info.type || '',
-    info.alt_baro != null ? `Alt ${info.alt_baro} ft · ${trend}` : '',
-    info.gs != null ? `Spd ${Math.round(info.gs)} kt` : '',
+    info.alt_baro != null ? `Alt ${Math.round(info.alt_baro * 0.3048)} m · ${trend}` : '',
+    info.gs != null ? `Spd ${Math.round(info.gs * 1.852)} km/h` : '',
     info.distance_km != null ? `Dist ${(+info.distance_km).toFixed(1)} km` : '',
     `<span style="color:var(--mut)">via ${srcTxt}</span>`,
   ].filter(Boolean);
@@ -1502,14 +1738,76 @@ $('#pathSide').addEventListener('click', e => {
   // also reflect on the map + table
   if (ac && ac.lat != null && acMap)
     acMap.setView([ac.lat, ac.lon], Math.max(acMap.getZoom(), 11), {animate:true});
-  if (acIcons[closestHex]) acIcons[closestHex].openPopup();
+  if (acIcons[closestHex]) acIcons[closestHex].openTooltip();
+  _highlightRow(closestHex, true);
   const tr = $('#acRows').querySelector(`tr[data-hex="${closestHex}"]`);
-  if (tr) {
-    $('#acRows').querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
-    tr.classList.add('selected');
-    tr.scrollIntoView({ behavior:'smooth', block:'nearest' });
-  }
+  if (tr) tr.scrollIntoView({ behavior:'smooth', block:'nearest' });
 });
+
+// Side-view hover: show info box on mousemove without clicking.
+let _sideHoverHex = null;
+$('#pathSide').addEventListener('mousemove', e => {
+  if (!_sideXform) return;
+  const cv = e.target;
+  const rect = cv.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (cv.width / rect.width);
+  const my = (e.clientY - rect.top)  * (cv.height / rect.height);
+
+  let closestHex = null, minDist = Infinity;
+  for (const [hex, pts] of Object.entries(_groupByHex(_pathData))) {
+    const vp = pts.filter(p => p.alt_baro != null && p.lon != null);
+    for (let i = 0; i < vp.length - 1; i++) {
+      const [x1, y1] = _sideXY(vp[i].lon,   vp[i].alt_baro);
+      const [x2, y2] = _sideXY(vp[i+1].lon, vp[i+1].alt_baro);
+      const d = _ptSegDist(mx, my, x1, y1, x2, y2);
+      if (d < minDist) { minDist = d; closestHex = hex; }
+    }
+  }
+  for (const a of (acData || [])) {
+    if (a.lon == null || a.alt_baro == null || a.distance_km == null || a.distance_km > acRange) continue;
+    const [x, y] = _sideXY(a.lon, a.alt_baro);
+    const d = Math.hypot(mx - x, my - y);
+    if (d < minDist) { minDist = d; closestHex = a.hex; }
+  }
+
+  if (!closestHex || minDist > 18) {
+    if (_sideHoverHex) { _sideHideInfo(); _sideHoverHex = null; }
+    return;
+  }
+
+  _sideHoverHex = closestHex;
+  const ac = (acData || []).find(a => a.hex === closestHex);
+  const hist = (_groupByHex(_pathData)[closestHex] || []);
+  const last = hist.length ? hist[hist.length - 1] : null;
+  const info = ac || last || { hex: closestHex };
+  const { flag } = _regFlag(info.reg);
+  const airline = acAirline(info.flight);
+  const kind = acKind(info.category, info.flight);
+  const vr = info.baro_rate || 0;
+  const trend = vr > 64 ? '▲' : vr < -64 ? '▼' : '—';
+  const ri = _routeInfo[closestHex];
+  const fromName = ri ? (ri.fromCity || ri.from || '?') : null;
+  const toName   = ri ? (ri.toCity   || ri.to   || '?') : null;
+  const rows = [
+    `<b>${(info.flight || '').trim() || info.hex}</b>${flag ? ' ' + flag : ''}`,
+    airline || kind ? `${airline}${airline && kind ? ' · ' : ''}${kind}` : '',
+    info.desc || info.type || '',
+    info.alt_baro != null ? `${Math.round(info.alt_baro * 0.3048)} m ${trend}` : '',
+    info.gs != null ? `${Math.round(info.gs * 1.852)} km/h` : '',
+    ri ? `${fromName} → ${toName}` : '',
+  ].filter(Boolean);
+
+  const box = $('#sideInfo');
+  box.innerHTML = rows.join('<br>');
+  const wrap = $('#pathSideWrap').getBoundingClientRect();
+  let lx = e.clientX - wrap.left + 8, ty = e.clientY - wrap.top + 8;
+  if (lx > wrap.width - 150) lx = wrap.width - 150;
+  if (ty > wrap.height - 90) ty = wrap.height - 90;
+  box.style.left = Math.max(4, lx) + 'px';
+  box.style.top  = Math.max(4, ty) + 'px';
+  box.style.display = 'block';
+});
+$('#pathSide').addEventListener('mouseleave', () => { _sideHideInfo(); _sideHoverHex = null; });
 
 function updateAircraft(list) { acData = Array.isArray(list) ? list : []; renderAircraft(); }
 
@@ -1770,8 +2068,11 @@ function _sampleCurve(cLat, cLon, tStart, tEnd, nPts) {
 }
 
 // Draw polynomial-fit trail + prediction for all planes within 2× acRange.
-// Trail = smooth curve through last-5 DB positions (solid).
-// Pred  = extrapolation 3 min ahead (dashed). Disappears once ≥5 new points arrive.
+// Trail = smooth curve from first DB point to current live position (solid).
+// Pred  = extrapolation 3 min ahead (dashed), starting from the live position.
+// Endpoint labels show compass heading and Schiphol distance at origin/destination.
+const _AMS = [52.3105, 4.7683]; // Schiphol EHAM
+
 function drawPredPaths() {
   if (!acMap || !acHome) return;
   const byHex = _groupByHex(_pathData);
@@ -1782,29 +2083,35 @@ function drawPredPaths() {
 
   for (const a of twoX) {
     active.add(a.hex);
-    const hist = (byHex[a.hex] || []).slice(-5);
+    // Include current live position as the most-recent point so the trail ends
+    // at the animated marker and the prediction starts from there, not from the
+    // last (potentially stale) DB record.
+    const rawHist = (byHex[a.hex] || []).slice(-5);
+    const nowTs = Date.now() / 1000;
+    const hist = rawHist.slice();
+    const lastDbTs = hist.length ? hist.at(-1).ts : 0;
+    if (nowTs > lastDbTs + 3) hist.push({ lat:a.lat, lon:a.lon, ts:nowTs });
+
     let trailLLs = null, predLLs = null;
 
     if (hist.length >= 2) {
       const t0 = hist[0].ts;
-      const ts  = hist.map(p => p.ts - t0);
+      const ts   = hist.map(p => p.ts - t0);
       const lats = hist.map(p => p.lat);
       const lons = hist.map(p => p.lon);
       const deg = Math.min(2, hist.length - 1);
       const cLat = polyFit(ts, lats, deg);
       const cLon = polyFit(ts, lons, deg);
-      // Update only avgIntervalSec — renderAircraft already owns the anchor position.
       const avgIntervalSec = (hist.at(-1).ts - hist[0].ts) / (hist.length - 1);
       if (_acAnimState[a.hex]) _acAnimState[a.hex].avgIntervalSec = avgIntervalSec;
-      const tTrailEnd = hist.at(-1).ts - t0;
+      const tTrailEnd = hist.at(-1).ts - t0;   // = nowTs - t0 after live-pos append
       const tPredEnd  = tTrailEnd + 3*60;
       trailLLs = _sampleCurve(cLat, cLon, 0, tTrailEnd, 10);
       predLLs  = _sampleCurve(cLat, cLon, tTrailEnd, tPredEnd, 10);
     } else if (a.track != null && a.gs) {
-      // No DB history yet — ensure state exists (renderAircraft may not have run for 2×-range planes)
       if (!_acAnimState[a.hex]) {
         _acAnimState[a.hex] = { lat:a.lat, lon:a.lon, track:a.track, gs:a.gs,
-                                 reportedAt: Date.now()/1000, avgIntervalSec: 15 };
+                                 reportedAt: nowTs, avgIntervalSec: 15 };
       }
       const distKm = a.gs * (3/60) * 1.852;
       predLLs = [[a.lat, a.lon], destPoint(a.lat, a.lon, a.track, distKm)];
@@ -1813,8 +2120,6 @@ function drawPredPaths() {
       continue;
     }
 
-    // Only draw lines when the plane is in range OR will enter range.
-    // Check: is any point of trail+pred within acRange of home?
     const allPts = [...(trailLLs || []), ...(predLLs || [])];
     const willBeInRange = a.distance_km <= acRange ||
       allPts.some(([lat, lon]) => haversineKm(acHome[0], acHome[1], lat, lon) <= acRange);
@@ -1824,30 +2129,56 @@ function drawPredPaths() {
     if (!_predCurves[a.hex]) _predCurves[a.hex] = {};
     const pc = _predCurves[a.hex];
 
-    // Click on any curve segment → highlight the aircraft row + pan map
+    // Hover on trail/pred → highlight table row; click → pan + highlight
     const _hexForClick = a.hex;
+    const popHtml = () => _pathPopupHtml(a.hex);
+    const onHoverIn  = () => _highlightRow(_hexForClick, true);
+    const onHoverOut = () => _highlightRow(_hexForClick, false);
     const onCurveClick = () => {
       const acObj = acData.find(x => x.hex === _hexForClick);
       if (acObj && acObj.lat != null && acMap)
         acMap.setView([acObj.lat, acObj.lon], Math.max(acMap.getZoom(), 11), {animate:true});
-      if (acIcons[_hexForClick]) acIcons[_hexForClick].openPopup();
-      const tr = $('#acRows').querySelector(`tr[data-hex="${_hexForClick}"]`);
-      if (tr) {
-        $('#acRows').querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
-        tr.classList.add('selected');
-        tr.scrollIntoView({ behavior:'smooth', block:'nearest' });
-      }
+      _highlightRow(_hexForClick, true);
+    };
+    const _bindCurve = grp => {
+      if (!grp) return;
+      grp.bindTooltip(popHtml, { sticky:true, direction:'top' });
+      grp.on('mouseover', onHoverIn).on('mouseout', onHoverOut).on('click', onCurveClick);
     };
 
     if (trailLLs && trailLLs.length > 1) {
-      pc.trail = _fadedPath(pc.trail, trailLLs, {color:col, weight:2, opacity:0.65}, onCurveClick);
+      pc.trail = _fadedPath(pc.trail, trailLLs, {color:col, weight:2, opacity:0.65});
+      _bindCurve(pc.trail);
       if (!pc.trail) delete pc.trail;
     } else if (pc.trail) { acMap.removeLayer(pc.trail); delete pc.trail; }
 
     if (predLLs && predLLs.length > 1) {
-      pc.pred = _fadedPath(pc.pred, predLLs, {color:col, weight:1.5, opacity:0.5, dashArray:'5 7'}, onCurveClick);
+      pc.pred = _fadedPath(pc.pred, predLLs, {color:col, weight:1.5, opacity:0.5, dashArray:'5 7'});
+      _bindCurve(pc.pred);
       if (!pc.pred) delete pc.pred;
     } else if (pc.pred) { acMap.removeLayer(pc.pred); delete pc.pred; }
+
+    // ── Route info (from/to compass) stored for table column + hover tooltip ──
+    if (!_routeInfo[a.hex]) _routeInfo[a.hex] = {};
+    if (predLLs && predLLs.length >= 2) {
+      const endPt = predLLs[predLLs.length - 1];
+      const hdg = _bearing(predLLs[predLLs.length-2][0], predLLs[predLLs.length-2][1],
+                           endPt[0], endPt[1]);
+      const distAMS  = haversineKm(endPt[0], endPt[1], _AMS[0], _AMS[1]);
+      const brgToAMS = _bearing(endPt[0], endPt[1], _AMS[0], _AMS[1]);
+      const diff = Math.abs(((hdg - brgToAMS + 540) % 360) - 180);
+      _routeInfo[a.hex].to = _compassDir(hdg);
+      _routeInfo[a.hex].toAMS = distAMS < 150
+        ? (diff < 60 ? `→ AMS ${Math.round(distAMS)} km` : `AMS ${Math.round(distAMS)} km`)
+        : '';
+    }
+    if (trailLLs && trailLLs.length >= 2) {
+      const startPt = trailLLs[0];
+      const hdgOut = _bearing(startPt[0], startPt[1], trailLLs[1][0], trailLLs[1][1]);
+      _routeInfo[a.hex].from = _compassDir((hdgOut + 180) % 360);
+      const distAMS = haversineKm(startPt[0], startPt[1], _AMS[0], _AMS[1]);
+      _routeInfo[a.hex].fromAMS = distAMS < 150 ? `AMS ${Math.round(distAMS)} km` : '';
+    }
   }
 
   // Clean up curves for planes no longer in extended range
@@ -1859,10 +2190,13 @@ function drawPredPaths() {
 function _removePredCurve(hex) {
   const pc = _predCurves[hex];
   if (!pc) return;
-  if (pc.trail) acMap.removeLayer(pc.trail);
-  if (pc.pred)  acMap.removeLayer(pc.pred);
+  if (pc.trail)     acMap.removeLayer(pc.trail);
+  if (pc.pred)      acMap.removeLayer(pc.pred);
+  if (pc.originTip) acMap.removeLayer(pc.originTip);
+  if (pc.destTip)   acMap.removeLayer(pc.destTip);
   delete _predCurves[hex];
   delete _acAnimState[hex];
+  delete _routeInfo[hex];
 }
 
 function planeIcon(track, source, type, category) {
@@ -1916,26 +2250,52 @@ function renderAircraft() {
       };
     }
 
-    if (acIcons[a.hex]) {
-      // Only update the icon style (heading/size/opacity); position is owned by the anim loop.
-      acIcons[a.hex].setIcon(planeIcon(a.track, a.source, a.type, a.category));
-    } else {
-      // First appearance: place at reported position and let anim loop take over.
-      acIcons[a.hex] = L.marker([a.lat, a.lon], { icon: planeIcon(a.track, a.source, a.type, a.category) }).addTo(acMap);
-    }
     const src = a.source === 'public' ? ' · reference feed'
               : a.source === 'both' ? ' · our SDR + reference' : ' · our SDR';
     const al = acAirline(a.flight); const kd = acKind(a.category, a.flight);
-    acIcons[a.hex].bindPopup(
-      `<b>${a.flight || a.hex}</b>${al ? ' · ' + al : ''}${kd ? ' <small>(' + kd + ')</small>' : ''}<br>`
-      + `${a.desc || a.type || '—'}<br>`
-      + `${a.alt_baro != null ? a.alt_baro + ' ft' : '—'} · ${a.gs != null ? Math.round(a.gs) + ' kt' : '—'}<br>`
-      + `${a.distance_km} km · ${Math.round(a.bearing_deg)}°${src}`);
+    const _tf = _regFlag(a.reg); const _tw = acWeight(a.type, a.category);
+    const _ri = _routeInfo[a.hex];
+    const _routeLine = _ri
+      ? (() => {
+          const vr = a.baro_rate || 0;
+          const fromName = _ri.fromCity || _ri.from || '?';
+          const toName   = _ri.toCity   || _ri.to   || '?';
+          const phase = vr > 64 ? `↗ from ${fromName}${_ri.fromAMS ? ' (' + _ri.fromAMS + ')' : ''}`
+                       : vr < -64 ? `↘ to ${toName}${_ri.toAMS ? ' (' + _ri.toAMS + ')' : ''}`
+                       : `${fromName} → ${toName}`;
+          return `<br>${phase}`;
+        })()
+      : '';
+    const tipHtml =
+        `<b>${a.flight || a.hex}</b>${_tf.flag ? ' ' + _tf.flag : ''}${al ? ' · ' + al : ''}${kd ? ' <small>(' + kd + ')</small>' : ''}<br>`
+      + `${a.desc || a.type || '—'}${_tw ? ' · ' + _tw : ''}<br>`
+      + `${a.alt_baro != null ? Math.round(a.alt_baro * 0.3048) + ' m' : '—'} · ${a.gs != null ? Math.round(a.gs * 1.852) + ' km/h' : '—'}<br>`
+      + `${a.distance_km != null ? a.distance_km.toFixed(1) : '—'} km · ${a.bearing_deg != null ? Math.round(a.bearing_deg) : '—'}°${src}`
+      + _routeLine;
+
+    if (acIcons[a.hex]) {
+      acIcons[a.hex].setIcon(planeIcon(a.track, a.source, a.type, a.category));
+      acIcons[a.hex].setTooltipContent(tipHtml);
+    } else {
+      const m = L.marker([a.lat, a.lon], { icon: planeIcon(a.track, a.source, a.type, a.category) }).addTo(acMap);
+      m.bindTooltip(tipHtml, { direction:'top', offset:[0,-10], sticky:false });
+      m.on('mouseover', () => _highlightRow(a.hex, true));
+      m.on('mouseout',  () => _highlightRow(a.hex, false));
+      m.on('click', () => {
+        const pos = _getAnimPos(a.hex);
+        if (pos && acMap) acMap.setView(pos, Math.max(acMap.getZoom(), 11), {animate:true});
+        _highlightRow(a.hex, true);
+      });
+      acIcons[a.hex] = m;
+    }
   });
   Object.keys(acIcons).forEach(h => { if (!seen.has(h)) { acMap.removeLayer(acIcons[h]); delete acIcons[h]; } });
 
   // Update avgIntervalSec for planes whose DB history is available (set in drawPredPaths).
   drawPredPaths();
+
+  // Kick off route lookups for any callsign we haven't seen yet.
+  inRange.forEach(a => { if (a.flight) _fetchRoute(a.flight.trim().toUpperCase()); });
 
   const rows = inRange.map(a => {
     const vr = a.baro_rate || 0;
@@ -1950,6 +2310,10 @@ function renderAircraft() {
     const flightCell = flightId
       ? `<a class="flightlink" href="https://www.flightradar24.com/${flightId.toLowerCase()}" target="_blank" rel="noopener">${flightId}</a>`
       : a.hex;
+    const ri = _routeInfo[a.hex];
+    const route = ri
+      ? (ri.fromCity && ri.toCity ? `${ri.fromCity}→${ri.toCity}` : `${ri.from || '?'}→${ri.to || '?'}`)
+      : '—';
     return `<tr class="${a.source === 'public' ? 'public' : ''}" data-hex="${a.hex}" style="cursor:pointer">`
       + `<td title="${country}">${flag}</td>`
       + `<td>${flightCell}</td>`
@@ -1958,26 +2322,33 @@ function renderAircraft() {
       + `<td title="${a.desc || ''}">${model}</td>`
       + `<td>${wt}</td>`
       + `<td>${age}</td>`
-      + `<td>${a.alt_baro != null ? a.alt_baro : '—'}</td>`
-      + `<td>${a.gs != null ? Math.round(a.gs) : '—'}</td>`
+      + `<td>${a.alt_baro != null ? Math.round(a.alt_baro * 0.3048) : '—'}</td>`
+      + `<td>${a.gs != null ? Math.round(a.gs * 1.852) : '—'}</td>`
       + `<td>${a.distance_km != null ? a.distance_km.toFixed(1) : '—'}</td>`
       + `<td>${a.bearing_deg != null ? Math.round(a.bearing_deg) : '—'}</td>`
+      + `<td>${route}</td>`
       + `<td>${ar}</td></tr>`;
   });
-  $('#acRows').innerHTML = rows.join('') || `<tr><td colspan="12" style="color:var(--mut);padding:14px">No aircraft in range</td></tr>`;
+  $('#acRows').innerHTML = rows.join('') || `<tr><td colspan="13" style="color:var(--mut);padding:14px">No aircraft in range</td></tr>`;
 
-  // row click → pan map to aircraft + highlight row
+  // Row hover → highlight + open marker tooltip; click → pan map
   $('#acRows').querySelectorAll('tr[data-hex]').forEach(tr => {
+    tr.addEventListener('mouseenter', e => {
+      if (e.target.tagName === 'A') return;
+      _highlightRow(tr.dataset.hex, true);
+      if (acIcons[tr.dataset.hex]) acIcons[tr.dataset.hex].openTooltip();
+    });
+    tr.addEventListener('mouseleave', () => {
+      _highlightRow(tr.dataset.hex, false);
+      if (acIcons[tr.dataset.hex]) acIcons[tr.dataset.hex].closeTooltip();
+    });
     tr.addEventListener('click', e => {
-      if (e.target.tagName === 'A') return;   // don't intercept flight-link clicks
+      if (e.target.tagName === 'A') return;
       const hex = tr.dataset.hex;
       const ac = inRange.find(a => a.hex === hex);
-      if (ac && ac.lat != null && acMap) {
+      if (ac && ac.lat != null && acMap)
         acMap.setView([ac.lat, ac.lon], Math.max(acMap.getZoom(), 11), {animate:true});
-        if (acIcons[hex]) acIcons[hex].openPopup();
-      }
-      $('#acRows').querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
-      tr.classList.add('selected');
+      _highlightRow(hex, true);
     });
   });
 
@@ -2031,6 +2402,94 @@ async function loadResearch() {
       { h:'Dist km', k:'dist_km' },
     ], events);
   } catch (_) {}
+}
+
+// ---- Closest-approach scatter -----------------------------------------------
+// For each aircraft in the current time window: (time of closest approach) vs
+// (interpolated min distance).  Dot size = peak noise_dba while aircraft was
+// nearest (max reading within ±30 s of the closest-approach timestamp).
+
+function _peakNoiseNear(approachTs, halfWin = 30) {
+  let peak = null;
+  for (const r of dataCache) {
+    if (r.ts == null || r.noise_dba == null) continue;
+    if (Math.abs(r.ts - approachTs) <= halfWin) {
+      if (peak === null || r.noise_dba > peak) peak = r.noise_dba;
+    }
+  }
+  return peak;
+}
+
+// Return a local-time ISO string (no trailing Z) so Plotly plots in wall-clock time.
+function _localISOStr(ts) {
+  const d = new Date(ts * 1000);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, -1);
+}
+
+function drawClosestApproachScatter() {
+  const el = document.getElementById('approachScatter');
+  if (!el || !acHome) return;
+  const { since, until } = fmtRange();
+  const approaches = _computeClosestApproaches(since, until, acRange);
+
+  const xs = [], ys = [], texts = [], colors = [], sizes = [], customdata = [];
+  for (const a of approaches) {
+    const peak = _peakNoiseNear(a.ts);
+    // Scale dot: 40 dB → 5 px, 85 dB → 20 px; clamp
+    const sz = peak != null ? Math.round(5 + Math.max(0, Math.min(1, (peak - 40) / 45)) * 15) : 7;
+    const meta = _pathMeta[a.hex] || {};
+    xs.push(_localISOStr(a.ts));
+    ys.push(+a.distKm.toFixed(2));
+    texts.push(meta.flight || a.hex.slice(0,6));
+    colors.push(_pathColor({ type: meta.type, hex: a.hex }));
+    sizes.push(sz);
+    const wt = acWeight(meta.type, meta.category);
+    customdata.push([a.hex, peak != null ? peak.toFixed(1) : '—', meta.desc || meta.type || '—', wt || '—']);
+  }
+
+  const nowTs = Math.floor(Date.now() / 1000);
+  const trace = {
+    type: 'scatter', mode: 'markers+text',
+    x: xs, y: ys, text: texts, customdata,
+    textposition: 'top center',
+    textfont: { size:9, color:'#8b93a7' },
+    marker: { color: colors, size: sizes, opacity:0.85, line:{ width:0 } },
+    hovertemplate: '<b>%{text}</b><br>%{customdata[2]} · %{customdata[3]}<br>%{x|%H:%M:%S}<br>dist: %{y:.2f} km<br>peak noise: %{customdata[1]} dB(A)<extra></extra>',
+    showlegend: false,
+  };
+
+  const layout = {
+    paper_bgcolor:'transparent', plot_bgcolor:'transparent',
+    margin: { t:4, r:8, b:36, l:44 },
+    font: { family:'system-ui', size:10, color:'#8b93a7' },
+    xaxis: {
+      type:'date', tickformat:'%H:%M', tickfont:{size:9},
+      gridcolor:'rgba(255,255,255,.05)', linecolor:'rgba(255,255,255,.1)', tickcolor:'rgba(255,255,255,.2)',
+      range: since ? [_localISOStr(since), _localISOStr(until ?? nowTs)] : undefined,
+    },
+    yaxis: {
+      title:{ text:'dist km', standoff:4 }, tickfont:{size:9},
+      gridcolor:'rgba(255,255,255,.05)', linecolor:'rgba(255,255,255,.1)', tickcolor:'rgba(255,255,255,.2)',
+      rangemode:'tozero',
+    },
+    hovermode:'closest',
+  };
+
+  Plotly.react(el, [trace], layout, { displayModeBar:false, responsive:true });
+
+  // Cross-highlight: clicking a scatter dot selects the same aircraft in map, table, side view.
+  el.on('plotly_click', data => {
+    if (!data?.points?.length) return;
+    const hex = data.points[0].customdata[0];
+    if (!hex) return;
+    _highlightRow(hex, true);
+    const acObj = acData.find(a => a.hex === hex);
+    if (acObj && acObj.lat != null && acMap)
+      acMap.setView([acObj.lat, acObj.lon], Math.max(acMap.getZoom(), 11), {animate:true});
+    if (acIcons[hex]) acIcons[hex].openTooltip();
+    const tr = $('#acRows').querySelector(`tr[data-hex="${hex}"]`);
+    if (tr) tr.scrollIntoView({behavior:'smooth', block:'nearest'});
+  });
 }
 
 $('#researchHead').addEventListener('click', e => {

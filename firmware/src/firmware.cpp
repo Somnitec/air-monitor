@@ -26,6 +26,8 @@
 #include <time.h>
 #include <sys/time.h>    // settimeofday() — adopt the server's clock when NTP is unavailable
 #include <esp_system.h>  // esp_reset_reason()
+#include <esp_task_wdt.h> // loop watchdog — reboots if a blocking call hangs the loop
+#include <esp_sleep.h>   // esp_light_sleep_start() — CPU naps between captures in POWER_SAVING
 
 #include <SensirionI2cSen66.h>
 #include <Adafruit_ADXL345_U.h>
@@ -39,6 +41,7 @@
 #include "accel.h"
 #include "record.h"
 #include "ringstore.h"
+#include "cadence.h"
 
 // ---------------------------------------------------------------------------
 // Sensor objects + presence flags
@@ -89,15 +92,58 @@ static bool s_ringReady = false;
 // ---------------------------------------------------------------------------
 // Operating mode + duty-cycle bookkeeping.
 // ---------------------------------------------------------------------------
-enum Mode { MODE_NORMAL, MODE_TESTING };
+// NORMAL/TESTING are the mains-powered modes (WiFi always on). POWER_SAVING duty-
+// cycles WiFi, light-sleeps between captures, gates the gas heaters + SEN66, and
+// lowers the mic rate — see the POWER_SAVE_* block in config.h.
+enum Mode { MODE_NORMAL, MODE_TESTING, MODE_POWER_SAVING };
 static Mode     g_mode           = MODE_NORMAL;
+static Mode     g_appliedMode    = MODE_NORMAL;   // last mode whose hardware transition ran
 static uint32_t g_bootStartMs    = 0;
 static uint32_t g_lastSyncAttempt = 0;
 
+// Connection supervisor state. The device is unattended and all buffered data is
+// durable, so recovery escalates: reconnect -> power-cycle radio -> reboot.
+static uint32_t g_consecutiveSyncFail = 0;          // resets to 0 on any acked sync
+static uint32_t g_lastGoodSyncMs      = 0;          // millis() of last acked sync (0 = never yet)
+static volatile bool g_wifiDropped    = false;      // set by the WiFi event handler on disconnect
+
+// Split-rate capture state. g_fields persists across loops so slow-channel values
+// are carried forward between their (infrequent) re-reads; g_cadence drives adaptive
+// storage; g_tSlow paces the slow channel.
+static RecordFields g_fields;
+static CadenceState g_cadence;
+static uint32_t     g_tSlow = 0;
+
 static bool inBootWindow() { return (millis() - g_bootStartMs) < BOOT_WINDOW_MS; }
-// Mains-powered: keep WiFi connected continuously (never duty-cycle/sleep it) so
-// uploads are immediate and the radio never misses the AP between sends.
-static bool wifiShouldStayOn() { return true; }
+
+static const char* modeStr(Mode m) {
+    switch (m) {
+        case MODE_TESTING:      return "testing";
+        case MODE_POWER_SAVING: return "power_saving";
+        default:                return "normal";
+    }
+}
+
+// NORMAL/TESTING are mains-powered: keep WiFi connected continuously so uploads are
+// immediate and the radio never misses the AP. POWER_SAVING duty-cycles the radio
+// (off between syncs) to save power — but the boot window always keeps it up so a
+// dashboard command (e.g. leave power-saving) still lands fast after a reboot.
+static bool wifiShouldStayOn() {
+    if (g_mode == MODE_POWER_SAVING) return inBootWindow();
+    return true;
+}
+
+// Light-sleep the CPU (radio modem + most peripherals suspended, RAM retained) for
+// `ms`, then resume. Used for the inter-capture gap and sensor warm-ups in
+// POWER_SAVING so idle time costs ~mA instead of ~tens of mA. We feed the watchdog
+// around it; naps are always far shorter than WDT_TIMEOUT_S.
+static void powerNap(uint32_t ms) {
+    if (ms == 0) return;
+    esp_task_wdt_reset();
+    esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL);
+    esp_light_sleep_start();
+    esp_task_wdt_reset();
+}
 
 struct WifiCred { const char* ssid; const char* pass; };
 #ifdef WIFI_NETWORKS
@@ -197,8 +243,57 @@ static void ledPulse(int on_ms = 60) {
 // ---------------------------------------------------------------------------
 // WiFi: connect on demand, used both for NTP and for sync.
 // ---------------------------------------------------------------------------
+// Resolved server endpoint (set by mDNS discovery below; empty => SYNC_HOST
+// fallback). Declared here so the recovery helpers can clear it on a radio reset.
+static String   s_serverHost = "";          // resolved IP string; empty = use fallback
+static uint16_t s_serverPort = SYNC_PORT;
+static bool     s_mdnsUp     = false;
+
+// Async WiFi events. We can't trust WiFi.status() alone — the stack can keep
+// reporting WL_CONNECTED after the AP has gone away — so a disconnect event arms
+// g_wifiDropped, which the supervisor in loop() uses to force a reconnect.
+static void onWifiEvent(WiFiEvent_t event) {
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            g_wifiDropped = false;
+            WiFi.setSleep(false);   // re-assert: modem sleep black-holes LAN TCP
+            Serial.printf("[wifi] got ip %s\n", WiFi.localIP().toString().c_str());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            g_wifiDropped = true;
+            Serial.println("[wifi] disconnected");
+            break;
+        default: break;
+    }
+}
+
+// Last-resort radio reset: fully tear down and rebuild the WiFi stack. Clears a
+// wedged DHCP/TCP state that survives a plain reconnect (the "still associated but
+// nothing routes" failure seen in the field).
+static void wifiHardCycle() {
+    Serial.println("[wifi] hard radio cycle");
+    WiFi.disconnect(true, true);    // disconnect + erase persisted config
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+    WiFi.mode(WIFI_STA);
+    wifiMulti.run(WIFI_CONNECT_TIMEOUT_MS);
+    if (WiFi.status() == WL_CONNECTED) WiFi.setSleep(false);
+    s_serverHost = "";              // force mDNS re-discovery after the reset
+}
+
+// Duty-cycle the radio off (POWER_SAVING, between syncs). The buffered ring is durable
+// so nothing is lost; the next syncSession brings WiFi back up and re-discovers the
+// server. Resets mDNS/host state since the lease/route may differ on the next wake.
+static void wifiPowerDown() {
+    WiFi.disconnect(true, false);   // disconnect + radio off, keep stored creds
+    WiFi.mode(WIFI_OFF);
+    s_serverHost = "";
+    s_mdnsUp     = false;
+    Serial.println("[wifi] radio off (power-saving)");
+}
+
 static bool wifiConnect() {
-    if (WiFi.status() == WL_CONNECTED) return true;
+    if (WiFi.status() == WL_CONNECTED && !g_wifiDropped) return true;
     // wifiMulti.run() scans and connects to the strongest known network in range.
     wifiMulti.run(WIFI_CONNECT_TIMEOUT_MS);
     bool ok = (WiFi.status() == WL_CONNECTED);
@@ -223,12 +318,9 @@ static bool wifiConnect() {
 // Server discovery via mDNS. The LattePanda advertises an "_airmon._tcp"
 // service (pc/server.py does this with zeroconf), so we find it by name on
 // whatever network we joined — no static IP. SYNC_HOST/SYNC_PORT from secrets.h
-// are only a fallback if discovery turns up nothing.
+// are only a fallback if discovery turns up nothing. (s_serverHost/Port/mdnsUp are
+// declared above so the recovery helpers can reach them.)
 // ---------------------------------------------------------------------------
-static String   s_serverHost = "";          // resolved IP string; empty = use fallback
-static uint16_t s_serverPort = SYNC_PORT;
-static bool     s_mdnsUp     = false;
-
 static void discoverServer() {
     if (WiFi.status() != WL_CONNECTED) return;
     if (!s_mdnsUp) s_mdnsUp = MDNS.begin(DEVICE_ID);   // our own hostname on the LAN
@@ -266,65 +358,160 @@ static bool sen66ValuesSane(float pm1, float pm25, float pm4, float pm10,
 }
 
 // ---------------------------------------------------------------------------
-// Build one RecordFields from a fresh read of every present sensor.
+// Split-rate capture. The mic is the primary instrument and only listens ~1.3 s
+// per capture, so the fast channel (mic + accel) is read every loop while the slow
+// channel (air quality, weather, gas, soil, battery) is re-read only every few
+// minutes — its values are carried forward into every record in between, so the
+// stored series stays gapless without re-reading sensors that barely move.
 // ---------------------------------------------------------------------------
-static void buildFields(RecordFields& f) {
+
+// Read the fast channel (timestamp + mic + accel) into f, clearing their present
+// flags first so a failed read this cycle shows as absent rather than stale.
+static void readFast(RecordFields& f) {
     f.ts    = (uint32_t)time(nullptr);
     f.ts_ok = timeIsValid();
     f.up_ms = millis();
     f.boot  = (uint16_t)(g_bootId & 0xFFFF);
 
-    if (present.sen66) {
-        // Only read once a fresh measurement is ready (continuous mode produces one
-        // per second). Reading otherwise can return stale/not-ready frames.
-        uint8_t pad = 0; bool ready = false;
-        bool okReady = (sen66.getDataReady(pad, ready) == 0) && ready;
-        float pm1, pm25, pm4, pm10, t, rh, voc, nox; uint16_t co2;
-        if (okReady && sen66.readMeasuredValues(pm1, pm25, pm4, pm10, rh, t, voc, nox, co2) == 0
-            && sen66ValuesSane(pm1, pm25, pm4, pm10, t, rh, voc, nox, co2)) {
-            f.has_sen66 = true;
-            f.pm1 = pm1; f.pm25 = pm25; f.pm4 = pm4; f.pm10 = pm10;
-            f.co2 = co2; f.voc = voc; f.nox = nox; f.temp = t; f.rh = rh;
-        }
-    }
-    if (present.bh1750 && bh1750.measurementReady(true)) {
-        f.has_bh1750 = true; f.lux = bh1750.readLightLevel();
-    }
-    if (present.bme) {
-        f.has_bme = true;
-        f.pressure = bme.readPressure() / 100.0f;
-        f.bme_temp = bme.readTemperature();
-        f.bme_rh   = bme.readHumidity();
-    }
+    f.status[GRP_ADXL] = FS_ABSENT;
     if (present.adxl) {
         AccelResult a;
         if (accel_capture(adxl, a)) {
-            f.has_adxl = true;
+            f.status[GRP_ADXL] = FS_OK;
             f.rumble_rms = a.rumble_rms; f.rumble_peak = a.rumble_peak; f.accel_mag = a.mag_mean;
             f.ppv_m_s      = a.ppv_m_s;
             f.accel_dom_hz = a.dom_freq_hz;
             for (int b = 0; b < REC_ACCEL_BANDS; ++b) f.accel_band_db[b] = a.band_db[b];
+        } else {
+            f.status[GRP_ADXL] = FS_INVALID;   // present but read failed — a real gap
         }
     }
-    if (present.co)   { f.has_co = true;   f.co_mv   = (uint16_t)readAdcMv(PIN_GAS_CO_ADC); }
-    if (present.hcho) { f.has_hcho = true; f.hcho_mv = (uint16_t)readAdcMv(PIN_GAS_HCHO_ADC); }
-    if (present.soil) { f.has_soil = true; f.soil_mv = (uint16_t)readAdcMv(PIN_SOIL_ADC); }
-    if (present.battery) {
-        f.has_battery = true;
-        f.bat_raw_mv = (uint16_t)readAdcMv(PIN_BATTERY_ADC);
-        f.bat_cal = (bool)BAT_CALIBRATED;
-    }
+    f.has_adxl = (f.status[GRP_ADXL] == FS_OK);
+
+    f.status[GRP_MIC] = FS_ABSENT;
     if (present.mic) {
         MicResult m;
         if (mic_capture(m)) {
-            f.has_mic = true;
+            f.status[GRP_MIC] = FS_OK;
             f.noise_dba  = m.laeq_est; f.noise_spl = m.spl_est; f.noise_dbfs = m.rms_dbfs;
             f.noise_clip = m.clipping;
             f.noise_lamax = m.lamax_dba;
             f.noise_lceq  = m.lceq;
             for (int b = 0; b < REC_NBANDS; ++b) f.bands[b] = m.band_dba[b];
+        } else {
+            f.status[GRP_MIC] = FS_INVALID;
         }
     }
+    f.has_mic = (f.status[GRP_MIC] == FS_OK);
+}
+
+// Read the slow channel into f. On a failed/not-ready read the previous values are
+// left in place (carry-forward) so the present flag and last good value persist.
+static void readSlow(RecordFields& f) {
+    // SEN66: present-but-not-ready / corrupt frame is FS_INVALID (a real gap), not
+    // absent — so the server shows a NULL rather than carrying a stale value.
+    if (!present.sen66) {
+        f.status[GRP_SEN66] = FS_ABSENT;
+    } else {
+        uint8_t pad = 0; bool ready = false;
+        bool okReady = (sen66.getDataReady(pad, ready) == 0) && ready;
+        float pm1, pm25, pm4, pm10, t, rh, voc, nox; uint16_t co2;
+        if (okReady && sen66.readMeasuredValues(pm1, pm25, pm4, pm10, rh, t, voc, nox, co2) == 0
+            && sen66ValuesSane(pm1, pm25, pm4, pm10, t, rh, voc, nox, co2)) {
+            f.status[GRP_SEN66] = FS_OK;
+            f.pm1 = pm1; f.pm25 = pm25; f.pm4 = pm4; f.pm10 = pm10;
+            f.co2 = co2; f.voc = voc; f.nox = nox; f.temp = t; f.rh = rh;
+        } else {
+            f.status[GRP_SEN66] = FS_INVALID;
+        }
+    }
+    f.has_sen66 = (f.status[GRP_SEN66] == FS_OK);
+
+    if (!present.bh1750)            f.status[GRP_BH1750] = FS_ABSENT;
+    else if (bh1750.measurementReady(true)) { f.status[GRP_BH1750] = FS_OK; f.lux = bh1750.readLightLevel(); }
+    else                           f.status[GRP_BH1750] = FS_UNCHANGED;  // not-ready is transient, carry last value
+    f.has_bh1750 = (f.status[GRP_BH1750] == FS_OK);
+
+    if (present.bme) {
+        f.status[GRP_BME] = FS_OK;
+        f.pressure = bme.readPressure() / 100.0f;
+        f.bme_temp = bme.readTemperature();
+        f.bme_rh   = bme.readHumidity();
+    } else {
+        f.status[GRP_BME] = FS_ABSENT;
+    }
+    f.has_bme = (f.status[GRP_BME] == FS_OK);
+
+    // Analog channels: a present pin always yields a reading (no failure mode here).
+    f.status[GRP_CO]   = present.co   ? FS_OK : FS_ABSENT;
+    if (present.co)   f.co_mv   = (uint16_t)readAdcMv(PIN_GAS_CO_ADC);
+    f.status[GRP_HCHO] = present.hcho ? FS_OK : FS_ABSENT;
+    if (present.hcho) f.hcho_mv = (uint16_t)readAdcMv(PIN_GAS_HCHO_ADC);
+    f.status[GRP_SOIL] = present.soil ? FS_OK : FS_ABSENT;
+    if (present.soil) f.soil_mv = (uint16_t)readAdcMv(PIN_SOIL_ADC);
+    f.status[GRP_BATTERY] = present.battery ? FS_OK : FS_ABSENT;
+    if (present.battery) {
+        f.bat_raw_mv = (uint16_t)readAdcMv(PIN_BATTERY_ADC);
+        f.bat_cal = (bool)BAT_CALIBRATED;
+    }
+    f.has_co = present.co; f.has_hcho = present.hcho;
+    f.has_soil = present.soil; f.has_battery = present.battery;
+}
+
+// Power-saving slow read: wake the duty-cycled slow sensors (SEN66 fan/laser + the
+// analog gas-sensor heaters), light-sleep through their warm-up so the wait itself
+// costs little, read, then return them to their low-power idle. Called instead of
+// readSlow() only in MODE_POWER_SAVING; carry-forward between reads is unchanged.
+static void readSlowPowerSaving(RecordFields& f) {
+    bool gas = present.co || present.hcho;
+    if (gas)           digitalWrite(PIN_GAS_HEATER_EN, HIGH);   // power the MEMS heaters
+    if (present.sen66) sen66.startContinuousMeasurement();      // spin up fan + laser
+
+    // Both need to stabilise; nap for the longer of the two warm-ups.
+    uint32_t warm = GAS_HEATER_WARMUP_MS > SEN66_WARMUP_MS ? GAS_HEATER_WARMUP_MS
+                                                           : SEN66_WARMUP_MS;
+    powerNap(warm);
+
+    readSlow(f);
+
+    if (present.sen66) sen66.stopMeasurement();                 // back to idle current
+    if (gas)           digitalWrite(PIN_GAS_HEATER_EN, LOW);    // cut heater power
+}
+
+// Apply the hardware side of a mode change (idempotent; runs once per transition).
+// POWER_SAVING lowers the mic rate and parks the duty-cycled sensors in their idle
+// state; the mains modes restore full fidelity and continuous sensors.
+static void applyModeTransition() {
+    if (g_mode == g_appliedMode) return;
+    if (g_mode == MODE_POWER_SAVING) {
+        if (present.mic)   mic_set_rate(POWER_SAVE_MIC_RATE_HZ);
+        if (present.sen66) sen66.stopMeasurement();   // started per-read by readSlowPowerSaving
+        digitalWrite(PIN_GAS_HEATER_EN, LOW);
+        Serial.println("[power] -> POWER_SAVING: wifi duty-cycled, sensors gated, mic 16 kHz");
+    } else {
+        if (present.mic)   mic_set_rate(I2S_SAMPLE_RATE_HZ);
+        if (present.sen66) sen66.startContinuousMeasurement();
+        digitalWrite(PIN_GAS_HEATER_EN, HIGH);        // mains: heaters + fan run continuously
+        if (g_appliedMode == MODE_POWER_SAVING)
+            Serial.println("[power] left POWER_SAVING: wifi always-on, sensors continuous");
+    }
+    g_appliedMode = g_mode;
+}
+
+// Full read of every sensor (boot snapshot / one-shot diagnostics).
+static void buildFields(RecordFields& f) {
+    readSlow(f);
+    readFast(f);
+}
+
+// On loop cycles where the slow channel is NOT re-read, downgrade its freshly-read
+// (FS_OK) groups to FS_UNCHANGED: the value is carried forward in f and stays in the
+// binary record, but record_to_json omits it so the server forward-fills it instead
+// of the wire re-sending a value that hasn't been re-measured. FS_INVALID/FS_ABSENT
+// are left as-is (a bad/absent sensor keeps reporting that until its next read).
+static void markSlowUnchanged(RecordFields& f) {
+    for (uint8_t g : { GRP_SEN66, GRP_BH1750, GRP_BME, GRP_CO, GRP_HCHO, GRP_SOIL, GRP_BATTERY })
+        if (f.status[g] == FS_OK) f.status[g] = FS_UNCHANGED;
 }
 
 // Print a human-readable snapshot of all sensor values in f to Serial.
@@ -416,10 +603,14 @@ static void logCapturedValues(const RecordFields& f) {
 static void applyServerCommand(const JsonDocument& doc) {
     const char* sm = doc["command"]["set_mode"] | (const char*)nullptr;
     if (!sm) return;
-    if (!strcmp(sm, "testing") && g_mode != MODE_TESTING) {
-        g_mode = MODE_TESTING; Serial.println("[mode] -> TESTING (server)");
-    } else if (!strcmp(sm, "normal") && g_mode != MODE_NORMAL) {
-        g_mode = MODE_NORMAL;  Serial.println("[mode] -> NORMAL (server)");
+    Mode want = g_mode;
+    if      (!strcmp(sm, "testing"))      want = MODE_TESTING;
+    else if (!strcmp(sm, "normal"))       want = MODE_NORMAL;
+    else if (!strcmp(sm, "power_saving")) want = MODE_POWER_SAVING;
+    else return;
+    if (want != g_mode) {
+        g_mode = want;   // hardware transition (mic rate, SEN66, heater) runs in loop()
+        Serial.printf("[mode] -> %s (server)\n", modeStr(g_mode));
     }
 }
 
@@ -443,7 +634,7 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
     doc["boot_ts"]      = g_bootTs;
     doc["reset_reason"] = resetReasonStr(g_resetReason);
     doc["fw"]           = "phase1";
-    doc["mode"]         = (g_mode == MODE_TESTING) ? "testing" : "normal";
+    doc["mode"]         = modeStr(g_mode);
     doc["buffered"]     = ringstore_unsynced();
     JsonArray arr = doc["records"].to<JsonArray>();
     for (uint32_t i = 0; i < n; ++i) {
@@ -457,7 +648,7 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
     String url = String("http://") + host + ":" + String(port) + SYNC_PATH;
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(8000);
+    http.setTimeout(HTTP_TIMEOUT_MS);
     int code = http.POST(body);
     String resp = http.getString();
     http.end();
@@ -470,11 +661,15 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
             applyServerConfig(rdoc);
         }
         ringstore_mark_synced(lastSeq);
+        g_consecutiveSyncFail = 0;
+        g_lastGoodSyncMs      = millis();
         Serial.printf("%s[sync] %u acked (unsynced now %u)\n", clockStr().c_str(), n, ringstore_unsynced());
         ledPulse();
         return code;
     }
-    Serial.printf("[sync] POST failed code=%d\n", code);
+    Serial.printf("[sync] POST failed code=%d — server unreachable, latest values over USB:\n", code);
+    if (n > 0) { RecordFields lf; record_unpack(recs[n - 1], lf); logCapturedValues(lf); }
+    g_consecutiveSyncFail++;
     s_serverHost = "";     // force re-discovery next time
     return code;
 }
@@ -487,7 +682,11 @@ static void drainRing() {
         uint32_t lastSeq = 0;
         uint32_t n = ringstore_drain(batch, SYNC_BATCH_MAX, &lastSeq);
         if (n == 0) break;
-        if (postBatch(batch, n, lastSeq) >= 400 || WiFi.status() != WL_CONNECTED) break;
+        int code = postBatch(batch, n, lastSeq);
+        // Stop on any non-2xx: >=400 is a server reject, <=0 is a transport failure
+        // (connection refused / not connected). Retrying the same batch in a tight
+        // loop just burns the watchdog budget — the supervisor handles recovery.
+        if (code < 200 || code >= 400 || WiFi.status() != WL_CONNECTED) break;
         if (ringstore_unsynced() == 0) break;
     }
 }
@@ -497,10 +696,34 @@ static void drainRing() {
 // and causes the visible connect/disconnect churn on the network.
 static void syncSession() {
     g_lastSyncAttempt = millis();
+
+    // Escalation step 1: after repeated failures, a plain reconnect isn't enough —
+    // power-cycle the radio to clear a wedged DHCP/TCP stack before trying again.
+    if (g_consecutiveSyncFail >= WIFI_HARD_CYCLE_FAIL) {
+        wifiHardCycle();
+        g_consecutiveSyncFail = 0;   // give the fresh stack a clean slate of attempts
+    }
+
     if (wifiConnect()) {
         syncTimeIfNeeded();
         if (s_serverHost.length() == 0) discoverServer();
         drainRing();
+        // POWER_SAVING: turn the radio back off once drained (outside the boot window,
+        // where we keep it up so dashboard commands still land promptly).
+        if (g_mode == MODE_POWER_SAVING && !inBootWindow()) wifiPowerDown();
+    }
+
+    // Escalation step 2: if nothing has acked for a long time, reboot. All buffered
+    // data is durable on flash and we resume from the persisted cursor, so this is a
+    // safe last resort for any failure a radio cycle can't clear (hung stack, bad
+    // DNS, server moved). g_lastGoodSyncMs==0 means we've never synced yet — anchor
+    // the stall window to boot so a never-reachable server still triggers a reboot.
+    uint32_t since = millis() - (g_lastGoodSyncMs ? g_lastGoodSyncMs : g_bootStartMs);
+    if (since >= STALL_REBOOT_MS) {
+        Serial.printf("[sync] no acked sync for %lu ms — rebooting to recover\n",
+                      (unsigned long)since);
+        Serial.flush();
+        ESP.restart();
     }
 }
 
@@ -567,6 +790,12 @@ void setup() {
     pinMode(PIN_EXT_LED, OUTPUT);
     digitalWrite(PIN_EXT_LED, LOW);
 
+    // Gas-heater MOSFET enable: default ON so NORMAL/TESTING run the heaters
+    // continuously (mains). POWER_SAVING gates this low between reads. Harmless on the
+    // current board (no MOSFET yet) — just drives a free GPIO.
+    pinMode(PIN_GAS_HEATER_EN, OUTPUT);
+    digitalWrite(PIN_GAS_HEATER_EN, HIGH);
+
     Serial.begin(115200);
     delay(300);
     g_resetReason = (uint8_t)esp_reset_reason();
@@ -592,10 +821,18 @@ void setup() {
     initSensors();
 
     // Register every known network with WiFiMulti.
+    WiFi.persistent(false);          // don't thrash flash storing creds every connect
+    WiFi.setAutoReconnect(true);     // let the core retry associations on its own
+    WiFi.onEvent(onWifiEvent);       // arm g_wifiDropped on disconnect / clear on GOT_IP
     WiFi.mode(WIFI_STA);
     for (size_t i = 0; i < kWifiCount; ++i)
         wifiMulti.addAP(kWifiNetworks[i].ssid, kWifiNetworks[i].pass);
     Serial.printf("[wifi] %u known network(s) registered\n", (unsigned)kWifiCount);
+
+    // Loop watchdog: reboot if a blocking call (HTTP/mDNS/I2S) hangs the loop past
+    // WDT_TIMEOUT_S. Durable ring => the reboot resumes with no data loss.
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+    esp_task_wdt_add(NULL);
 
     g_bootStartMs = millis();
     if (s_fsMounted) {
@@ -617,25 +854,47 @@ void setup() {
 }
 
 void loop() {
-    static uint32_t tSample = 0;
     const uint32_t now = millis();
 
-    // --- fixed-cadence baseline sample ---
-    if (tSample == 0 || now - tSample >= g_config.poll_interval_ms) {
-        tSample = now;
+    esp_task_wdt_reset();   // we're alive — defer the watchdog reboot
 
-        if (wifiShouldStayOn() && WiFi.status() != WL_CONNECTED) wifiConnect();
-        if (WiFi.status() == WL_CONNECTED) { syncTimeIfNeeded();
-            if (s_serverHost.length() == 0) discoverServer(); }
+    applyModeTransition();  // run hardware side of any pending mode change once
 
-        RecordFields f; buildFields(f);
-        logCapturedValues(f);  // print latest values to serial
-        Record rec = record_pack(f);
+    if (wifiShouldStayOn() && WiFi.status() != WL_CONNECTED) wifiConnect();
+    if (WiFi.status() == WL_CONNECTED) { syncTimeIfNeeded();
+        if (s_serverHost.length() == 0) discoverServer(); }
+
+    // --- fast channel: capture noise + accel every loop (mic_capture paces us
+    //     at ~1.3 s, the natural listen window). ---
+    readFast(g_fields);
+
+    // Adaptive storage: densify when the level moves fast, decimate when quiet.
+    // quiet_store_ms tracks the server-set poll_interval_ms so the dashboard's
+    // cadence knob still governs the quiet baseline. TESTING stores every capture.
+    CadenceParams cp{ NOISE_DENSIFY_DELTA_DBA, DENSIFY_HOLD_MS, g_config.poll_interval_ms };
+    CadenceDecision cd = cadence_decide(g_cadence, cp, g_fields.has_mic, g_fields.noise_dba, now);
+    bool store = (g_mode == MODE_TESTING) ? true : cd.store;
+
+    // --- slow channel: re-read air-quality/weather/gas/soil/battery on their own
+    //     cadence (faster while densified), carried forward into every record. ---
+    uint32_t slowInterval = cd.densified ? SLOW_INTERVAL_DENSE_MS : SLOW_INTERVAL_MS;
+    if (g_tSlow == 0 || now - g_tSlow >= slowInterval) {
+        // POWER_SAVING wakes/warms/parks the duty-cycled sensors around the read.
+        if (g_mode == MODE_POWER_SAVING) readSlowPowerSaving(g_fields);
+        else                             readSlow(g_fields);   // fresh -> FS_OK (or INVALID/ABSENT)
+        g_tSlow = now;
+    } else {
+        markSlowUnchanged(g_fields);  // carry forward -> FS_UNCHANGED (omitted on wire)
+    }
+
+    if (store) {
+        logCapturedValues(g_fields);  // print latest values to serial
+        Record rec = record_pack(g_fields);
         if (s_ringReady) {
             ringstore_push(rec);
-            Serial.printf("%s[rec] seq=%u ts=%u buffered=%u mode=%s\n",
+            Serial.printf("%s[rec] seq=%u ts=%u buffered=%u mode=%s%s\n",
                           clockStr().c_str(), rec.seq, rec.ts, ringstore_unsynced(),
-                          g_mode == MODE_TESTING ? "testing" : "normal");
+                          modeStr(g_mode), cd.densified ? " dense" : "");
         } else {
             Serial.printf("[rec] ts=%u (ring not ready, discarding)\n", rec.ts);
         }
@@ -651,10 +910,22 @@ void loop() {
         // keep WiFi up and poll the server so an "enter testing" command lands fast
         if (now - g_lastSyncAttempt >= 5000) syncSession();
     } else {
-        bool dueByTime  = (now - g_lastSyncAttempt) >= SYNC_ATTEMPT_INTERVAL_MS;
+        // POWER_SAVING syncs far less often (radio up for the drain, then off again).
+        uint32_t syncIntvl = (g_mode == MODE_POWER_SAVING) ? POWER_SAVE_SYNC_INTERVAL_MS
+                                                           : SYNC_ATTEMPT_INTERVAL_MS;
+        bool dueByTime  = (now - g_lastSyncAttempt) >= syncIntvl;
         bool dueByCount = ringstore_unsynced() >= SYNC_THRESHOLD_RECORDS;
         if (g_lastSyncAttempt == 0 || dueByTime || dueByCount) syncSession();
     }
 
-    delay(50);
+    // POWER_SAVING: with the radio off between syncs, light-sleep the inter-capture
+    // gap so idle current drops from ~tens of mA to ~mA. Skip while WiFi must stay up
+    // (boot window / mid-sync) — light sleep would suspend the modem and stall the
+    // drain. Other modes keep the original tiny busy-delay.
+    if (g_mode == MODE_POWER_SAVING && !wifiShouldStayOn()
+        && WiFi.status() != WL_CONNECTED && POWER_SAVE_CAPTURE_GAP_MS > 0) {
+        powerNap(POWER_SAVE_CAPTURE_GAP_MS);
+    } else {
+        delay(50);
+    }
 }

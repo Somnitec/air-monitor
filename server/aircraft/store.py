@@ -91,6 +91,7 @@ def insert(conn: sqlite3.Connection, aircraft: list[Aircraft], *,
 
 def query(conn: sqlite3.Connection, *, since: int | None = None,
           until: int | None = None, hex: str | None = None,
+          max_distance_km: float | None = None,
           limit: int = 20000) -> list[dict[str, Any]]:
     """Time-range / per-hex query of logged sightings, oldest first."""
     sql = "SELECT * FROM aircraft WHERE 1=1"
@@ -101,5 +102,8 @@ def query(conn: sqlite3.Connection, *, since: int | None = None,
         sql += " AND ts <= ?"; args.append(int(until))
     if hex:
         sql += " AND hex = ?"; args.append(hex)
+    if max_distance_km is not None:
+        sql += " AND distance_km <= ? AND lat IS NOT NULL AND lon IS NOT NULL"
+        args.append(float(max_distance_km))
     sql += " ORDER BY ts ASC LIMIT ?"; args.append(int(limit))
     return [dict(r) for r in conn.execute(sql, args).fetchall()]

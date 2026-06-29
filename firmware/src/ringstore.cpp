@@ -1,6 +1,7 @@
 #include "ringstore.h"
 #include "seglogic.h"
 #include "config.h"
+#include "record.h"      // RECORD_SCHEMA_VERSION, RECORD_SIZE — the format signature
 #include <LittleFS.h>
 #include <Arduino.h>
 #include <string.h>
@@ -101,6 +102,55 @@ static bool loadCursor(uint32_t& out) {
     return true;
 }
 
+// Record-format signature stored alongside the queue. seq->(segment,offset) and
+// record_unpack both assume a fixed record layout, so reinterpreting segments
+// written by a different layout reads garbage. We persist the layout signature and,
+// on a mismatch after a reflash, refuse to reinterpret and start fresh.
+struct RingFmt { uint32_t magic; uint16_t schema; uint16_t record_size; };
+static constexpr uint32_t RINGFMT_MAGIC = 0x52464d54;   // "RFMT"
+
+// Remove every queue file (segments + cursor + fmt) so a fresh queue can start.
+static void wipeQueue() {
+    File dir = LittleFS.open(QUEUE_DIR);
+    if (dir && dir.isDirectory()) {
+        // Collect names first: removing while iterating openNextFile is unreliable.
+        String victims[MAX_SEGMENTS + 4];
+        int nv = 0;
+        for (File e = dir.openNextFile(); e && nv < (int)(MAX_SEGMENTS + 4); e = dir.openNextFile()) {
+            victims[nv++] = e.name();   // name() returns full path on arduino-esp32
+            e.close();
+        }
+        dir.close();
+        for (int i = 0; i < nv; ++i) LittleFS.remove(victims[i]);
+    } else if (dir) {
+        dir.close();
+    }
+    LittleFS.remove(QUEUE_CURSOR_PATH);
+    LittleFS.remove(QUEUE_FMT_PATH);
+}
+
+// Verify the stored format signature matches this build; wipe + re-stamp on mismatch.
+static void checkFormat() {
+    RingFmt want{ RINGFMT_MAGIC, RECORD_SCHEMA_VERSION, (uint16_t)RECORD_SIZE };
+    RingFmt got{};
+    File f = LittleFS.open(QUEUE_FMT_PATH, "r");
+    bool have = f && f.read((uint8_t*)&got, sizeof(got)) == (int)sizeof(got);
+    if (f) f.close();
+
+    bool match = have && got.magic == RINGFMT_MAGIC &&
+                 got.schema == want.schema && got.record_size == want.record_size;
+    if (have && !match) {
+        Serial.printf("[ring] FORMAT CHANGED (stored schema=%u size=%u, build schema=%u size=%u) "
+                      "— buffered records cannot be reinterpreted; starting fresh\n",
+                      got.schema, got.record_size, want.schema, want.record_size);
+        wipeQueue();
+    }
+    if (!match) {                                   // (re)stamp current signature
+        File w = LittleFS.open(QUEUE_FMT_PATH, "w");
+        if (w) { w.write((const uint8_t*)&want, sizeof(want)); w.close(); }
+    }
+}
+
 bool ringstore_begin() {
     s_ok = false;
     // Reclaim space from any earlier firmware revision's queue files.
@@ -111,6 +161,10 @@ bool ringstore_begin() {
         Serial.println("[ring] mkdir failed");
         return false;
     }
+
+    // Guard against reinterpreting segments written by an incompatible record layout
+    // (e.g. after a reflash that bumped RECORD_SCHEMA_VERSION / RECORD_SIZE).
+    checkFormat();
 
     // Recover head/tail by scanning the segment directory.
     bool any = false;
