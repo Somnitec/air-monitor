@@ -22,7 +22,7 @@ Database location (default ./data/air-monitor.db) is overridable:
 from __future__ import annotations
 
 import asyncio
-import base64
+import hashlib
 import hmac
 import json
 import math
@@ -34,10 +34,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Form, Request, WebSocket
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response
 
 import station
@@ -83,6 +84,21 @@ READING_METRIC_COLS = [
 ]
 
 
+# Slow-channel keys the firmware delta-encodes (schema v3): when a slow sensor isn't
+# re-read, the device omits these keys and we carry the last value forward; an explicit
+# null means the sensor read failed (a real gap). Mirrors the FS_* groups the firmware
+# marks FS_UNCHANGED (record_to_json / readSlow). Fast-channel keys (noise_*, vib_*,
+# rumble*, ppv*) are NOT here — they're read every record, never carried.
+SLOW_FILL_KEYS = [
+    "pm1", "pm25", "pm4", "pm10", "co2", "voc", "nox", "temp", "rh",  # SEN66
+    "lux",                                                            # BH1750
+    "pressure_hpa", "bme_temp", "bme_rh",                             # BME280
+    "co_mv", "co_rs", "hcho_mv", "hcho_rs",                           # gas
+    "soil_mv", "soil_pct",                                            # soil
+    "bat_raw_mv", "bat_cal", "bat_v", "bat_pct",                      # battery
+]
+
+
 def _metric_col_ddl() -> str:
     return ",\n            ".join(
         f"{c} REAL GENERATED ALWAYS AS (json_extract(payload,'$.{c}')) VIRTUAL"
@@ -112,6 +128,7 @@ def _init_db() -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_readings_ts     ON readings(ts);
         CREATE INDEX IF NOT EXISTS idx_readings_device ON readings(device);
+        CREATE INDEX IF NOT EXISTS idx_readings_dedup  ON readings(device, device_ts, boot);
 
         CREATE TABLE IF NOT EXISTS events (
             id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -301,6 +318,7 @@ def _effective_ts(rec: dict[str, Any], received_at: int, boot_anchor_up_ms: int 
     return received_at, "received"
 
 
+
 def _dedupe_insert(rec: dict[str, Any], received_at: int, eff_ts: int, source: str) -> bool:
     """Insert one reading at its effective timestamp. Returns True if newly stored,
     False if a duplicate (same device + device_ts + boot) was skipped — makes
@@ -388,6 +406,45 @@ hub = Hub()
 DEVICE_STATE: dict[str, dict] = {}     # dev -> {mode,last_seen,buffered,boot,fw}
 PENDING_CMD: dict[str, str] = {}       # dev -> "testing" | "normal"
 
+# Delta-sync forward-fill (firmware Phase 3). The device sends slow-channel values
+# only when freshly read; in between it OMITS those keys (carry the last value
+# forward) and on a failed read it sends an explicit null (a real gap — keep it).
+# We reconstruct full payloads here so the generated metric columns stay populated.
+# Cache is per-device and per-process: after a server restart it's cold, so a few
+# minutes of slow-channel NULLs are expected until the next fresh read repopulates it.
+SLOW_FILL_KEYS: tuple[str, ...] = (
+    "pm1", "pm25", "pm4", "pm10", "co2", "voc", "nox", "temp", "rh",   # SEN66
+    "lux",                                                             # BH1750
+    "pressure_hpa", "bme_temp", "bme_rh",                              # BME280
+    "co_mv", "co_rs", "hcho_mv", "hcho_rs",                            # gas
+    "soil_mv", "soil_pct",                                             # soil
+    "bat_raw_mv", "bat_cal", "bat_v", "bat_pct",                       # battery
+)
+_LAST_VALUES: dict[str, dict[str, Any]] = {}   # dev -> {key: last good value}
+
+
+def _forward_fill(records: list, default_dev: Any) -> None:
+    """Reconstruct delta-encoded slow fields across a batch, in place and in order.
+    Per slow key of each record: present & non-null -> a fresh value (remember it);
+    present & null -> an explicit gap from a failed read (leave null, keep the last
+    good value cached); absent -> carried forward from cache if we've ever seen it
+    for that device (else left absent -> column NULL). Records carry their own `dev`;
+    `default_dev` covers bare records from the envelope."""
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        dev = rec.get("dev") or rec.get("device") or default_dev
+        if dev is None:
+            continue
+        cache = _LAST_VALUES.setdefault(dev, {})
+        for k in SLOW_FILL_KEYS:
+            if k in rec:
+                if rec[k] is not None:
+                    cache[k] = rec[k]      # fresh read — update the carry-forward value
+                # else: explicit null (FS_INVALID) — leave as a gap, don't touch cache
+            elif k in cache:
+                rec[k] = cache[k]          # omitted (FS_UNCHANGED) — carry last value forward
+
 
 def _update_device(dev: str, mode: str, buffered, boot, fw) -> None:
     DEVICE_STATE[dev] = {
@@ -441,7 +498,14 @@ async def _start_mdns():
         server="airmon-server.local.",
     )
     aiozc = AsyncZeroconf()
-    await aiozc.async_register_service(info)
+    try:
+        await aiozc.async_register_service(info)
+    except Exception as exc:
+        # NonUniqueNameException on rapid restart (or in tests); mDNS is best-effort.
+        await aiozc.async_close()
+        print(f"[mdns] could not register service ({exc.__class__.__name__}) — "
+              "ESP32 must use SYNC_HOST fallback")
+        return None, None
     print(f"[mdns] advertising _airmon._tcp at {ip}:{PORT}")
     return aiozc, info
 
@@ -457,7 +521,8 @@ import subprocess
 
 
 def _start_cloudflared():
-    name = os.environ.get("CLOUDFLARED_TUNNEL")
+    print("not doing tunnel stuff for now. sorry!")
+"""     name = os.environ.get("CLOUDFLARED_TUNNEL")
     if not name:
         return None
     exe = shutil.which("cloudflared")
@@ -470,7 +535,7 @@ def _start_cloudflared():
         return proc
     except Exception as e:
         print(f"[tunnel] failed to start cloudflared: {e}")
-        return None
+        return None """
 
 
 # --------------------------------------------------------------------------- #
@@ -570,35 +635,92 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Air Monitor", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # --------------------------------------------------------------------------- #
-# Basic Auth — gates the dashboard and all API routes; /ingest is exempted so
+# Cookie auth — gates the dashboard and all API routes; /ingest is exempted so
 # the ESP32 can keep posting without credentials.
 # --------------------------------------------------------------------------- #
 _DASHBOARD_PASSWORD = station.dashboard_password()
+_COOKIE_NAME = "air_monitor_auth"
+# Stateless session token: HMAC of the password. Rotating the password
+# invalidates all existing sessions automatically.
+_SESSION_TOKEN = (
+    hmac.new(_DASHBOARD_PASSWORD.encode(), b"air-monitor-session", hashlib.sha256).hexdigest()
+    if _DASHBOARD_PASSWORD else None
+)
+
+_LOGIN_HTML = """\
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Air Monitor</title>
+<style>
+body{font-family:system-ui,sans-serif;display:flex;align-items:center;
+     justify-content:center;min-height:100vh;margin:0;background:#111;color:#eee}
+form{background:#1e1e1e;padding:2rem;border-radius:12px;display:flex;
+     flex-direction:column;gap:1rem;min-width:260px}
+h2{margin:0;font-size:1.1rem;color:#aaa}
+input{padding:.75rem;border-radius:8px;border:1px solid #333;
+      background:#111;color:#eee;font-size:1rem}
+button{padding:.75rem;border-radius:8px;border:none;background:#2563eb;
+       color:#fff;font-size:1rem;cursor:pointer}
+button:hover{background:#1d4ed8}
+.err{color:#f87171;font-size:.9rem;margin:0}
+</style>
+</head>
+<body>
+<form method="post">
+  <h2>Air Monitor</h2>
+  <input type="password" name="password" placeholder="Password"
+         autofocus autocomplete="current-password">
+  <button type="submit">Log in</button>
+  <!--ERR-->
+</form>
+</body>
+</html>"""
 
 
-class _BasicAuth(BaseHTTPMiddleware):
+class _CookieAuth(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if not _DASHBOARD_PASSWORD or request.url.path == "/ingest":
+        if not _SESSION_TOKEN or request.url.path in ("/ingest", "/login", "/logout", "/ws"):
             return await call_next(request)
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Basic "):
-            try:
-                decoded = base64.b64decode(auth[6:]).decode("utf-8", errors="replace")
-                _, _, pw = decoded.partition(":")
-                if hmac.compare_digest(pw.encode(), _DASHBOARD_PASSWORD.encode()):
-                    return await call_next(request)
-            except Exception:
-                pass
-        return Response(
-            "Unauthorized",
-            status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="Air Monitor"'},
-        )
+        if hmac.compare_digest(request.cookies.get(_COOKIE_NAME, ""), _SESSION_TOKEN):
+            return await call_next(request)
+        next_url = request.url.path
+        return RedirectResponse(url=f"/login?next={next_url}", status_code=303)
 
 
-app.add_middleware(_BasicAuth)
+app.add_middleware(_CookieAuth)
+
+
+@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+async def login_get():
+    return HTMLResponse(_LOGIN_HTML.replace("<!--ERR-->", ""))
+
+
+@app.post("/login", response_class=HTMLResponse, include_in_schema=False)
+async def login_post(request: Request, password: str = Form(...)):
+    next_url = request.query_params.get("next", "/")
+    if not next_url.startswith("/") or next_url.startswith("//"):   # block open redirect incl. //evil.com
+        next_url = "/"
+    if _SESSION_TOKEN and hmac.compare_digest(password.encode(), _DASHBOARD_PASSWORD.encode()):
+        resp = RedirectResponse(url=next_url, status_code=303)
+        resp.set_cookie(_COOKIE_NAME, _SESSION_TOKEN,
+                        httponly=True, samesite="lax", max_age=30 * 24 * 3600)
+        return resp
+    return HTMLResponse(
+        _LOGIN_HTML.replace("<!--ERR-->", '<p class="err">Wrong password.</p>'),
+        status_code=401,
+    )
+
+
+@app.get("/logout", include_in_schema=False)
+async def logout():
+    resp = RedirectResponse(url="/login", status_code=303)
+    resp.delete_cookie(_COOKIE_NAME)
+    return resp
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -680,6 +802,7 @@ async def ingest(request: Request):
     backward compatibility, a bare record dict or a list of records."""
     body = await request.json()
 
+    dev = None
     if isinstance(body, dict) and "records" in body:
         records = body["records"]
         dev = body.get("dev")
@@ -701,6 +824,8 @@ async def ingest(request: Request):
     stored = []
     corrected = 0
     async with _db_lock:
+        # Delta-decode: carry forward omitted slow values, null = real gap (schema v3).
+        _forward_fill(records, dev)
         boots: set[tuple] = set()   # (device, boot) pairs that arrived with a good clock
         for rec in records:
             if not isinstance(rec, dict):
@@ -1031,8 +1156,11 @@ async def set_device_mode(dev: str, request: Request):
     (immediately while it's online in the boot window or in testing mode)."""
     body = await request.json()
     mode = body.get("mode")
-    if mode not in ("testing", "normal"):
-        return JSONResponse({"error": "mode must be 'testing' or 'normal'"}, status_code=400)
+    if mode not in ("testing", "normal", "power_saving"):
+        return JSONResponse(
+            {"error": "mode must be 'testing', 'normal', or 'power_saving'"},
+            status_code=400,
+        )
     PENDING_CMD[dev] = mode
     if dev in DEVICE_STATE:
         DEVICE_STATE[dev]["pending"] = mode
@@ -1112,14 +1240,10 @@ async def aircraft_paths(range_km: float = 1.0, hours: float = 48.0):
     per-sample geometry (incl. track, for direction chevrons); `meta` carries each
     aircraft's identity once per hex (for the click-to-identify popup)."""
     since = int(time.time()) - int(min(hours, 168) * 3600)
-    rows = aircraft_store.query(_conn, since=since, limit=200_000)
+    rows = aircraft_store.query(_conn, since=since, max_distance_km=range_km)
     pts = []
     meta: dict[str, dict] = {}
     for r in rows:
-        if r["distance_km"] is None or r["distance_km"] > range_km:
-            continue
-        if r["lat"] is None or r["lon"] is None:
-            continue
         pts.append({"hex": r["hex"], "ts": r["ts"], "lat": r["lat"], "lon": r["lon"],
                     "alt_baro": r["alt_baro"], "track": r["track"], "source": r["source"]})
         m = meta.setdefault(r["hex"], {})
@@ -1127,6 +1251,41 @@ async def aircraft_paths(range_km: float = 1.0, hours: float = 48.0):
             if not m.get(k) and r[k] is not None:
                 m[k] = r[k]
     return JSONResponse({"points": pts, "meta": meta})
+
+
+# ---- flight route lookup --------------------------------------------------- #
+# Cache callsign → {from_city, to_city} for 24 h (routes don't change mid-day).
+_route_cache: dict[str, tuple[float, dict]] = {}  # callsign → (fetched_at, result)
+_ROUTE_TTL = 86400  # seconds
+
+@app.get("/api/route")
+async def get_route(callsign: str):
+    """Look up origin/destination city for a flight callsign via OpenSky Network."""
+    cs = callsign.strip().upper()
+    now = time.time()
+    if cs in _route_cache:
+        fetched_at, result = _route_cache[cs]
+        if now - fetched_at < _ROUTE_TTL:
+            return JSONResponse(result)
+    try:
+        import requests as _req
+        resp = await asyncio.to_thread(
+            lambda: _req.get(
+                f"https://opensky-network.org/api/routes?callsign={cs}",
+                timeout=4.0,
+                headers={"User-Agent": "air-monitor/1.0"},
+            )
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            route = data.get("route") or []
+            result = {"route": route}
+        else:
+            result = {"route": []}
+    except Exception:
+        result = {"route": []}
+    _route_cache[cs] = (now, result)
+    return JSONResponse(result)
 
 
 # ---- events (home mode) ---------------------------------------------------- #
@@ -1170,7 +1329,9 @@ async def ws(ws: WebSocket):
     try:
         while True:
             await ws.receive_text()   # we don't expect input; keeps the socket open
-    except WebSocketDisconnect:
+    except Exception:
+        pass
+    finally:
         hub.disconnect(ws)
 
 

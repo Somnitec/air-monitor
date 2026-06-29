@@ -27,6 +27,10 @@ struct MicResult {
 // Initialise the I2S peripheral. Returns false on driver error.
 bool mic_begin();
 
+// Change the I2S sample rate at runtime (POWER_SAVING lowers it to cut FFT CPU).
+// No-op if unchanged; returns false on driver error.
+bool mic_set_rate(uint32_t hz);
+
 // Capture ~1.3 s of audio (30 FFT windows) and fill `out`. Returns false on read error.
 bool mic_capture(MicResult& out);
 

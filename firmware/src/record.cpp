@@ -37,6 +37,15 @@ static int8_t qI8(float v) {
 }
 static void setBit(uint16_t& flags, uint16_t bit, bool on) { if (on) flags |= bit; }
 
+// Present bit per group, indexed by RecGroup — mirrors status2 for code that only
+// needs "installed?" and keeps the flags word meaningful for old tooling.
+static const uint16_t kPresentBit[REC_NGROUPS] = {
+    PRESENT_SEN66, PRESENT_BH1750, PRESENT_BME, PRESENT_ADXL,
+    PRESENT_CO, PRESENT_HCHO, PRESENT_SOIL, PRESENT_BATTERY, PRESENT_MIC,
+};
+// A value is stored/usable for a group when it was freshly read or carried forward.
+static inline bool groupHasValue(uint8_t st) { return st == FS_OK || st == FS_UNCHANGED; }
+
 Record record_pack(const RecordFields& f) {
     Record r;
     memset(&r, 0, sizeof(r));
@@ -46,29 +55,29 @@ Record record_pack(const RecordFields& f) {
     setBit(flags, FLAG_TS_OK,      f.ts_ok);
     setBit(flags, FLAG_BAT_CAL,    f.bat_cal);
     setBit(flags, FLAG_NOISE_CLIP, f.noise_clip);
-    setBit(flags, PRESENT_SEN66,   f.has_sen66);
-    setBit(flags, PRESENT_BH1750,  f.has_bh1750);
-    setBit(flags, PRESENT_BME,     f.has_bme);
-    setBit(flags, PRESENT_ADXL,    f.has_adxl);
-    setBit(flags, PRESENT_CO,      f.has_co);
-    setBit(flags, PRESENT_HCHO,    f.has_hcho);
-    setBit(flags, PRESENT_SOIL,    f.has_soil);
-    setBit(flags, PRESENT_BATTERY, f.has_battery);
-    setBit(flags, PRESENT_MIC,     f.has_mic);
-    r.flags = flags;
 
-    if (f.has_sen66) {
+    // Per-group status drives both the 2-bit status2 word and the legacy present bit.
+    uint32_t st2 = 0;
+    for (int g = 0; g < REC_NGROUPS; ++g) {
+        uint8_t s = f.status[g] & 0x3;
+        st2 |= (uint32_t)s << (2 * g);
+        if (s != FS_ABSENT) flags |= kPresentBit[g];
+    }
+    r.flags   = flags;
+    r.status2 = st2;
+
+    if (groupHasValue(f.status[GRP_SEN66])) {
         r.pm1 = qU16(f.pm1, 10); r.pm25 = qU16(f.pm25, 10);
         r.pm4 = qU16(f.pm4, 10); r.pm10 = qU16(f.pm10, 10);
         r.co2 = f.co2; r.voc = qU16(f.voc, 1); r.nox = qU16(f.nox, 1);
         r.temp = qI16(f.temp, 100); r.rh = qU16(f.rh, 100);
     }
-    if (f.has_bh1750) r.lux = qU16(f.lux, 1);
-    if (f.has_bme) {
+    if (groupHasValue(f.status[GRP_BH1750])) r.lux = qU16(f.lux, 1);
+    if (groupHasValue(f.status[GRP_BME])) {
         r.pressure = qU16(f.pressure, 10);
         r.bme_temp = qI16(f.bme_temp, 100); r.bme_rh = qU16(f.bme_rh, 100);
     }
-    if (f.has_adxl) {
+    if (groupHasValue(f.status[GRP_ADXL])) {
         r.rumble_rms  = qU16(f.rumble_rms,  1000);
         r.rumble_peak = qU16(f.rumble_peak, 1000);
         r.accel_mag   = qU16(f.accel_mag,   100);
@@ -78,11 +87,11 @@ Record record_pack(const RecordFields& f) {
         for (int b = 0; b < REC_ACCEL_BANDS; ++b)
             r.accel_bands[b] = qI8(f.accel_band_db[b]);
     }
-    if (f.has_co)      r.co_mv = f.co_mv;
-    if (f.has_hcho)    r.hcho_mv = f.hcho_mv;
-    if (f.has_soil)    r.soil_mv = f.soil_mv;
-    if (f.has_battery) r.bat_raw_mv = f.bat_raw_mv;
-    if (f.has_mic) {
+    if (groupHasValue(f.status[GRP_CO]))      r.co_mv = f.co_mv;
+    if (groupHasValue(f.status[GRP_HCHO]))    r.hcho_mv = f.hcho_mv;
+    if (groupHasValue(f.status[GRP_SOIL]))    r.soil_mv = f.soil_mv;
+    if (groupHasValue(f.status[GRP_BATTERY])) r.bat_raw_mv = f.bat_raw_mv;
+    if (groupHasValue(f.status[GRP_MIC])) {
         r.noise_dba  = qI16(f.noise_dba,  10);
         r.noise_spl  = qI16(f.noise_spl,  10);
         r.noise_dbfs = qI16(f.noise_dbfs, 10);
@@ -100,16 +109,25 @@ void record_unpack(const Record& r, RecordFields& f) {
     f.bat_cal    = r.flags & FLAG_BAT_CAL;
     f.noise_clip = r.flags & FLAG_NOISE_CLIP;
 
-    f.has_sen66 = r.flags & PRESENT_SEN66;
+    // Restore per-group status from status2; has_* mirrors "value available".
+    for (int g = 0; g < REC_NGROUPS; ++g) f.status[g] = (r.status2 >> (2 * g)) & 0x3;
+    f.has_sen66   = groupHasValue(f.status[GRP_SEN66]);
+    f.has_bh1750  = groupHasValue(f.status[GRP_BH1750]);
+    f.has_bme     = groupHasValue(f.status[GRP_BME]);
+    f.has_adxl    = groupHasValue(f.status[GRP_ADXL]);
+    f.has_co      = groupHasValue(f.status[GRP_CO]);
+    f.has_hcho    = groupHasValue(f.status[GRP_HCHO]);
+    f.has_soil    = groupHasValue(f.status[GRP_SOIL]);
+    f.has_battery = groupHasValue(f.status[GRP_BATTERY]);
+    f.has_mic     = groupHasValue(f.status[GRP_MIC]);
+
     if (f.has_sen66) {
         f.pm1 = r.pm1/10.0f; f.pm25 = r.pm25/10.0f; f.pm4 = r.pm4/10.0f; f.pm10 = r.pm10/10.0f;
         f.co2 = r.co2; f.voc = r.voc; f.nox = r.nox;
         f.temp = r.temp/100.0f; f.rh = r.rh/100.0f;
     }
-    f.has_bh1750 = r.flags & PRESENT_BH1750; if (f.has_bh1750) f.lux = r.lux;
-    f.has_bme = r.flags & PRESENT_BME;
+    if (f.has_bh1750) f.lux = r.lux;
     if (f.has_bme) { f.pressure = r.pressure/10.0f; f.bme_temp = r.bme_temp/100.0f; f.bme_rh = r.bme_rh/100.0f; }
-    f.has_adxl = r.flags & PRESENT_ADXL;
     if (f.has_adxl) {
         f.rumble_rms  = r.rumble_rms  / 1000.0f;
         f.rumble_peak = r.rumble_peak / 1000.0f;
@@ -118,11 +136,10 @@ void record_unpack(const Record& r, RecordFields& f) {
         f.accel_dom_hz = r.accel_dom_hz;
         for (int b = 0; b < REC_ACCEL_BANDS; ++b) f.accel_band_db[b] = r.accel_bands[b];
     }
-    f.has_co = r.flags & PRESENT_CO;       if (f.has_co)      f.co_mv = r.co_mv;
-    f.has_hcho = r.flags & PRESENT_HCHO;   if (f.has_hcho)    f.hcho_mv = r.hcho_mv;
-    f.has_soil = r.flags & PRESENT_SOIL;   if (f.has_soil)    f.soil_mv = r.soil_mv;
-    f.has_battery = r.flags & PRESENT_BATTERY; if (f.has_battery) f.bat_raw_mv = r.bat_raw_mv;
-    f.has_mic = r.flags & PRESENT_MIC;
+    if (f.has_co)      f.co_mv = r.co_mv;
+    if (f.has_hcho)    f.hcho_mv = r.hcho_mv;
+    if (f.has_soil)    f.soil_mv = r.soil_mv;
+    if (f.has_battery) f.bat_raw_mv = r.bat_raw_mv;
     if (f.has_mic) {
         f.noise_dba  = r.noise_dba  / 10.0f;
         f.noise_spl  = r.noise_spl  / 10.0f;
@@ -139,6 +156,10 @@ static float gasRsLocal(float vout_mv, float rl_ohms) {
     return rl_ohms * (GAS_VCC_MV - vout_mv) / vout_mv;
 }
 
+// Emit an explicit JSON null (key present, value null) so the server can tell a
+// failed read (FS_INVALID — a real gap) from a carried-forward one (key omitted).
+static void jsonNull(JsonDocument& doc, const char* key) { doc[key] = (const char*)nullptr; }
+
 void record_to_json(const Record& r, JsonDocument& doc) {
     RecordFields f; record_unpack(r, f);
 
@@ -148,14 +169,23 @@ void record_to_json(const Record& r, JsonDocument& doc) {
     doc["up_ms"] = f.up_ms;
     doc["boot"]  = f.boot;
 
-    if (f.has_sen66) {
+    // Slow channel: delta-encoded. FS_OK emits values; FS_UNCHANGED & FS_ABSENT omit
+    // the keys (the server carries the last value forward / leaves them absent);
+    // FS_INVALID emits null to mark a genuine gap. Fast channel (accel/mic) is read
+    // every cycle, so it only emits on FS_OK and omits otherwise (no carry-forward).
+    if (f.status[GRP_SEN66] == FS_OK) {
         doc["pm1"] = f.pm1; doc["pm25"] = f.pm25; doc["pm4"] = f.pm4; doc["pm10"] = f.pm10;
         doc["co2"] = f.co2; doc["voc"] = f.voc; doc["nox"] = f.nox;
         doc["temp"] = f.temp; doc["rh"] = f.rh;
+    } else if (f.status[GRP_SEN66] == FS_INVALID) {
+        for (const char* k : {"pm1","pm25","pm4","pm10","co2","voc","nox","temp","rh"}) jsonNull(doc, k);
     }
-    if (f.has_bh1750) doc["lux"] = f.lux;
-    if (f.has_bme) {
+    if (f.status[GRP_BH1750] == FS_OK)           doc["lux"] = f.lux;
+    else if (f.status[GRP_BH1750] == FS_INVALID) jsonNull(doc, "lux");
+    if (f.status[GRP_BME] == FS_OK) {
         doc["pressure_hpa"] = f.pressure; doc["bme_temp"] = f.bme_temp; doc["bme_rh"] = f.bme_rh;
+    } else if (f.status[GRP_BME] == FS_INVALID) {
+        for (const char* k : {"pressure_hpa","bme_temp","bme_rh"}) jsonNull(doc, k);
     }
     if (f.has_adxl) {
         doc["rumble"]      = f.rumble_rms;
@@ -168,19 +198,29 @@ void record_to_json(const Record& r, JsonDocument& doc) {
         static const char* BAND_KEYS[REC_ACCEL_BANDS] =
             {"vib_4hz","vib_8hz","vib_16hz","vib_31hz","vib_63hz","vib_125hz"};
         for (int b = 0; b < REC_ACCEL_BANDS; ++b) doc[BAND_KEYS[b]] = f.accel_band_db[b];
+    } else if (f.status[GRP_ADXL] == FS_INVALID) {
+        for (const char* k : {"rumble","rumble_peak","accel_mag","ppv_mm_s","accel_dom_hz",
+                              "vib_4hz","vib_8hz","vib_16hz","vib_31hz","vib_63hz","vib_125hz"})
+            jsonNull(doc, k);
     }
-    if (f.has_co) {
+    if (f.status[GRP_CO] == FS_OK) {
         doc["co_mv"] = f.co_mv; doc["co_rs"] = gasRsLocal(f.co_mv, GAS_CO_RL_OHMS);
+    } else if (f.status[GRP_CO] == FS_INVALID) {
+        for (const char* k : {"co_mv","co_rs"}) jsonNull(doc, k);
     }
-    if (f.has_hcho) {
+    if (f.status[GRP_HCHO] == FS_OK) {
         doc["hcho_mv"] = f.hcho_mv; doc["hcho_rs"] = gasRsLocal(f.hcho_mv, GAS_HCHO_RL_OHMS);
+    } else if (f.status[GRP_HCHO] == FS_INVALID) {
+        for (const char* k : {"hcho_mv","hcho_rs"}) jsonNull(doc, k);
     }
-    if (f.has_soil) {
+    if (f.status[GRP_SOIL] == FS_OK) {
         float pct = 100.0f * (float)(SOIL_DRY_MV - (int)f.soil_mv) / (float)(SOIL_DRY_MV - SOIL_WET_MV);
         if (pct < 0) pct = 0; if (pct > 100) pct = 100;
         doc["soil_mv"] = f.soil_mv; doc["soil_pct"] = pct;
+    } else if (f.status[GRP_SOIL] == FS_INVALID) {
+        for (const char* k : {"soil_mv","soil_pct"}) jsonNull(doc, k);
     }
-    if (f.has_battery) {
+    if (f.status[GRP_BATTERY] == FS_OK) {
         doc["bat_raw_mv"] = f.bat_raw_mv; doc["bat_cal"] = f.bat_cal;
         if (f.bat_cal) {
             float v = f.bat_raw_mv / 1000.0f * BAT_DIVIDER_FACTOR;
@@ -188,6 +228,8 @@ void record_to_json(const Record& r, JsonDocument& doc) {
             if (pct < 0) pct = 0; if (pct > 100) pct = 100;
             doc["bat_v"] = v; doc["bat_pct"] = pct;
         }
+    } else if (f.status[GRP_BATTERY] == FS_INVALID) {
+        for (const char* k : {"bat_raw_mv","bat_v","bat_pct"}) jsonNull(doc, k);
     }
     if (f.has_mic) {
         doc["noise_dba"]  = f.noise_dba;      // LAeq over capture window, dB(A)

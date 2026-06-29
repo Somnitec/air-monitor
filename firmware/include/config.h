@@ -173,6 +173,7 @@
 // head/tail are recovered by scanning the dir; only the synced cursor persists.
 #define QUEUE_DIR            "/q"             // directory holding /q/<hex>.seg files
 #define QUEUE_CURSOR_PATH    "/q/cursor"      // double-buffered, CRC'd synced boundary
+#define QUEUE_FMT_PATH       "/q/fmt"         // record-format signature guarding reflash reinterpretation
 #define SEG_RECORDS          500U             // records per segment (500*71 = ~35.5 KB ~= 9 blocks)
 #define RING_CAPACITY        12000U           // logical capacity ~= ~8.3 days @ 60s (24 segments)
 #define SYNC_BATCH_MAX       20              // records POSTed per HTTP request
@@ -194,6 +195,67 @@
 #define SYNC_ATTEMPT_INTERVAL_MS  (10UL * 1000UL)           // 10 s — near-live uploads
 #define SYNC_THRESHOLD_RECORDS    20                         // early-trigger for bursts
 #define BOOT_WINDOW_MS            (5UL * 60UL * 1000UL)      // 5 min
+
+// --- Connection robustness / self-healing ---
+// The station is unattended, so it must recover from a wedged link on its own.
+// All buffered data is durable on flash, so a reboot loses nothing — making
+// "reboot when stuck" a cheap last resort rather than a data-loss event.
+//   - After WIFI_HARD_CYCLE_FAIL consecutive failed sync attempts, fully power-
+//     cycle the radio (clears a stuck DHCP/TCP stack that still reports associated).
+//   - After STALL_REBOOT_MS with no acknowledged sync, ESP.restart() and resume
+//     from the persisted ring cursor.
+//   - The task watchdog reboots if a blocking call (HTTP/mDNS/I2S) hangs the loop.
+#define WIFI_HARD_CYCLE_FAIL      4                          // failed syncs before radio power-cycle
+#define STALL_REBOOT_MS           (15UL * 60UL * 1000UL)     // 15 min with no good sync -> reboot
+#define WDT_TIMEOUT_S             60                          // loop watchdog timeout (> one full sync session)
+#define HTTP_TIMEOUT_MS           5000                        // per-POST timeout (was 8000)
+
+// --- Split-rate + adaptive cadence (cadence.h) ---
+// The mic captures continuously (~1.3 s/capture); these knobs decide which captures
+// get *stored* and how often the slow sensors are re-read. Aircraft flyovers are
+// near-single-sample even at 10 s, so we densify storage when the level moves fast
+// and decimate when quiet. quiet_store_ms defaults to the server-set poll_interval_ms
+// so the dashboard's existing cadence knob still controls the baseline.
+#define SLOW_INTERVAL_MS          (3UL * 60UL * 1000UL)       // slow sensors re-read every 3 min...
+#define SLOW_INTERVAL_DENSE_MS    (20UL * 1000UL)             // ...or every 20 s while densified
+#define NOISE_DENSIFY_DELTA_DBA   6.0f                        // |Δ LAeq| between captures that arms densify
+#define DENSIFY_HOLD_MS           (30UL * 1000UL)             // densified window length after each trigger
+
+// --- POWER_SAVING mode (battery operation) ---------------------------------
+// A third operating mode alongside NORMAL/TESTING, selected from the dashboard and
+// pushed via the /ingest reply like the others. Everything below ONLY takes effect
+// in MODE_POWER_SAVING — NORMAL/TESTING keep their mains-powered behaviour untouched.
+//
+// The radio dominates average current, so power saving duty-cycles WiFi (off between
+// syncs), light-sleeps the CPU between mic captures, gates the analog gas-sensor
+// heaters and the SEN66 fan/laser through their warm-up, and drops the mic sample
+// rate to halve FFT CPU. The accelerometer is read in the same windows as the mic
+// (and sleeps in between) — no separate poll. See DESIGN.md "Phase 4 / power".
+//
+// Sync less often than NORMAL (radio up ~once per interval, then off). Trades
+// dashboard liveness + config-push latency for battery life.
+#define POWER_SAVE_SYNC_INTERVAL_MS   (5UL * 60UL * 1000UL)   // drain ring every 5 min
+// Inter-capture light sleep: after each ~1.3 s mic capture, light-sleep this long
+// (CPU + radio modem suspended, RAM retained) before the next capture. Larger =
+// less power but sparser noise sampling. 0 keeps the loop free-running (no sleep).
+#define POWER_SAVE_CAPTURE_GAP_MS     (5UL * 1000UL)
+// Mic sample rate while power-saving (vs I2S_SAMPLE_RATE_HZ). 16 kHz covers bands up
+// to ~4 kHz (Nyquist 8 kHz) and ~halves FFT CPU; aircraft energy is low-frequency.
+#define POWER_SAVE_MIC_RATE_HZ        16000
+
+// --- Gas-sensor heater gating (analog DFRobot Fermion MEMS boards) ----------
+// The MEMS heaters draw continuously; in power-saving we power them through a
+// low-side MOSFET on this GPIO, warm up, read, then cut power. Set HIGH (heaters on)
+// continuously in NORMAL/TESTING. NOTE: the MOSFET is not on the current board — pin
+// is driven harmlessly until the board is rebuilt. GPIO4 is broken out and free.
+#define PIN_GAS_HEATER_EN     4
+#define GAS_HEATER_WARMUP_MS  (30UL * 1000UL)   // MEMS heater stabilisation before a read
+
+// --- SEN66 duty-cycling -----------------------------------------------------
+// In power-saving the SEN66 is stopped (fan + laser off, idle current) between slow
+// reads; before each read it is restarted and given this long to spin up + stabilise
+// the PM measurement. Datasheet warm-up for stable PM is several seconds.
+#define SEN66_WARMUP_MS       (10UL * 1000UL)
 
 // --- Time ---
 #define NTP_SERVER_1         "pool.ntp.org"

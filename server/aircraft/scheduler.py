@@ -71,7 +71,16 @@ async def run_loop(conn: sqlite3.Connection, db_lock, *, settings: dict, on_snap
                 now = time.monotonic()
                 if now - last_public >= settings["public_poll_sec"]:
                     last_public = now
-                    public_records = await _refresh_public(settings)
+                    # Refresh the public feed in its OWN guard: it needs internet, and
+                    # a failure here must NOT stop the SDR poll below. The local readsb
+                    # feed works offline, so SDR aircraft keep displaying without
+                    # internet. Drop the warm public copy on failure so a fallback
+                    # never shows stale internet positions.
+                    try:
+                        public_records = await _refresh_public(settings)
+                    except Exception as e:
+                        public_records = []
+                        print(f"[aircraft] public feed unavailable (SDR only): {e}")
             await poll_once(conn, db_lock, settings=settings, last_logged=last_logged,
                             on_snapshot=on_snapshot,
                             public_records=public_records if settings["public_enabled"] else None)

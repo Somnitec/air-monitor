@@ -1,6 +1,7 @@
 #include <unity.h>
 #include <math.h>
-#include "record.h"
+#include <string>
+#include "record.h"   // pulls in ArduinoJson.h
 #include "config.h"   // DEVICE_ID, GAS_CO_RL_OHMS, GAS_VCC_MV for the to_json checks
 
 void setUp() {}
@@ -30,10 +31,12 @@ static RecordFields sample() {
     f.noise_lamax = 46.8f;
     f.noise_lceq  = 48.3f;
     for (int b = 0; b < REC_NBANDS; ++b) f.bands[b] = 20.0f + b;
+    // v3: every group present & freshly read in this fixture.
+    for (int g = 0; g < REC_NGROUPS; ++g) f.status[g] = FS_OK;
     return f;
 }
 
-void test_size_is_84() { TEST_ASSERT_EQUAL_UINT(84, sizeof(Record)); }
+void test_size_is_88() { TEST_ASSERT_EQUAL_UINT(88, sizeof(Record)); }
 
 void test_roundtrip_preserves_within_quantization() {
     RecordFields in = sample();
@@ -65,9 +68,60 @@ void test_absent_sensors_clear_present_bits() {
 }
 
 void test_quantization_clamps_high_values() {
-    RecordFields in; in.has_sen66 = true; in.pm25 = 1e9f;   // absurd
+    RecordFields in; in.status[GRP_SEN66] = FS_OK; in.pm25 = 1e9f;   // absurd
     Record r = record_pack(in);
     TEST_ASSERT_EQUAL_UINT16(65535, r.pm25);                // clamped, no wrap
+}
+
+// ---- v3: per-group tri-state status (unchanged / invalid / absent) ----
+
+void test_status_roundtrip() {
+    RecordFields in = sample();
+    in.status[GRP_SEN66]   = FS_OK;
+    in.status[GRP_BME]     = FS_UNCHANGED;   // value carried, present bit still set
+    in.status[GRP_BH1750]  = FS_INVALID;     // failed read
+    in.status[GRP_SOIL]    = FS_ABSENT;      // not installed
+    Record r = record_pack(in);
+    RecordFields out; record_unpack(r, out);
+    TEST_ASSERT_EQUAL_UINT8(FS_OK,        out.status[GRP_SEN66]);
+    TEST_ASSERT_EQUAL_UINT8(FS_UNCHANGED, out.status[GRP_BME]);
+    TEST_ASSERT_EQUAL_UINT8(FS_INVALID,   out.status[GRP_BH1750]);
+    TEST_ASSERT_EQUAL_UINT8(FS_ABSENT,    out.status[GRP_SOIL]);
+    // present bit reflects "installed" (everything except the absent one)
+    TEST_ASSERT_TRUE(r.flags & PRESENT_BME);
+    TEST_ASSERT_FALSE(r.flags & PRESENT_SOIL);
+    // FS_UNCHANGED still carries its value through the binary record
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, in.pressure, out.pressure);
+}
+
+// Serialize to a string so we can distinguish "key omitted" from "key: null".
+static std::string toJsonStr(const RecordFields& in) {
+    Record r = record_pack(in);
+    JsonDocument doc; record_to_json(r, doc);
+    char buf[2048]; serializeJson(doc, buf, sizeof(buf));
+    return std::string(buf);
+}
+
+void test_to_json_unchanged_omits_key() {
+    RecordFields in = sample();
+    in.status[GRP_SEN66] = FS_UNCHANGED;        // carried forward -> omit on the wire
+    std::string s = toJsonStr(in);
+    TEST_ASSERT_TRUE(s.find("\"pm25\"") == std::string::npos);   // key absent
+}
+
+void test_to_json_invalid_emits_null() {
+    RecordFields in = sample();
+    in.status[GRP_SEN66] = FS_INVALID;          // real gap -> explicit null
+    std::string s = toJsonStr(in);
+    TEST_ASSERT_TRUE(s.find("\"pm25\":null") != std::string::npos);
+}
+
+void test_to_json_ok_emits_value() {
+    RecordFields in = sample();
+    in.status[GRP_SEN66] = FS_OK;
+    std::string s = toJsonStr(in);
+    TEST_ASSERT_TRUE(s.find("\"pm25\":null") == std::string::npos);
+    TEST_ASSERT_TRUE(s.find("\"pm25\"") != std::string::npos);   // present with a value
 }
 
 void test_v2_mic_roundtrip() {
@@ -145,10 +199,14 @@ void test_to_json_omits_absent_sensor_keys() {
 
 int main(int, char**) {
     UNITY_BEGIN();
-    RUN_TEST(test_size_is_84);
+    RUN_TEST(test_size_is_88);
     RUN_TEST(test_roundtrip_preserves_within_quantization);
     RUN_TEST(test_absent_sensors_clear_present_bits);
     RUN_TEST(test_quantization_clamps_high_values);
+    RUN_TEST(test_status_roundtrip);
+    RUN_TEST(test_to_json_unchanged_omits_key);
+    RUN_TEST(test_to_json_invalid_emits_null);
+    RUN_TEST(test_to_json_ok_emits_value);
     RUN_TEST(test_v2_mic_roundtrip);
     RUN_TEST(test_v2_accel_roundtrip);
     RUN_TEST(test_to_json_has_expected_keys_and_derived);
