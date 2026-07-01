@@ -423,6 +423,30 @@ SLOW_FILL_KEYS: tuple[str, ...] = (
 _LAST_VALUES: dict[str, dict[str, Any]] = {}   # dev -> {key: last good value}
 
 
+def _seed_fill_cache(dev: Any) -> dict[str, Any]:
+    """Warm a device's forward-fill cache from its most recent stored reading. The
+    cache is per-process, so a server restart (or moving to a fresh DB) starts it cold
+    and the first delta-encoded records — the ones that OMIT unchanged slow values —
+    would land with NULL PM/CO2/temp/… until the next fresh read minutes later. Seeding
+    from the last row (whose payload was already forward-filled before storage) closes
+    that gap. Returns the seeded cache (also stored in _LAST_VALUES)."""
+    cache: dict[str, Any] = {}
+    try:
+        row = _conn.execute(
+            "SELECT payload FROM readings WHERE device IS ? ORDER BY ts DESC LIMIT 1",
+            (dev,),
+        ).fetchone()
+        if row:
+            payload = json.loads(row["payload"])
+            for k in SLOW_FILL_KEYS:
+                if payload.get(k) is not None:
+                    cache[k] = payload[k]
+    except Exception:
+        pass
+    _LAST_VALUES[dev] = cache
+    return cache
+
+
 def _forward_fill(records: list, default_dev: Any) -> None:
     """Reconstruct delta-encoded slow fields across a batch, in place and in order.
     Per slow key of each record: present & non-null -> a fresh value (remember it);
@@ -436,7 +460,9 @@ def _forward_fill(records: list, default_dev: Any) -> None:
         dev = rec.get("dev") or rec.get("device") or default_dev
         if dev is None:
             continue
-        cache = _LAST_VALUES.setdefault(dev, {})
+        cache = _LAST_VALUES.get(dev)
+        if cache is None:                    # first sight this process — warm from DB
+            cache = _seed_fill_cache(dev)
         for k in SLOW_FILL_KEYS:
             if k in rec:
                 if rec[k] is not None:
@@ -464,16 +490,53 @@ def _update_device(dev: str, mode: str, buffered, boot, fw) -> None:
 PORT = int(os.environ.get("PORT", 8000))
 
 
-def _local_ip() -> str:
-    """Best-effort primary LAN IP (the address other devices reach us on)."""
+def _enumerate_ipv4() -> list[str]:
+    """Every non-loopback IPv4 address on this host, any interface. Uses `ifaddr`
+    (a transitive dep of zeroconf), so it needs no route to the internet — the key
+    to working on an offline hotspot where the 8.8.8.8 trick below fails."""
+    ips: list[str] = []
+    try:
+        import ifaddr
+        for adapter in ifaddr.get_adapters():
+            for ip in adapter.ips:
+                addr = ip.ip
+                if isinstance(addr, str) and "." in addr and not addr.startswith("127."):
+                    if addr not in ips:
+                        ips.append(addr)
+    except Exception:
+        pass
+    return ips
+
+
+def _local_ips() -> list[str]:
+    """LAN IPv4 addresses other devices can reach us on, most-likely-primary first.
+    Works offline: with no default route (a hotspot with no upstream) the 8.8.8.8
+    route lookup raises, so we fall back to enumerating every interface address. The
+    old code returned 127.0.0.1 here, which then got advertised over mDNS — so the
+    ESP32 'found' the server at its own loopback and could never deliver anything."""
+    ordered: list[str] = []
+    # 1. If a default route exists, its source IP is the primary LAN address.
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))   # no packets sent; just picks the route's source IP
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
+        s.connect(("8.8.8.8", 80))   # no packets sent; just resolves the route's source IP
+        ip = s.getsockname()[0]
+        if not ip.startswith("127."):
+            ordered.append(ip)
+    except OSError:
+        pass
     finally:
         s.close()
+    # 2. Add every other interface address (the no-route case + multi-homed hosts,
+    #    e.g. ethernet-with-internet AND a hotspot at the same time).
+    for ip in _enumerate_ipv4():
+        if ip not in ordered:
+            ordered.append(ip)
+    return ordered or ["127.0.0.1"]
+
+
+def _local_ip() -> str:
+    """Best-effort primary LAN IP (the address other devices reach us on)."""
+    return _local_ips()[0]
 
 
 async def _start_mdns():
@@ -485,14 +548,16 @@ async def _start_mdns():
     except ImportError:
         print("[mdns] zeroconf not installed — ESP32 must use the static SYNC_HOST fallback")
         return None, None
-    ip = _local_ip()
+    ips = _local_ips()
     # Use a fixed hostname (not socket.gethostname(), which the ESP32 can't predict)
     # so the device can resolve our A-record directly via MDNS.queryHost("airmon-server").
-    # zeroconf registers airmon-server.local. -> ip for us.
+    # zeroconf registers airmon-server.local. -> ip(s) for us. Advertise ALL interface
+    # addresses (primary first) so a device on any of them — the hotspot subnet included
+    # — gets a reachable one; the ESP32 also has a gateway fallback for laptop-as-hotspot.
     info = ServiceInfo(
         "_airmon._tcp.local.",
         "air-monitor._airmon._tcp.local.",
-        addresses=[socket.inet_aton(ip)],
+        addresses=[socket.inet_aton(ip) for ip in ips],
         port=PORT,
         properties={"path": "/ingest"},
         server="airmon-server.local.",
@@ -506,7 +571,7 @@ async def _start_mdns():
         print(f"[mdns] could not register service ({exc.__class__.__name__}) — "
               "ESP32 must use SYNC_HOST fallback")
         return None, None
-    print(f"[mdns] advertising _airmon._tcp at {ip}:{PORT}")
+    print(f"[mdns] advertising _airmon._tcp at {', '.join(ips)}:{PORT}")
     return aiozc, info
 
 

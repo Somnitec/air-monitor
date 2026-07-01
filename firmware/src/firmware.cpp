@@ -197,6 +197,13 @@ static String clockStr() {
 }
 static void syncTimeIfNeeded() {
     if (timeIsValid()) return;
+    // Throttle: each attempt blocks ~2 s and re-inits SNTP. Without this an offline
+    // station (no internet, adopting time from the server reply instead) would stall
+    // the loop on NTP every iteration. The first attempt runs immediately (s==0).
+    static uint32_t s_lastNtpAttempt = 0;
+    uint32_t now = millis();
+    if (s_lastNtpAttempt != 0 && (now - s_lastNtpAttempt) < NTP_RETRY_INTERVAL_MS) return;
+    s_lastNtpAttempt = now;
     configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);   // UTC; tz handled on PC side
     // brief, non-blocking-ish wait; we don't stall the loop for long
     for (int i = 0; i < 20 && !timeIsValid(); ++i) delay(100);
@@ -622,12 +629,46 @@ static void applyServerConfig(const JsonDocument& doc) {
     devconfig_apply_json(cfg_str.c_str(), g_config);
 }
 
+// Ordered list of server endpoints to try, so all three deployment modes work
+// without reconfiguration:
+//   1. the mDNS-resolved host (normal LAN / an external AP shared with the server)
+//   2. the static SYNC_HOST from secrets.h (hardcoded fallback)
+//   3. the WiFi gateway — when the SERVER itself runs the hotspot, it *is* the
+//      gateway, so this nails the laptop-as-hotspot case even if mDNS never resolves.
+// Duplicates are dropped. The winner is pinned into s_serverHost so subsequent
+// batches go straight to it (one attempt) until it fails.
+struct Endpoint { String host; uint16_t port; };
+static uint8_t buildEndpoints(Endpoint out[3]) {
+    uint8_t nc = 0;
+    auto add = [&](const String& h, uint16_t p) {
+        if (!h.length() || h == "0.0.0.0") return;
+        for (uint8_t i = 0; i < nc; ++i) if (out[i].host == h) return;  // dedupe
+        out[nc++] = { h, p };
+    };
+    if (s_serverHost.length()) add(s_serverHost, s_serverPort);
+    add(String(SYNC_HOST), (uint16_t)SYNC_PORT);
+    IPAddress gw = WiFi.gatewayIP();
+    if (gw != IPAddress(0, 0, 0, 0)) add(gw.toString(), (uint16_t)SYNC_PORT);
+    return nc;
+}
+
+// One HTTP POST of a pre-serialized body to a single endpoint. Returns the HTTP code
+// (<=0 on transport failure) and fills `resp` with the body on a 2xx.
+static int httpPostTo(const String& host, uint16_t port, const String& body, String& resp) {
+    HTTPClient http;
+    String url = String("http://") + host + ":" + String(port) + SYNC_PATH;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    int code = http.POST(body);
+    resp = http.getString();
+    http.end();
+    return code;
+}
+
 // POST one batch of records as an envelope. Returns the HTTP code; on success
 // advances the synced pointer and applies any server command.
 static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
-    String   host = s_serverHost.length() ? s_serverHost : String(SYNC_HOST);
-    uint16_t port = s_serverHost.length() ? s_serverPort : (uint16_t)SYNC_PORT;
-
     JsonDocument doc;
     doc["dev"]          = DEVICE_ID;
     doc["boot"]         = g_bootId;
@@ -639,39 +680,48 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
     JsonArray arr = doc["records"].to<JsonArray>();
     for (uint32_t i = 0; i < n; ++i) {
         JsonDocument tmp;
-        record_to_json(recs[i], tmp);
+        // First record of the batch carries a FULL slow snapshot (not delta-encoded)
+        // so the server reconstructs correctly even with a cold forward-fill cache —
+        // the reconnect-after-outage case where the backlog would otherwise start with
+        // NULL PM/CO2/temp/… until the next fresh read.
+        record_to_json(recs[i], tmp, /*full_slow=*/ i == 0);
         arr.add(tmp);
     }
     String body; serializeJson(doc, body);
 
-    HTTPClient http;
-    String url = String("http://") + host + ":" + String(port) + SYNC_PATH;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(HTTP_TIMEOUT_MS);
-    int code = http.POST(body);
-    String resp = http.getString();
-    http.end();
-
-    if (code == 200 || code == 201 || code == 204) {
-        JsonDocument rdoc;
-        if (!deserializeJson(rdoc, resp)) {
-            adoptServerTime(resp);
-            applyServerCommand(rdoc);
-            applyServerConfig(rdoc);
+    Endpoint eps[3];
+    uint8_t nep = buildEndpoints(eps);
+    int lastCode = -1;
+    for (uint8_t i = 0; i < nep; ++i) {
+        esp_task_wdt_reset();   // trying several endpoints can take a few seconds
+        String resp;
+        int code = httpPostTo(eps[i].host, eps[i].port, body, resp);
+        if (code == 200 || code == 201 || code == 204) {
+            s_serverHost = eps[i].host;   // pin the working endpoint for next time
+            s_serverPort = eps[i].port;
+            JsonDocument rdoc;
+            if (!deserializeJson(rdoc, resp)) {
+                adoptServerTime(resp);
+                applyServerCommand(rdoc);
+                applyServerConfig(rdoc);
+            }
+            ringstore_mark_synced(lastSeq);
+            g_consecutiveSyncFail = 0;
+            g_lastGoodSyncMs      = millis();
+            Serial.printf("%s[sync] %u acked via %s:%u (unsynced now %u)\n",
+                          clockStr().c_str(), n, eps[i].host.c_str(), eps[i].port,
+                          ringstore_unsynced());
+            ledPulse();
+            return code;
         }
-        ringstore_mark_synced(lastSeq);
-        g_consecutiveSyncFail = 0;
-        g_lastGoodSyncMs      = millis();
-        Serial.printf("%s[sync] %u acked (unsynced now %u)\n", clockStr().c_str(), n, ringstore_unsynced());
-        ledPulse();
-        return code;
+        lastCode = code;
     }
-    Serial.printf("[sync] POST failed code=%d — server unreachable, latest values over USB:\n", code);
+    Serial.printf("[sync] POST failed (last code=%d, %u endpoint(s)) — server unreachable,"
+                  " latest values over USB:\n", lastCode, nep);
     if (n > 0) { RecordFields lf; record_unpack(recs[n - 1], lf); logCapturedValues(lf); }
     g_consecutiveSyncFail++;
     s_serverHost = "";     // force re-discovery next time
-    return code;
+    return lastCode;
 }
 
 // Drain the ring to the server in batches until empty or a POST fails.

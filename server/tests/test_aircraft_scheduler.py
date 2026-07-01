@@ -78,6 +78,31 @@ class TestPollOnce(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(seen.get("reached"))      # SDR poll ran despite the public failure
         self.assertEqual(seen["public_records"], [])  # stale internet copy dropped
 
+    async def test_sdr_poll_not_blocked_by_slow_public_refresh(self):
+        """A hanging public refresh (no internet: connect timeout / DNS stall) must not
+        delay the local readsb poll — the refresh runs as a background task, never
+        awaited inline. Without decoupling, poll_once would wait out the hang."""
+        settings = _settings(public_enabled=True, public_poll_sec=0.0, poll_sec=0.0)
+        reached = {}
+
+        async def slow_refresh(_s):               # simulate a DNS/connect hang
+            await asyncio.sleep(3600)
+            return []
+
+        async def fake_poll(conn, lock, *, settings, last_logged,
+                            on_snapshot=None, public_records=None):
+            reached["ok"] = True
+            raise asyncio.CancelledError          # break out of the loop immediately
+
+        with patch.object(scheduler, "_refresh_public", slow_refresh), \
+             patch.object(scheduler, "poll_once", fake_poll):
+            with self.assertRaises((asyncio.CancelledError, asyncio.TimeoutError)):
+                # 2 s guard: if poll_once were blocked on the 3600 s refresh this trips.
+                await asyncio.wait_for(
+                    scheduler.run_loop(self.conn, self.lock, settings=settings), timeout=2.0)
+
+        self.assertTrue(reached.get("ok"))        # poll ran without awaiting the hang
+
 
 if __name__ == "__main__":
     unittest.main()

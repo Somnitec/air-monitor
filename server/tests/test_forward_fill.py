@@ -1,6 +1,8 @@
 """Delta decoding (schema v3): the server carries forward omitted slow-channel
 values, treats an explicit null as a real gap, and keeps devices isolated.
 Pure function test — no HTTP, no DB writes."""
+import json
+import sqlite3
 import unittest
 
 import server
@@ -54,6 +56,42 @@ class TestForwardFill(unittest.TestCase):
         recs = [{}]
         server._forward_fill(recs, "fallback")
         self.assertEqual(recs[0]["pm25"], 2.0)
+
+
+class TestForwardFillColdCacheSeed(unittest.TestCase):
+    """On a cold start (server restart / fresh process), the first delta record that
+    OMITS unchanged slow values must still populate them — seeded from the device's
+    latest stored reading — instead of landing as NULL until the next fresh read."""
+
+    def setUp(self):
+        server._LAST_VALUES.clear()
+        self._orig_conn = getattr(server, "_conn", None)
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE readings (id INTEGER PRIMARY KEY, ts INTEGER, device TEXT, payload TEXT)"
+        )
+        conn.execute("INSERT INTO readings (ts, device, payload) VALUES (?,?,?)",
+                     (100, "d", json.dumps({"pm25": 7.5, "co2": 900})))
+        conn.execute("INSERT INTO readings (ts, device, payload) VALUES (?,?,?)",
+                     (200, "d", json.dumps({"pm25": 8.0, "co2": 950})))
+        conn.commit()
+        server._conn = conn
+
+    def tearDown(self):
+        server._conn = self._orig_conn
+        server._LAST_VALUES.clear()
+
+    def test_cold_cache_seeds_from_latest_db_row(self):
+        recs = [{"dev": "d"}]                       # delta record omitting slow values
+        server._forward_fill(recs, "d")
+        self.assertEqual(recs[0]["pm25"], 8.0)      # newest row (ts=200) wins
+        self.assertEqual(recs[0]["co2"], 950)
+
+    def test_seed_is_noop_for_unknown_device(self):
+        recs = [{"dev": "other"}]                   # no history in the DB
+        server._forward_fill(recs, "other")
+        self.assertNotIn("pm25", recs[0])
 
 
 if __name__ == "__main__":

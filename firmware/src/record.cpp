@@ -160,8 +160,13 @@ static float gasRsLocal(float vout_mv, float rl_ohms) {
 // failed read (FS_INVALID — a real gap) from a carried-forward one (key omitted).
 static void jsonNull(JsonDocument& doc, const char* key) { doc[key] = (const char*)nullptr; }
 
-void record_to_json(const Record& r, JsonDocument& doc) {
+void record_to_json(const Record& r, JsonDocument& doc, bool full_slow) {
     RecordFields f; record_unpack(r, f);
+
+    // A slow group's value is emitted when freshly read (FS_OK) or, for the batch's
+    // seed record, when carried forward (FS_UNCHANGED + full_slow) — the value is
+    // already in `f` for both. FS_INVALID/FS_ABSENT are unaffected.
+    auto emitSlow = [&](uint8_t st) { return st == FS_OK || (full_slow && st == FS_UNCHANGED); };
 
     doc["ts"]    = f.ts;
     doc["ts_ok"] = f.ts_ok;
@@ -173,16 +178,16 @@ void record_to_json(const Record& r, JsonDocument& doc) {
     // the keys (the server carries the last value forward / leaves them absent);
     // FS_INVALID emits null to mark a genuine gap. Fast channel (accel/mic) is read
     // every cycle, so it only emits on FS_OK and omits otherwise (no carry-forward).
-    if (f.status[GRP_SEN66] == FS_OK) {
+    if (emitSlow(f.status[GRP_SEN66])) {
         doc["pm1"] = f.pm1; doc["pm25"] = f.pm25; doc["pm4"] = f.pm4; doc["pm10"] = f.pm10;
         doc["co2"] = f.co2; doc["voc"] = f.voc; doc["nox"] = f.nox;
         doc["temp"] = f.temp; doc["rh"] = f.rh;
     } else if (f.status[GRP_SEN66] == FS_INVALID) {
         for (const char* k : {"pm1","pm25","pm4","pm10","co2","voc","nox","temp","rh"}) jsonNull(doc, k);
     }
-    if (f.status[GRP_BH1750] == FS_OK)           doc["lux"] = f.lux;
+    if (emitSlow(f.status[GRP_BH1750]))          doc["lux"] = f.lux;
     else if (f.status[GRP_BH1750] == FS_INVALID) jsonNull(doc, "lux");
-    if (f.status[GRP_BME] == FS_OK) {
+    if (emitSlow(f.status[GRP_BME])) {
         doc["pressure_hpa"] = f.pressure; doc["bme_temp"] = f.bme_temp; doc["bme_rh"] = f.bme_rh;
     } else if (f.status[GRP_BME] == FS_INVALID) {
         for (const char* k : {"pressure_hpa","bme_temp","bme_rh"}) jsonNull(doc, k);
@@ -203,24 +208,24 @@ void record_to_json(const Record& r, JsonDocument& doc) {
                               "vib_4hz","vib_8hz","vib_16hz","vib_31hz","vib_63hz","vib_125hz"})
             jsonNull(doc, k);
     }
-    if (f.status[GRP_CO] == FS_OK) {
+    if (emitSlow(f.status[GRP_CO])) {
         doc["co_mv"] = f.co_mv; doc["co_rs"] = gasRsLocal(f.co_mv, GAS_CO_RL_OHMS);
     } else if (f.status[GRP_CO] == FS_INVALID) {
         for (const char* k : {"co_mv","co_rs"}) jsonNull(doc, k);
     }
-    if (f.status[GRP_HCHO] == FS_OK) {
+    if (emitSlow(f.status[GRP_HCHO])) {
         doc["hcho_mv"] = f.hcho_mv; doc["hcho_rs"] = gasRsLocal(f.hcho_mv, GAS_HCHO_RL_OHMS);
     } else if (f.status[GRP_HCHO] == FS_INVALID) {
         for (const char* k : {"hcho_mv","hcho_rs"}) jsonNull(doc, k);
     }
-    if (f.status[GRP_SOIL] == FS_OK) {
+    if (emitSlow(f.status[GRP_SOIL])) {
         float pct = 100.0f * (float)(SOIL_DRY_MV - (int)f.soil_mv) / (float)(SOIL_DRY_MV - SOIL_WET_MV);
         if (pct < 0) pct = 0; if (pct > 100) pct = 100;
         doc["soil_mv"] = f.soil_mv; doc["soil_pct"] = pct;
     } else if (f.status[GRP_SOIL] == FS_INVALID) {
         for (const char* k : {"soil_mv","soil_pct"}) jsonNull(doc, k);
     }
-    if (f.status[GRP_BATTERY] == FS_OK) {
+    if (emitSlow(f.status[GRP_BATTERY])) {
         doc["bat_raw_mv"] = f.bat_raw_mv; doc["bat_cal"] = f.bat_cal;
         if (f.bat_cal) {
             float v = f.bat_raw_mv / 1000.0f * BAT_DIVIDER_FACTOR;

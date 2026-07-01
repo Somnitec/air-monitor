@@ -134,4 +134,10 @@ void    record_unpack(const Record& r, RecordFields& out);   // inverse (lossy b
 
 // Expand a record into the JSON field set, re-deriving co_rs/hcho_rs,
 // soil_pct, bat_v/bat_pct, ppv_mm_s from config constants.
-void    record_to_json(const Record& r, JsonDocument& doc);
+//
+// full_slow: normally the slow channel is delta-encoded — FS_UNCHANGED groups omit
+// their keys and the server carries the last value forward. Set full_slow=true to
+// instead emit the carried-forward values in full (treat FS_UNCHANGED like FS_OK).
+// Used for the first record of each sync batch so a reconnect backlog reconstructs
+// correctly even when the server's forward-fill cache is cold (restart / fresh DB).
+void    record_to_json(const Record& r, JsonDocument& doc, bool full_slow = false);
