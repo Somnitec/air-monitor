@@ -260,6 +260,10 @@
 // --- Time ---
 #define NTP_SERVER_1         "pool.ntp.org"
 #define NTP_SERVER_2         "time.google.com"
+// How often to (re)attempt NTP while the clock is still unsynced. Each attempt briefly
+// blocks the loop (~2 s) and re-inits SNTP, so without this throttle an offline station
+// stalls every loop until it adopts server time. Once synced, no attempts are made.
+#define NTP_RETRY_INTERVAL_MS (60UL * 1000UL)
 // Epoch sanity floor: a timestamp below this means NTP never succeeded.
 #define EPOCH_VALID_AFTER    1735689600UL  // 2025-01-01; records before this are "unsynced time"
 

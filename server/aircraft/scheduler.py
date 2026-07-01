@@ -61,31 +61,46 @@ async def run_loop(conn: sqlite3.Connection, db_lock, *, settings: dict, on_snap
     """Poll the local readsb snapshot every `poll_sec`. Keep a warm copy of the public
     reference feed (refreshed on its own slower cadence) so that if the dongle drops,
     `poll_once` can fall back to it instantly. While the dongle is feeding, the public
-    copy is just kept warm and never shown."""
+    copy is just kept warm and never shown.
+
+    The public refresh runs as a *background task*, never awaited inline: it needs the
+    internet, and with none a `requests` call can block for the connect timeout (or a
+    DNS hang) — which, if awaited here, would freeze the local readsb poll for seconds
+    every cycle. Since the readsb feed is a local file that works offline, the SDR map
+    must keep updating at `poll_sec` regardless. The task just drops its result into a
+    shared holder; the next `poll_once` reads whatever is current."""
     last_logged: dict[str, float] = {}
-    public_records: list = []
+    holder: dict[str, list] = {"public": []}   # updated in place by the refresher task
+    refresh_task: asyncio.Task | None = None
     last_public = 0.0
-    while True:
+
+    async def _do_refresh() -> None:
+        # Drop the warm public copy on failure so a fallback never shows stale
+        # internet positions. Never propagates — a dead feed is "SDR only", not fatal.
         try:
-            if settings["public_enabled"]:
-                now = time.monotonic()
-                if now - last_public >= settings["public_poll_sec"]:
-                    last_public = now
-                    # Refresh the public feed in its OWN guard: it needs internet, and
-                    # a failure here must NOT stop the SDR poll below. The local readsb
-                    # feed works offline, so SDR aircraft keep displaying without
-                    # internet. Drop the warm public copy on failure so a fallback
-                    # never shows stale internet positions.
-                    try:
-                        public_records = await _refresh_public(settings)
-                    except Exception as e:
-                        public_records = []
-                        print(f"[aircraft] public feed unavailable (SDR only): {e}")
-            await poll_once(conn, db_lock, settings=settings, last_logged=last_logged,
-                            on_snapshot=on_snapshot,
-                            public_records=public_records if settings["public_enabled"] else None)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:                       # never let one bad tick kill the loop
-            print(f"[aircraft] poll error: {e}")
-        await asyncio.sleep(settings["poll_sec"])
+            holder["public"] = await _refresh_public(settings)
+        except Exception as e:
+            holder["public"] = []
+            print(f"[aircraft] public feed unavailable (SDR only): {e}")
+
+    try:
+        while True:
+            try:
+                if settings["public_enabled"]:
+                    now = time.monotonic()
+                    # Launch at most one refresh at a time, on its own slow cadence.
+                    if (now - last_public >= settings["public_poll_sec"]
+                            and (refresh_task is None or refresh_task.done())):
+                        last_public = now
+                        refresh_task = asyncio.create_task(_do_refresh())
+                await poll_once(conn, db_lock, settings=settings, last_logged=last_logged,
+                                on_snapshot=on_snapshot,
+                                public_records=holder["public"] if settings["public_enabled"] else None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:                   # never let one bad tick kill the loop
+                print(f"[aircraft] poll error: {e}")
+            await asyncio.sleep(settings["poll_sec"])
+    finally:
+        if refresh_task is not None and not refresh_task.done():
+            refresh_task.cancel()
