@@ -1,0 +1,30 @@
+# Air Monitor collector + dashboard — systemd user unit.
+#
+# Install (once):
+#   mkdir -p ~/.config/systemd/user
+#   cp server/air-monitor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now air-monitor
+#   loginctl enable-linger $USER     # keep it running after logout/reboot
+#
+# Logs:   journalctl --user -u air-monitor -f
+# The DB stays at server/data/air-monitor.db unless AIRMON_DB is set below.
+
+[Unit]
+Description=Air Monitor collector + dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/Documents/code/air-monitor/server
+# .venv (not venv): built with the HOST python. The sibling venv/ was created inside
+# the VS Code flatpak (python 3.13) and doesn't run outside it (host is 3.14).
+ExecStart=%h/Documents/code/air-monitor/server/.venv/bin/python server.py
+Restart=always
+RestartSec=5
+# Safety net: if memory ever runs away again, restart the service instead of
+# dragging the whole machine down. Normal footprint is well under 200 MB.
+MemoryMax=500M
+
+[Install]
+WantedBy=default.target

@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS aircraft (
 );
 CREATE INDEX IF NOT EXISTS idx_aircraft_ts  ON aircraft(ts);
 CREATE INDEX IF NOT EXISTS idx_aircraft_hex ON aircraft(hex);
+-- Covers the research views' aircraft-side work (loudness_by_type,
+-- noise_with_aircraft, daily_summary flight counts): probe/scan by ts, then
+-- filter on distance and group by type/hex without ever touching the row.
+DROP INDEX IF EXISTS idx_aircraft_ts_dist;
+CREATE INDEX IF NOT EXISTS idx_aircraft_research ON aircraft(ts, distance_km, type, hex);
 """
 
 # Columns added after the initial release; each gets a plain ALTER on older DBs.

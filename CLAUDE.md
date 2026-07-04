@@ -32,6 +32,17 @@ Practical consequences when prioritizing:
 
 PlatformIO CLI lives at `~/.platformio/penv/bin/pio`; the server's venv at `server/venv`.
 
+**The server runs as a systemd user service** (`air-monitor`, unit file at
+`server/air-monitor.service`, linger enabled so it survives logout). Two venvs exist on
+purpose: `server/venv` (VS Code flatpak python 3.13 — use for pytest inside the IDE) and
+`server/.venv` (host python 3.14 — what the service runs; rebuild with the host python).
+From inside the VS Code flatpak, host commands need `flatpak-spawn --host`:
+
+```bash
+flatpak-spawn --host systemctl --user restart air-monitor    # deploy server changes
+flatpak-spawn --host journalctl --user -u air-monitor -f     # server logs
+```
+
 ```bash
 # --- firmware (run from firmware/) ---
 ~/.platformio/penv/bin/pio test -e native            # host unit tests (record/ring/seg logic)

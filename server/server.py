@@ -65,6 +65,56 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 _db_lock = asyncio.Lock()
 _conn: sqlite3.Connection
 
+# Dashboard/analysis reads run on a second, read-only connection inside a worker
+# thread: every _conn.execute() is synchronous on the event loop, so a slow scan
+# there freezes /ingest, websockets — everything — for its whole duration. WAL mode
+# gives readers a consistent snapshot concurrent with the writer.
+_ro_conn: sqlite3.Connection | None = None
+_ro_lock = asyncio.Lock()
+
+
+def _open_ro_conn() -> sqlite3.Connection | None:
+    """Read-only companion connection to DB_PATH. Returns None for in-memory DBs
+    (tests): a second ':memory:' connection would be a different, empty database,
+    so those fall back to the shared connection under the write lock."""
+    if str(DB_PATH) == ":memory:":
+        return None
+    conn = sqlite3.connect(f"{DB_PATH.resolve().as_uri()}?mode=ro",
+                           uri=True, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+
+async def _read_query(fn):
+    """Run `fn(conn)` — a blocking, read-only DB function — without stalling the
+    event loop. `_ro_lock` serialises access: one worker thread at a time may use
+    the sqlite connection."""
+    if _ro_conn is not None:
+        async with _ro_lock:
+            return await asyncio.to_thread(fn, _ro_conn)
+    async with _db_lock:
+        return fn(_conn)
+
+
+# The research aggregates scan the whole history, so a dashboard (or several open
+# tabs) refreshing every couple of minutes must not re-run them back to back.
+# Expired entries are pruned on every miss, keeping the cache bounded.
+_research_cache: dict[str, tuple[float, Any]] = {}
+_RESEARCH_TTL = 60.0
+
+
+async def _cached_read(key: str, fn):
+    now = time.monotonic()
+    hit = _research_cache.get(key)
+    if hit is not None and now - hit[0] < _RESEARCH_TTL:
+        return hit[1]
+    result = await _read_query(fn)
+    for k in [k for k, (t, _) in _research_cache.items() if now - t >= _RESEARCH_TTL]:
+        del _research_cache[k]
+    _research_cache[key] = (now, result)
+    return result
+
 
 # Records timestamped before this are from an unsynced ESP32 clock and can't be
 # trusted (mirrors firmware EPOCH_VALID_AFTER = 2025-01-01).
@@ -129,6 +179,14 @@ def _init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_readings_ts     ON readings(ts);
         CREATE INDEX IF NOT EXISTS idx_readings_device ON readings(device);
         CREATE INDEX IF NOT EXISTS idx_readings_dedup  ON readings(device, device_ts, boot);
+        -- _backfill_times runs on nearly every ingest batch; without this it scans
+        -- every row of the device (grows with the table) instead of one boot's slice.
+        CREATE INDEX IF NOT EXISTS idx_readings_boot   ON readings(device, boot, ts_source);
+        -- Covers the research views' reading-side scans. The metric columns are
+        -- generated VIRTUAL (json_extract on access), so without this every
+        -- aggregate reads every row's full JSON payload — the whole table.
+        CREATE INDEX IF NOT EXISTS idx_readings_research
+            ON readings(ts, lamax, noise_dba, pm25, co2);
 
         CREATE TABLE IF NOT EXISTS events (
             id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,6 +242,8 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
 
         -- Each loud-ish reading joined to the closest aircraft overhead within ±30 s.
         -- "Which plane made this noise?" — the basis for cause attribution.
+        -- The ±30 s window is a BETWEEN (not ABS()) so the aircraft ts index is used;
+        -- ABS() forced a full aircraft scan per loud reading (seconds, growing daily).
         DROP VIEW IF EXISTS noise_with_aircraft;
         CREATE VIEW noise_with_aircraft AS
         SELECT r.ts,
@@ -192,23 +252,26 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
                a.hex, a.flight, a.type, a.category, a.operator,
                a.alt_baro, a.gs, a.baro_rate,
                round(a.distance_km, 2) AS dist_km
-        FROM readings r
+        FROM readings r INDEXED BY idx_readings_research
         LEFT JOIN aircraft a ON a.id = (
             SELECT a2.id FROM aircraft a2
-            WHERE ABS(a2.ts - r.ts) <= 30
+            WHERE a2.ts BETWEEN r.ts - 30 AND r.ts + 30
             ORDER BY a2.distance_km ASC LIMIT 1)
         WHERE COALESCE(r.lamax, r.noise_dba) BETWEEN 60 AND 140
         ORDER BY r.ts;
 
         -- Which aircraft TYPES are loudest (avg + peak), for types seen overhead (≤8 km).
+        -- Driven from readings (the smaller table) with a BETWEEN range join so each
+        -- reading probes the aircraft ts index; the old ABS() join compared every
+        -- reading against every sighting and stopped finishing after a week of data.
         DROP VIEW IF EXISTS loudness_by_type;
         CREATE VIEW loudness_by_type AS
         SELECT a.type,
                COUNT(*) AS n_samples,
                round(AVG(r.noise_dba), 1) AS avg_dba,
                round(MAX(COALESCE(r.lamax, r.noise_dba)), 1) AS max_dba
-        FROM aircraft a
-        JOIN readings r ON ABS(r.ts - a.ts) <= 15
+        FROM readings r INDEXED BY idx_readings_research
+        JOIN aircraft a ON a.ts BETWEEN r.ts - 15 AND r.ts + 15
         WHERE a.distance_km <= 8 AND a.type IS NOT NULL
           AND r.noise_dba BETWEEN 0 AND 140
         GROUP BY a.type
@@ -217,31 +280,41 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
 
         -- Per local day: flights overhead, loudness, event counts, air quality.
         -- "Clearly better air when they don't fly for a day?" lives here.
+        -- One GROUP BY pass over each table; the previous version ran eight
+        -- correlated full-scan subqueries per day (O(days × rows)).
         DROP VIEW IF EXISTS daily_summary;
         CREATE VIEW daily_summary AS
-        WITH days(day) AS (
-            SELECT DISTINCT date(ts,'unixepoch','localtime') FROM readings
-            UNION
-            SELECT DISTINCT date(ts,'unixepoch','localtime') FROM aircraft)
-        SELECT day,
-            (SELECT COUNT(DISTINCT hex) FROM aircraft
-               WHERE date(ts,'unixepoch','localtime')=day AND distance_km<=10) AS flights,
-            (SELECT round(MAX(COALESCE(lamax,noise_dba)),1) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day
-                 AND COALESCE(lamax,noise_dba) BETWEEN 0 AND 140) AS max_db,
-            (SELECT COUNT(*) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba) BETWEEN 65 AND 140) AS n_ge65,
-            (SELECT COUNT(*) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba) BETWEEN 70 AND 140) AS n_ge70,
-            (SELECT COUNT(*) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day AND COALESCE(lamax,noise_dba) BETWEEN 65 AND 140
-                 AND (CAST(strftime('%H',ts,'unixepoch','localtime') AS INTEGER)<7
-                   OR CAST(strftime('%H',ts,'unixepoch','localtime') AS INTEGER)>=23)) AS n_ge65_night,
-            (SELECT round(AVG(pm25),1) FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day AND pm25 BETWEEN 0 AND 1000) AS avg_pm25,
-            (SELECT round(AVG(co2),0)  FROM readings
-               WHERE date(ts,'unixepoch','localtime')=day AND co2 BETWEEN 0 AND 40000) AS avg_co2
-        FROM days ORDER BY day DESC;
+        -- INDEXED BY: the metric columns are generated VIRTUAL, and the planner
+        -- keeps choosing a table scan (reading every row's whole JSON payload)
+        -- over the much smaller covering index that stores their values.
+        WITH rd AS (
+            SELECT date(ts,'unixepoch','localtime') AS day,
+                   round(MAX(CASE WHEN COALESCE(lamax,noise_dba) BETWEEN 0 AND 140
+                                  THEN COALESCE(lamax,noise_dba) END),1) AS max_db,
+                   COUNT(CASE WHEN COALESCE(lamax,noise_dba) BETWEEN 65 AND 140
+                              THEN 1 END) AS n_ge65,
+                   COUNT(CASE WHEN COALESCE(lamax,noise_dba) BETWEEN 70 AND 140
+                              THEN 1 END) AS n_ge70,
+                   COUNT(CASE WHEN COALESCE(lamax,noise_dba) BETWEEN 65 AND 140
+                              AND (CAST(strftime('%H',ts,'unixepoch','localtime') AS INTEGER)<7
+                                OR CAST(strftime('%H',ts,'unixepoch','localtime') AS INTEGER)>=23)
+                              THEN 1 END) AS n_ge65_night,
+                   round(AVG(CASE WHEN pm25 BETWEEN 0 AND 1000 THEN pm25 END),1) AS avg_pm25,
+                   round(AVG(CASE WHEN co2 BETWEEN 0 AND 40000 THEN co2 END),0) AS avg_co2
+            FROM readings INDEXED BY idx_readings_research GROUP BY day),
+        ac AS (
+            SELECT date(ts,'unixepoch','localtime') AS day,
+                   COUNT(DISTINCT hex) AS flights
+            FROM aircraft WHERE distance_km <= 10 GROUP BY day),
+        days AS (SELECT day FROM rd UNION SELECT day FROM ac)
+        SELECT days.day,
+               COALESCE(ac.flights, 0) AS flights,
+               rd.max_db, rd.n_ge65, rd.n_ge70, rd.n_ge65_night,
+               rd.avg_pm25, rd.avg_co2
+        FROM days
+        LEFT JOIN rd ON rd.day = days.day
+        LEFT JOIN ac ON ac.day = days.day
+        ORDER BY days.day DESC;
         """
     )
     conn.commit()
@@ -385,10 +458,13 @@ class Hub:
         self.clients.discard(ws)
 
     async def broadcast(self, msg: dict) -> None:
+        # Broadcast is awaited inside /ingest and the 1 Hz aircraft loop, so one
+        # stalled client (backpressured send) must not freeze the whole server:
+        # a client that can't take the message within 1 s is dropped.
         dead = []
-        for ws in self.clients:
+        for ws in list(self.clients):
             try:
-                await ws.send_json(msg)
+                await asyncio.wait_for(ws.send_json(msg), timeout=1.0)
             except Exception:
                 dead.append(ws)
         for ws in dead:
@@ -643,8 +719,9 @@ async def _on_aircraft_snapshot(records) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _conn
+    global _conn, _ro_conn
     _conn = _init_db()
+    _ro_conn = _open_ro_conn()   # after _init_db: the file and views must exist
     print(f"[air-monitor] DB: {DB_PATH}")
     aiozc, info = await _start_mdns()
     cloudflared = _start_cloudflared()   # opt-in remote access (CLOUDFLARED_TUNNEL=...)
@@ -696,6 +773,9 @@ async def lifespan(app: FastAPI):
             cloudflared.wait(timeout=5)
         except Exception:
             cloudflared.kill()
+    if _ro_conn is not None:
+        _ro_conn.close()
+        _ro_conn = None
     _conn.close()
 
 
@@ -947,9 +1027,9 @@ async def get_readings(
         sql += " AND device = ?"; args.append(device)
     sql += " ORDER BY ts ASC LIMIT ?"; args.append(int(limit))
 
-    async with _db_lock:
-        rows = _conn.execute(sql, args).fetchall()
-    return JSONResponse([_flatten(r) for r in rows])
+    flat = await _read_query(
+        lambda c: [_flatten(r) for r in c.execute(sql, args).fetchall()])
+    return JSONResponse(flat)
 
 
 @app.get("/api/latest")
@@ -995,17 +1075,19 @@ async def stats():
 async def research_daily(limit: int = 30):
     """Per-day rollup: flights overhead, loudness, >65/>70 dB counts (incl. night),
     avg PM2.5 / CO2. Backed by the `daily_summary` view."""
-    async with _db_lock:
-        rows = _conn.execute("SELECT * FROM daily_summary LIMIT ?", (int(limit),)).fetchall()
-    return JSONResponse([dict(r) for r in rows])
+    rows = await _cached_read(f"daily:{limit}", lambda c: [
+        dict(r) for r in c.execute("SELECT * FROM daily_summary LIMIT ?",
+                                   (int(limit),)).fetchall()])
+    return JSONResponse(rows)
 
 
 @app.get("/api/research/loudness")
 async def research_loudness(limit: int = 25):
     """Average + peak noise per aircraft type seen overhead — which types are loudest."""
-    async with _db_lock:
-        rows = _conn.execute("SELECT * FROM loudness_by_type LIMIT ?", (int(limit),)).fetchall()
-    return JSONResponse([dict(r) for r in rows])
+    rows = await _cached_read(f"loudness:{limit}", lambda c: [
+        dict(r) for r in c.execute("SELECT * FROM loudness_by_type LIMIT ?",
+                                   (int(limit),)).fetchall()])
+    return JSONResponse(rows)
 
 
 @app.get("/api/research/noise_events")
@@ -1017,9 +1099,9 @@ async def research_noise_events(limit: int = 100, since: int | None = None):
     if since is not None:
         sql += " WHERE ts >= ?"; args.append(int(since))
     sql += " ORDER BY ts DESC LIMIT ?"; args.append(int(limit))
-    async with _db_lock:
-        rows = _conn.execute(sql, args).fetchall()
-    return JSONResponse([dict(r) for r in rows])
+    rows = await _cached_read(f"noise_events:{limit}:{since}", lambda c: [
+        dict(r) for r in c.execute(sql, args).fetchall()])
+    return JSONResponse(rows)
 
 
 # ---- Dutch / EU aircraft noise statistics -------------------------------- #
@@ -1121,16 +1203,15 @@ async def noise_stats(
         sql += " AND device = ?"; args.append(device)
     sql += " ORDER BY ts ASC"
 
-    async with _db_lock:
-        rows = _conn.execute(sql, args).fetchall()
+    def _fetch(c: sqlite3.Connection) -> list[dict]:
+        payloads = []
+        for r in c.execute(sql, args).fetchall():
+            p = json.loads(r["payload"])
+            p["device"] = r["device"]
+            payloads.append(p)
+        return payloads
 
-    payloads = []
-    for r in rows:
-        p = json.loads(r["payload"])
-        p["device"] = r["device"]
-        payloads.append(p)
-
-    return JSONResponse(_lden_from_rows(payloads))
+    return JSONResponse(_lden_from_rows(await _read_query(_fetch)))
 
 
 # ---- audio frequency bands ------------------------------------------------ #
@@ -1156,20 +1237,15 @@ async def audio_bands(
         sql += " AND device = ?"; args.append(device)
     sql += " ORDER BY ts ASC LIMIT ?"; args.append(int(limit))
 
-    async with _db_lock:
-        rows = _conn.execute(sql, args).fetchall()
+    def _fetch(c: sqlite3.Connection) -> list[dict]:
+        result = []
+        for r in c.execute(sql, args).fetchall():
+            bands = json.loads(r["payload"]).get("noise_bands", [])
+            if bands:
+                result.append({"ts": r["ts"], "device": r["device"], "bands": bands})
+        return result
 
-    result = []
-    for r in rows:
-        p = json.loads(r["payload"])
-        bands = p.get("noise_bands", [])
-        if bands:
-            result.append({
-                "ts": r["ts"],
-                "device": r["device"],
-                "bands": bands,
-            })
-    return JSONResponse(result)
+    return JSONResponse(await _read_query(_fetch))
 
 
 # ---- device configuration ------------------------------------------------- #
@@ -1244,9 +1320,9 @@ async def get_weather(
 ):
     """Time-range query over the external weather/air-quality series. `valid_ts` is
     the join key against /api/readings `ts`."""
-    async with _db_lock:
-        rows = weather_store.query(_conn, since=since, until=until,
-                                   source=source, variable=variable, limit=limit)
+    rows = await _read_query(
+        lambda c: weather_store.query(c, since=since, until=until,
+                                      source=source, variable=variable, limit=limit))
     return JSONResponse(rows)
 
 
@@ -1305,7 +1381,8 @@ async def aircraft_paths(range_km: float = 1.0, hours: float = 48.0):
     per-sample geometry (incl. track, for direction chevrons); `meta` carries each
     aircraft's identity once per hex (for the click-to-identify popup)."""
     since = int(time.time()) - int(min(hours, 168) * 3600)
-    rows = aircraft_store.query(_conn, since=since, max_distance_km=range_km)
+    rows = await _read_query(
+        lambda c: aircraft_store.query(c, since=since, max_distance_km=range_km))
     pts = []
     meta: dict[str, dict] = {}
     for r in rows:
@@ -1322,6 +1399,7 @@ async def aircraft_paths(range_km: float = 1.0, hours: float = 48.0):
 # Cache callsign → {from_city, to_city} for 24 h (routes don't change mid-day).
 _route_cache: dict[str, tuple[float, dict]] = {}  # callsign → (fetched_at, result)
 _ROUTE_TTL = 86400  # seconds
+_ROUTE_CACHE_MAX = 512  # far more than a day of distinct callsigns overhead
 
 @app.get("/api/route")
 async def get_route(callsign: str):
@@ -1350,6 +1428,11 @@ async def get_route(callsign: str):
     except Exception:
         result = {"route": []}
     _route_cache[cs] = (now, result)
+    if len(_route_cache) > _ROUTE_CACHE_MAX:
+        for k in [k for k, (t, _) in _route_cache.items() if now - t >= _ROUTE_TTL]:
+            del _route_cache[k]
+        while len(_route_cache) > _ROUTE_CACHE_MAX:
+            del _route_cache[min(_route_cache, key=lambda k: _route_cache[k][0])]
     return JSONResponse(result)
 
 

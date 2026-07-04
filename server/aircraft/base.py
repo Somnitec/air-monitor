@@ -140,4 +140,11 @@ def select_for_logging(records: list[Aircraft], last_logged: dict[str, float], *
         if prev is None or now - prev >= interval_sec:
             due.append(ac)
             last_logged[ac.hex] = now
+    # The dict would otherwise keep one entry per hex ever seen (thousands a week
+    # near Schiphol, for the process lifetime). An aircraft gone long enough gets
+    # logged immediately on return anyway, so a stale entry carries no information.
+    if len(last_logged) > 1000:
+        cutoff = now - max(3600.0, 10 * interval_sec)
+        for h in [h for h, t in last_logged.items() if t < cutoff]:
+            del last_logged[h]
     return due
