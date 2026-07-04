@@ -7,7 +7,9 @@
 *.swp
 build/
 .claude/settings.local.json
-/secrets.h
+# real credentials/coordinates — ignored in EVERY directory (root, src/, firmware/src/),
+# not just the repo root; the old root-only rule let firmware/src/secrets.h get committed
+secrets.h
 
 # server/ runtime artifacts
 server/.venv/
