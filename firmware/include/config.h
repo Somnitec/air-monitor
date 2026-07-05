@@ -218,6 +218,11 @@
 // so the dashboard's existing cadence knob still controls the baseline.
 #define SLOW_INTERVAL_MS          (3UL * 60UL * 1000UL)       // slow sensors re-read every 3 min...
 #define SLOW_INTERVAL_DENSE_MS    (20UL * 1000UL)             // ...or every 20 s while densified
+// POWER_SAVING re-reads the slow channel faster than mains NORMAL — the whole point of
+// battery mode is a truthful low-rate series, and 3 min leaves the air-quality trace too
+// coarse (long flat carry-forward plateaus). Each read costs a sensor warm-up, so this
+// trades a little battery for resolution.
+#define POWER_SAVE_SLOW_INTERVAL_MS (60UL * 1000UL)           // slow sensors re-read every 1 min on battery
 #define NOISE_DENSIFY_DELTA_DBA   6.0f                        // |Δ LAeq| between captures that arms densify
 #define DENSIFY_HOLD_MS           (30UL * 1000UL)             // densified window length after each trigger
 
@@ -242,6 +247,15 @@
 // Mic sample rate while power-saving (vs I2S_SAMPLE_RATE_HZ). 16 kHz covers bands up
 // to ~4 kHz (Nyquist 8 kHz) and ~halves FFT CPU; aircraft energy is low-frequency.
 #define POWER_SAVE_MIC_RATE_HZ        16000
+
+// --- Mic self-healing --------------------------------------------------------
+// The mic is the primary instrument, so it must recover on its own from a wedged
+// I2S driver (seen after light-sleep on some ESP32s) or a hot-unplugged INMP441.
+// After this many consecutive failed captures, tear down + re-install the driver
+// and self-test; if that fails the mic is marked absent and re-probed on this
+// interval until it self-tests good again (hot-reconnect).
+#define MIC_REINIT_AFTER_FAILS        2
+#define MIC_RECONNECT_INTERVAL_MS     (60UL * 1000UL)
 
 // --- Gas-sensor heater gating (analog DFRobot Fermion MEMS boards) ----------
 // The MEMS heaters draw continuously; in power-saving we power them through a

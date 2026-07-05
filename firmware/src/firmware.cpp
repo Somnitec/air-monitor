@@ -372,6 +372,15 @@ static bool sen66ValuesSane(float pm1, float pm25, float pm4, float pm10,
 // stored series stays gapless without re-reading sensors that barely move.
 // ---------------------------------------------------------------------------
 
+// Mic self-heal bookkeeping: consecutive failed captures, and the next time to probe
+// for a mic that's currently marked absent (see readFast). The I2S rate depends on the
+// active mode (POWER_SAVING runs the mic slower), so a re-init must restore that rate.
+static uint8_t  s_micFailStreak = 0;
+static uint32_t s_micNextProbe  = 0;
+static inline uint32_t micRate() {
+    return (g_mode == MODE_POWER_SAVING) ? POWER_SAVE_MIC_RATE_HZ : I2S_SAMPLE_RATE_HZ;
+}
+
 // Read the fast channel (timestamp + mic + accel) into f, clearing their present
 // flags first so a failed read this cycle shows as absent rather than stale.
 static void readFast(RecordFields& f) {
@@ -399,6 +408,7 @@ static void readFast(RecordFields& f) {
     if (present.mic) {
         MicResult m;
         if (mic_capture(m)) {
+            s_micFailStreak = 0;
             f.status[GRP_MIC] = FS_OK;
             f.noise_dba  = m.laeq_est; f.noise_spl = m.spl_est; f.noise_dbfs = m.rms_dbfs;
             f.noise_clip = m.clipping;
@@ -407,6 +417,33 @@ static void readFast(RecordFields& f) {
             for (int b = 0; b < REC_NBANDS; ++b) f.bands[b] = m.band_dba[b];
         } else {
             f.status[GRP_MIC] = FS_INVALID;
+            // Self-heal: a run of failures means the I2S driver has wedged (light-sleep)
+            // or the mic was unplugged. Re-init the driver and self-test; if it won't
+            // come back, drop to absent and let the reconnect probe below recover it.
+            if (++s_micFailStreak >= MIC_REINIT_AFTER_FAILS) {
+                s_micFailStreak = 0;
+                float dbfs;
+                Serial.println("[mic] repeated read failures — re-initialising I2S");
+                if (mic_reinit(micRate()) && mic_selftest(dbfs)) {
+                    Serial.printf("[mic] recovered (self-test %.1f dBFS)\n", dbfs);
+                } else {
+                    present.mic = false;
+                    s_micNextProbe = millis() + MIC_RECONNECT_INTERVAL_MS;
+                    Serial.println("[mic] disconnected — probing to reconnect");
+                }
+            }
+        }
+    } else {
+        // Mic absent (failed boot self-test or dropped): re-probe periodically so a
+        // reseated/hot-plugged INMP441 comes back without a reboot.
+        if (millis() >= s_micNextProbe) {
+            s_micNextProbe = millis() + MIC_RECONNECT_INTERVAL_MS;
+            float dbfs;
+            if (mic_reinit(micRate()) && mic_selftest(dbfs)) {
+                present.mic = true;
+                s_micFailStreak = 0;
+                Serial.printf("[mic] reconnected (self-test %.1f dBFS)\n", dbfs);
+            }
         }
     }
     f.has_mic = (f.status[GRP_MIC] == FS_OK);
@@ -677,6 +714,11 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
     doc["fw"]           = "phase1";
     doc["mode"]         = modeStr(g_mode);
     doc["buffered"]     = ringstore_unsynced();
+    // Report the config the device is actually running so the server can recover the
+    // current values after a restart (it starts with no opinion — "leave as configured"
+    // — and adopts these for display until the dashboard pushes an explicit override).
+    doc["poll_interval_ms"] = g_config.poll_interval_ms;
+    doc["slow_interval_ms"] = g_config.slow_interval_ms;
     JsonArray arr = doc["records"].to<JsonArray>();
     for (uint32_t i = 0; i < n; ++i) {
         JsonDocument tmp;
@@ -889,7 +931,8 @@ void setup() {
         s_ringReady = ringstore_begin();
         if (!s_ringReady) Serial.println("[ring] begin failed — samples will not be stored");
         g_config = devconfig_load();
-        Serial.printf("[config] poll_interval_ms = %u\n", g_config.poll_interval_ms);
+        Serial.printf("[config] poll_interval_ms = %u, slow_interval_ms = %u\n",
+                      g_config.poll_interval_ms, g_config.slow_interval_ms);
     }
 
     // Boot window: WiFi on so the dashboard can flip us into testing mode.
@@ -927,7 +970,9 @@ void loop() {
 
     // --- slow channel: re-read air-quality/weather/gas/soil/battery on their own
     //     cadence (faster while densified), carried forward into every record. ---
-    uint32_t slowInterval = cd.densified ? SLOW_INTERVAL_DENSE_MS : SLOW_INTERVAL_MS;
+    uint32_t slowBaseline = (g_mode == MODE_POWER_SAVING) ? POWER_SAVE_SLOW_INTERVAL_MS
+                                                          : g_config.slow_interval_ms;
+    uint32_t slowInterval = cd.densified ? SLOW_INTERVAL_DENSE_MS : slowBaseline;
     if (g_tSlow == 0 || now - g_tSlow >= slowInterval) {
         // POWER_SAVING wakes/warms/parks the duty-cycled sensors around the read.
         if (g_mode == MODE_POWER_SAVING) readSlowPowerSaving(g_fields);

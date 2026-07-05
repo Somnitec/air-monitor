@@ -499,6 +499,86 @@ SLOW_FILL_KEYS: tuple[str, ...] = (
 _LAST_VALUES: dict[str, dict[str, Any]] = {}   # dev -> {key: last good value}
 
 
+# --------------------------------------------------------------------------- #
+# Ingest logging + sensor-health warnings. Prints a one-line snapshot of every
+# batch and flags any sensor that has stopped reporting, so `journalctl -u
+# air-monitor -f` shows live values and shouts the moment a sensor misbehaves.
+# Toggle with AIRMON_LOG_INGEST=0.
+# --------------------------------------------------------------------------- #
+LOG_INGEST = os.environ.get("AIRMON_LOG_INGEST", "1") not in ("0", "false", "no", "")
+
+# (label, representative key, channel). "fast" keys (mic/accel) are captured every
+# record, so their ABSENCE is a failed read; "slow" keys are delta-encoded, so
+# absence just means carried-forward (normal) and only an explicit null is a failure.
+_HEALTH_SENSORS: tuple[tuple[str, str, str], ...] = (
+    ("mic",     "noise_dba",    "fast"),
+    ("accel",   "rumble",       "fast"),
+    ("SEN66",   "pm25",         "slow"),
+    ("BME280",  "pressure_hpa", "slow"),
+    ("BH1750",  "lux",          "slow"),
+    ("CO",      "co_mv",        "slow"),
+    ("HCHO",    "hcho_mv",      "slow"),
+    ("soil",    "soil_mv",      "slow"),
+    ("battery", "bat_raw_mv",   "slow"),
+)
+_HEALTH_WARN_AT: dict[tuple, int] = {}   # (dev,label) -> last warn epoch (rate-limit)
+_HEALTH_WARN_EVERY_S = 120               # re-warn a still-broken sensor at most this often
+
+
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _scan_health(dev: Any, records: list, now: int) -> list[str]:
+    """Inspect RAW records (call BEFORE _forward_fill) and return warning strings for
+    sensors that are malfunctioning in this batch. A sensor counts as failing when it
+    sends an explicit null (a real gap, any channel) or when a fast-channel sensor
+    (mic/accel — read every record) sends nothing all batch. Slow sensors that merely
+    OMIT their keys are carried-forward, not failures. Warnings are rate-limited per
+    sensor so TESTING mode's ~2 s cadence doesn't flood the log."""
+    n = sum(1 for r in records if isinstance(r, dict))
+    good: set[str] = set()
+    failed: dict[str, int] = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        for label, key, channel in _HEALTH_SENSORS:
+            if key in rec:
+                if rec[key] is None:
+                    failed[label] = failed.get(label, 0) + 1   # explicit null → real gap
+                elif _is_num(rec[key]):
+                    good.add(label)
+            elif channel == "fast":
+                failed[label] = failed.get(label, 0) + 1        # should be read every record
+    warnings: list[str] = []
+    for label, _key, _channel in _HEALTH_SENSORS:
+        if label in good or label not in failed:
+            continue
+        k = (dev, label)
+        if now - _HEALTH_WARN_AT.get(k, 0) >= _HEALTH_WARN_EVERY_S:
+            _HEALTH_WARN_AT[k] = now
+            warnings.append(f"{label} not reporting ({failed[label]}/{n} records)")
+    return warnings
+
+
+def _headline(dev: Any, mode: str, rec: dict) -> str:
+    """One-line snapshot of a record's headline metrics (forward-filled values). The
+    mic is the primary instrument, so its slot is always shown — `noise --` when the
+    reading is missing — rather than silently dropped."""
+    # noise is special-cased so a silent mic is visible rather than just absent.
+    v = rec.get("noise_dba")
+    parts: list[str] = [f"noise {v:.1f}dBA" if _is_num(v) else "noise --"]
+    for fmt, key in (
+        ("LAmax {:.1f}", "lamax"),
+        ("PM2.5 {:.1f}", "pm25"), ("CO2 {:.0f}", "co2"),
+        ("T {:.1f}C", "temp"), ("RH {:.0f}%", "rh"), ("bat {:.2f}V", "bat_v"),
+    ):
+        v = rec.get(key)
+        if _is_num(v):
+            parts.append(fmt.format(v))
+    return f"[ingest] {dev or '?'} {mode}: " + "  ".join(parts)
+
+
 def _seed_fill_cache(dev: Any) -> dict[str, Any]:
     """Warm a device's forward-fill cache from its most recent stored reading. The
     cache is per-process, so a server restart (or moving to a fresh DB) starts it cold
@@ -548,14 +628,41 @@ def _forward_fill(records: list, default_dev: Any) -> None:
                 rec[k] = cache[k]          # omitted (FS_UNCHANGED) — carry last value forward
 
 
-def _update_device(dev: str, mode: str, buffered, boot, fw) -> None:
-    DEVICE_STATE[dev] = {
+# Config keys a device reports (and the dashboard can override). Whitelisted so a
+# stray POST body can't inject arbitrary keys into what we push back to the device.
+CONFIG_KEYS: tuple[str, ...] = ("poll_interval_ms", "slow_interval_ms")
+
+
+def _update_device(dev: str, mode: str, buffered, boot, fw, reported_cfg: dict | None = None) -> None:
+    prev = DEVICE_STATE.get(dev, {})
+    st = {
         "dev": dev, "mode": mode, "buffered": buffered,
         "boot": boot, "fw": fw, "last_seen": int(time.time()),
     }
+    # Carry the device's reported config into its live state so the dashboard can show
+    # the *current* intervals (this is how the server recovers them after a restart:
+    # it holds no override — "leave as configured" — until the dashboard sets one).
+    # A key missing from this batch keeps its last-reported value.
+    reported_cfg = reported_cfg or {}
+    for k in CONFIG_KEYS:
+        if reported_cfg.get(k) is not None:
+            st[k] = reported_cfg[k]
+        elif k in prev:
+            st[k] = prev[k]
+    DEVICE_STATE[dev] = st
     # Clear a pending command once the device reports the target mode.
     if PENDING_CMD.get(dev) == mode:
         PENDING_CMD.pop(dev, None)
+    # Drop any override the device has now adopted, so the resting state returns to
+    # "leave as configured" (mirrors the pending-command clear above). Once empty we
+    # stop pushing config entirely and the device just runs its persisted values.
+    override = DEVICE_CONFIG.get(dev)
+    if override:
+        for k in list(override):
+            if reported_cfg.get(k) == override[k]:
+                override.pop(k)
+        if not override:
+            DEVICE_CONFIG.pop(dev, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -607,30 +714,34 @@ def _local_ips() -> list[str]:
     for ip in _enumerate_ipv4():
         if ip not in ordered:
             ordered.append(ip)
-    return ordered or ["127.0.0.1"]
+    # Deliberately NO loopback fallback: if we have no LAN address (e.g. the
+    # service won the boot race against the WiFi association), return empty so
+    # callers wait rather than advertise 127.0.0.1 — which would send the ESP32
+    # to its own loopback forever (see _run_mdns).
+    return ordered
 
 
 def _local_ip() -> str:
     """Best-effort primary LAN IP (the address other devices reach us on)."""
-    return _local_ips()[0]
-
-
-async def _start_mdns():
-    """Register the _airmon._tcp service. Uses AsyncZeroconf because we're inside
-    a running asyncio loop (the sync Zeroconf API deadlocks here)."""
-    try:
-        from zeroconf import ServiceInfo
-        from zeroconf.asyncio import AsyncZeroconf
-    except ImportError:
-        print("[mdns] zeroconf not installed — ESP32 must use the static SYNC_HOST fallback")
-        return None, None
     ips = _local_ips()
-    # Use a fixed hostname (not socket.gethostname(), which the ESP32 can't predict)
-    # so the device can resolve our A-record directly via MDNS.queryHost("airmon-server").
-    # zeroconf registers airmon-server.local. -> ip(s) for us. Advertise ALL interface
-    # addresses (primary first) so a device on any of them — the hotspot subnet included
-    # — gets a reachable one; the ESP32 also has a gateway fallback for laptop-as-hotspot.
-    info = ServiceInfo(
+    return ips[0] if ips else "127.0.0.1"
+
+
+# Re-check our LAN address this often once advertised, so a DHCP lease change
+# (or the address finally appearing after a boot-time network race) is picked up
+# and re-advertised. While still waiting for a first address we poll faster.
+_MDNS_RECHECK_SEC = 30
+_MDNS_WAIT_SEC = 2
+
+
+def _build_service_info(ips: list[str]):
+    """The _airmon._tcp ServiceInfo advertising `ips`. Uses a fixed hostname (not
+    socket.gethostname(), which the ESP32 can't predict) so the device resolves our
+    A-record directly via MDNS.queryHost("airmon-server"). All interface addresses are
+    advertised (primary first) so a device on any of them — the hotspot subnet included
+    — gets a reachable one; the ESP32 also has a gateway fallback for laptop-as-hotspot."""
+    from zeroconf import ServiceInfo
+    return ServiceInfo(
         "_airmon._tcp.local.",
         "air-monitor._airmon._tcp.local.",
         addresses=[socket.inet_aton(ip) for ip in ips],
@@ -638,17 +749,61 @@ async def _start_mdns():
         properties={"path": "/ingest"},
         server="airmon-server.local.",
     )
-    aiozc = AsyncZeroconf()
+
+
+async def _run_mdns(stop: asyncio.Event):
+    """Advertise _airmon._tcp for the lifetime of the server, robustly.
+
+    Two failure modes this guards against, both seen in the field:
+      1. Boot race — the (user) service starts before WiFi has a DHCP lease, so the
+         only address is loopback. We NEVER advertise 127.0.0.1 (that sends the ESP32
+         to its own loopback forever); instead we wait until a real LAN IP exists.
+      2. DHCP lease change while running — we re-check periodically and re-advertise
+         when the address set changes, so airmon-server.local always resolves to a
+         reachable IP without a manual restart.
+
+    Uses AsyncZeroconf because we're inside a running asyncio loop (the sync Zeroconf
+    API deadlocks here). Best-effort throughout: any failure is logged and retried."""
     try:
-        await aiozc.async_register_service(info)
-    except Exception as exc:
-        # NonUniqueNameException on rapid restart (or in tests); mDNS is best-effort.
+        from zeroconf.asyncio import AsyncZeroconf
+    except ImportError:
+        print("[mdns] zeroconf not installed — ESP32 must use the static SYNC_HOST fallback",
+              flush=True)
+        return
+
+    aiozc = AsyncZeroconf()
+    info = None
+    advertised: list[str] = []
+    try:
+        while not stop.is_set():
+            ips = _local_ips()
+            if ips and ips != advertised:
+                new_info = _build_service_info(ips)
+                try:
+                    if info is None:
+                        await aiozc.async_register_service(new_info)
+                    else:
+                        await aiozc.async_update_service(new_info)
+                    info, advertised = new_info, ips
+                    print(f"[mdns] advertising _airmon._tcp at {', '.join(ips)}:{PORT}",
+                          flush=True)
+                except Exception as exc:
+                    # NonUniqueNameException on rapid restart, transient network errors, etc.
+                    print(f"[mdns] register/update failed ({exc.__class__.__name__}) — retrying",
+                          flush=True)
+            # Poll fast until we've advertised something, then back off.
+            delay = _MDNS_RECHECK_SEC if info is not None else _MDNS_WAIT_SEC
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        if info is not None:
+            try:
+                await aiozc.async_unregister_service(info)
+            except Exception:
+                pass
         await aiozc.async_close()
-        print(f"[mdns] could not register service ({exc.__class__.__name__}) — "
-              "ESP32 must use SYNC_HOST fallback")
-        return None, None
-    print(f"[mdns] advertising _airmon._tcp at {', '.join(ips)}:{PORT}")
-    return aiozc, info
 
 
 # --------------------------------------------------------------------------- #
@@ -723,7 +878,8 @@ async def lifespan(app: FastAPI):
     _conn = _init_db()
     _ro_conn = _open_ro_conn()   # after _init_db: the file and views must exist
     print(f"[air-monitor] DB: {DB_PATH}")
-    aiozc, info = await _start_mdns()
+    mdns_stop = asyncio.Event()
+    mdns_task = asyncio.create_task(_run_mdns(mdns_stop))
     cloudflared = _start_cloudflared()   # opt-in remote access (CLOUDFLARED_TUNNEL=...)
 
     # Weather/air-quality importer: a background poll loop alongside mDNS.
@@ -764,9 +920,11 @@ async def lifespan(app: FastAPI):
             await aircraft_task
         except asyncio.CancelledError:
             pass
-    if aiozc is not None:
-        await aiozc.async_unregister_service(info)
-        await aiozc.async_close()
+    mdns_stop.set()
+    try:
+        await mdns_task
+    except asyncio.CancelledError:
+        pass
     if cloudflared is not None:
         cloudflared.terminate()
         try:
@@ -952,10 +1110,13 @@ async def ingest(request: Request):
         records = body["records"]
         dev = body.get("dev")
         mode = body.get("mode", "normal")
+        reported_cfg = {k: body[k] for k in CONFIG_KEYS if body.get(k) is not None}
         if dev:
-            _update_device(dev, mode, body.get("buffered"), body.get("boot"), body.get("fw"))
+            _update_device(dev, mode, body.get("buffered"), body.get("boot"),
+                           body.get("fw"), reported_cfg)
     else:
         records = body if isinstance(body, list) else [body]
+        mode = "normal"
 
     received_at = int(time.time())
     # Per-boot anchor: the largest uptime in this batch ≈ captured at received_at,
@@ -965,6 +1126,9 @@ async def ingest(request: Request):
         if isinstance(rec, dict) and rec.get("up_ms") is not None:
             b = rec.get("boot")
             anchor_up[b] = max(anchor_up.get(b, 0), int(rec["up_ms"]))
+
+    # Sensor-health scan on the RAW records (before forward-fill masks omitted keys).
+    health_warnings = _scan_health(dev, records, received_at) if LOG_INGEST else []
 
     stored = []
     corrected = 0
@@ -987,6 +1151,16 @@ async def ingest(request: Request):
         _conn.commit()
     if corrected:
         print(f"[time] back-filled {corrected} record(s) with a corrected timestamp")
+
+    if LOG_INGEST:
+        # Snapshot the latest record (forward-filled) so slow values show even when
+        # carried; then shout about any sensor that's malfunctioning this batch.
+        last = next((r for r in reversed(records) if isinstance(r, dict)), None)
+        if last is not None:
+            print(_headline(dev, mode, last)
+                  + (f"  [{len(records)} rec]" if len(records) > 1 else ""))
+        for w in health_warnings:
+            print(f"[sensor] ⚠ {dev or '?'}: {w}")
 
     # push the freshly stored ones to any open dashboards
     for rec in stored:
@@ -1249,34 +1423,54 @@ async def audio_bands(
 
 
 # ---- device configuration ------------------------------------------------- #
-# In-memory config per device. Persists only during this server session.
-# To make it persistent, store in the database or a config file.
-DEVICE_CONFIG: dict[str, dict] = {}  # dev -> {poll_interval_s, ...}
+# In-memory OVERRIDE per device: only the intervals the dashboard has explicitly
+# set and the device hasn't yet adopted. Empty (the default, and the state after a
+# restart) means "leave as configured" — we push nothing and the device runs its own
+# persisted config. Entries self-clear in _update_device once the device reports the
+# target value, so this stays a set of *pending* changes, not a durable source of truth.
+DEVICE_CONFIG: dict[str, dict] = {}  # dev -> {poll_interval_ms?, slow_interval_ms?}
+
+# Accepted interval range (ms), mirrored by the firmware clamps in devconfig.cpp.
+_INTERVAL_MIN_MS = 1000
+_INTERVAL_MAX_MS = 3600 * 1000
+
 
 @app.get("/api/config/{device}")
 async def get_device_config(device: str):
-    """One device's pushed config (poll_interval_s, …). Delivered to the device in
-    each /ingest reply; this is just for inspection from the dashboard/CLI."""
+    """One device's pending override (the intervals we're still pushing). Empty means
+    'leave as configured'. The device's *current* values live in /api/devices."""
     return JSONResponse(DEVICE_CONFIG.get(device, {}))
 
 
 @app.post("/api/config/{device}")
 async def set_config(device: str, request: Request):
-    """Set device configuration. Persists only until server restart.
+    """Queue an interval override for a device, delivered in its next /ingest reply and
+    cleared once the device echoes the new value. Persists only until server restart.
 
-    Example: {"poll_interval_s": 120}
-    The device fetches this at startup and after each sync.
+    Example: {"poll_interval_ms": 10000, "slow_interval_ms": 180000}
     """
     body = await request.json()
-    if device not in DEVICE_CONFIG:
-        DEVICE_CONFIG[device] = {}
-    DEVICE_CONFIG[device].update(body)
-    # In a production system, you'd persist this to disk or database here.
-    return JSONResponse({
-        "ok": True,
-        "device": device,
-        "config": DEVICE_CONFIG[device],
-    })
+    clean: dict[str, int] = {}
+    for k in CONFIG_KEYS:
+        if k not in body:
+            continue
+        try:
+            v = int(body[k])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": f"{k} must be an integer (ms)"}, status_code=400)
+        if not _INTERVAL_MIN_MS <= v <= _INTERVAL_MAX_MS:
+            return JSONResponse(
+                {"error": f"{k} must be {_INTERVAL_MIN_MS}–{_INTERVAL_MAX_MS} ms"},
+                status_code=400,
+            )
+        clean[k] = v
+    if not clean:
+        return JSONResponse(
+            {"error": f"no valid config keys; expected any of {list(CONFIG_KEYS)}"},
+            status_code=400,
+        )
+    DEVICE_CONFIG.setdefault(device, {}).update(clean)
+    return JSONResponse({"ok": True, "device": device, "config": DEVICE_CONFIG[device]})
 
 
 # ---- device mode (testing) control --------------------------------------- #

@@ -62,7 +62,12 @@ static float cWeightGain(float f) {
     return powf(10.0f, (20.0f * log10f(rc) + 0.06f) / 20.0f);
 }
 
+// Whether the I2S driver is currently installed, so mic_begin()/mic_end() are
+// idempotent and mic_reinit() can safely tear down before re-installing.
+static bool s_installed = false;
+
 bool mic_begin() {
+    if (s_installed) i2s_driver_uninstall(I2S_PORT);   // idempotent re-begin
     const i2s_config_t cfg = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = I2S_SAMPLE_RATE_HZ,
@@ -83,9 +88,22 @@ bool mic_begin() {
         .data_in_num = PIN_I2S_DIN,
     };
     if (i2s_driver_install(I2S_PORT, &cfg, 0, nullptr) != ESP_OK) return false;
-    if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) return false;
+    if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) { i2s_driver_uninstall(I2S_PORT); return false; }
+    s_installed  = true;
     s_sampleRate = I2S_SAMPLE_RATE_HZ;
     return true;
+}
+
+void mic_end() {
+    if (!s_installed) return;
+    i2s_driver_uninstall(I2S_PORT);
+    s_installed = false;
+}
+
+bool mic_reinit(uint32_t hz) {
+    mic_end();
+    if (!mic_begin()) return false;
+    return mic_set_rate(hz);   // no-op when hz == I2S_SAMPLE_RATE_HZ
 }
 
 // Change the I2S clock at runtime (POWER_SAVING uses a lower rate to cut FFT CPU).

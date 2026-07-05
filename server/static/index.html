@@ -305,15 +305,25 @@
         <label>From</label><input type="datetime-local" id="from" />
         <label>To</label><input type="datetime-local" id="to" />
       </div>
-      <label>Sensor interval <span id="liveHint" style="color:var(--mut)">— how often the board samples &amp; sends</span></label>
-      <select id="sensorIntvl" title="Pushed to the ESP32. Picking an interval also switches it to live streaming so readings arrive in real time. Applied within ~1 min (or instantly if the board just booted).">
-        <option value="">— (leave as configured)</option>
+      <label>Fast sensors — mic + accel <span id="liveHint" style="color:var(--mut)">— how often the board samples &amp; sends</span></label>
+      <select id="sensorIntvl" title="Fast channel (mic + accelerometer) store cadence, pushed to the ESP32. Picking an interval also switches it to live streaming so readings arrive in real time. Applied within ~1 min (or instantly if the board just booted).">
+        <option value="" selected>— (leave as configured)</option>
         <option value="5">Live · every 5 s</option>
-        <option value="10" selected>Live · every 10 s</option>
+        <option value="10">Live · every 10 s</option>
         <option value="15">Live · every 15 s</option>
         <option value="30">Live · every 30 s</option>
         <option value="60">Every 1 min</option>
         <option value="300">Every 5 min</option>
+      </select>
+      <label style="margin-top:8px">Slow sensors — air quality / gas / soil <span id="slowHint" style="color:var(--mut)">— how often they re-read</span></label>
+      <select id="slowIntvl" title="Slow channel (SEN66 air quality, gas, soil, battery) re-read cadence, pushed to the ESP32. Between re-reads the last value is carried forward. Does not change the power mode. Applied within ~1 min.">
+        <option value="" selected>— (leave as configured)</option>
+        <option value="20">Every 20 s</option>
+        <option value="60">Every 1 min</option>
+        <option value="120">Every 2 min</option>
+        <option value="180">Every 3 min</option>
+        <option value="300">Every 5 min</option>
+        <option value="600">Every 10 min</option>
       </select>
       <label style="margin-top:8px">Power mode <span id="modeHint" style="color:var(--mut)">— mains vs. battery</span></label>
       <select id="deviceMode" title="Pushed to the ESP32 like the interval. NORMAL/TESTING keep WiFi always on (mains). POWER_SAVING duty-cycles WiFi, light-sleeps between captures, and gates the gas heaters + SEN66 — for battery operation. Applied within ~1 min (or its next sync in power-saving).">
@@ -396,8 +406,8 @@ const GROUP_Y_RANGE = {
 };
 // Chart stacking order (top→bottom). Battery is always forced last regardless.
 const GROUP_ORDER = [
-  'Particulates','Gases','Air Quality Index','Temp / Humidity','Pressure',
-  'Cloud & Radiation','Wind','Precipitation','Light','Noise & Vibration','Soil',
+  'Noise & Vibration','Particulates','Gases','Air Quality Index','Temp / Humidity','Pressure',
+  'Cloud & Radiation','Wind','Precipitation','Light','Soil',
 ];
 function groupRank(g) {
   if (g === 'Battery') return 1e6;
@@ -569,7 +579,7 @@ async function query() {
   [dataCache, eventsCache, weatherCache] = await Promise.all([
     (await fetch('/api/readings?' + qs)).json(),
     (await fetch('/api/events?' + qs)).json(),
-    fetch('/api/weather?' + wqs + '&limit=5000').then(r => r.json()).catch(() => []),
+    fetch('/api/weather?' + wqs + '&limit=20000').then(r => r.json()).catch(() => []),
   ]);
   render();
   restoreToggleStates();
@@ -870,7 +880,7 @@ function connectWS() {
     if (msg.type === 'weather')  { Object.assign(_weatherLatest, msg.data); _weatherLatest._source = msg.data.source || _weatherLatest._source; renderWeather(); return; }
     if (!live) return;
     if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); _scheduleRender(); _serialPush(msg.data); }
-    if (msg.type === 'device')  { /* device mode changes silently ignored (section removed) */ }
+    if (msg.type === 'device')  { reflectDeviceConfig(msg.data); }
     if (msg.type === 'event')   {
       eventsCache.push(msg.data); render();
       // reflect a toggle flipped from another client/device
@@ -1070,6 +1080,47 @@ $('#sensorIntvl').onchange = async function() {
     : `— every ${secs}s (applies within ~1 min)`;
 };
 
+// Slow sensor interval → pushed to every known device as slow_interval_ms only (no
+// mode change). Between re-reads the board carries the last value forward.
+$('#slowIntvl').onchange = async function() {
+  const v = this.value;
+  if (!v) return;
+  const secs = parseInt(v, 10);
+  let devices = [];
+  try { devices = (await (await fetch('/api/devices')).json()).map(d => d.dev); } catch (_) {}
+  if (!devices.length) { $('#slowHint').textContent = '— no device has reported in yet'; return; }
+  await Promise.all(devices.map(dev =>
+    fetch(`/api/config/${encodeURIComponent(dev)}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ slow_interval_ms: secs * 1000 }),
+    })));
+  $('#slowHint').textContent = `— every ${secs}s (applies within ~1 min)`;
+};
+
+// Reflect the device's CURRENT (reported) intervals + mode in the control hints. The
+// dropdowns stay on "leave as configured" — the server holds no override after a
+// restart — so this is how you see what the board is actually running right now.
+function reflectDeviceConfig(st) {
+  if (!st) return;
+  const fmt = ms => (ms % 60000 === 0 ? `${ms / 60000} min` : `${Math.round(ms / 1000)} s`);
+  if (st.poll_interval_ms && !$('#sensorIntvl').value)
+    $('#liveHint').textContent = `— currently every ${fmt(st.poll_interval_ms)}`;
+  if (st.slow_interval_ms && !$('#slowIntvl').value)
+    $('#slowHint').textContent = `— currently every ${fmt(st.slow_interval_ms)}`;
+  if (st.mode && !$('#deviceMode').value)
+    $('#modeHint').textContent = `— currently ${st.mode.replace('_', ' ')}`;
+}
+
+// On load, ask the server what each device is currently running (recovered from the
+// device's own /ingest reports) and show it. Picks the most recently seen device.
+(async function initDeviceConfig() {
+  try {
+    const devs = await (await fetch('/api/devices')).json();
+    const st = devs.sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0))[0];
+    reflectDeviceConfig(st);
+  } catch (_) {}
+})();
+
 // Explicit power-mode override → pushed to every known device. NORMAL/TESTING keep
 // WiFi always on (mains); POWER_SAVING duty-cycles WiFi + gates sensors for battery.
 // In power-saving the board only checks in every few minutes, so a mode change lands
@@ -1161,17 +1212,23 @@ function _computeClosestApproaches(since, until, maxDistKm = null) {
     const win = pts.filter(p => p.lat != null && p.lon != null
                              && (!since || p.ts >= since) && (!until || p.ts <= until));
     if (!win.length) continue;
-    let minDist = Infinity, minTs = null;
+    let minDist = Infinity, minTs = null, minLat = null, minLon = null, minAlt = null;
     for (let i = 0; i < win.length; i++) {
       const d = haversineKm(hLat, hLon, win[i].lat, win[i].lon);
-      if (d < minDist) { minDist = d; minTs = win[i].ts; }
+      if (d < minDist) { minDist = d; minTs = win[i].ts; minLat = win[i].lat; minLon = win[i].lon; minAlt = win[i].alt_baro; }
       if (i + 1 < win.length) {
         const ca = _interpClosestApproach(win[i], win[i+1], hLat, hLon);
-        if (ca.distKm < minDist) { minDist = ca.distKm; minTs = ca.ts; }
+        if (ca.distKm < minDist) {
+          minDist = ca.distKm; minTs = ca.ts;
+          minLat = win[i].lat + ca.t*(win[i+1].lat - win[i].lat);
+          minLon = win[i].lon + ca.t*(win[i+1].lon - win[i].lon);
+          minAlt = (win[i].alt_baro||0) + ca.t*((win[i+1].alt_baro||0) - (win[i].alt_baro||0));
+        }
       }
     }
     if (maxDistKm != null && minDist > maxDistKm) continue;
-    out.push({ hex, flight: (_pathMeta[hex] || {}).flight || hex, distKm: minDist, ts: minTs });
+    out.push({ hex, flight: (_pathMeta[hex] || {}).flight || hex, distKm: minDist, ts: minTs,
+               lat: minLat, lon: minLon, alt: minAlt });
   }
   return out.sort((a, b) => a.ts - b.ts);
 }
@@ -1500,7 +1557,12 @@ function drawMapPaths() {
     if (_mapPathLines[hex]) {
       _mapPathLines[hex].bindTooltip(() => _pathPopupHtml(hex), { sticky:true, direction:'top' });
       _mapPathLines[hex].on('mouseover', () => _highlightRow(hex, true));
-      _mapPathLines[hex].on('mouseout',  () => _highlightRow(hex, false));
+      _mapPathLines[hex].on('mouseout',  () => { _highlightRow(hex, false); _clearCrossDot(); });
+      // Track the cursor along the path → show the matching dot on the side view.
+      _mapPathLines[hex].on('mousemove', e => {
+        const hp = _mapNearestPoint(e.latlng, _groupByHex(_pathData)[hex] || []);
+        if (hp) _setCrossDot(hp);
+      });
     } else { delete _mapPathLines[hex]; }
 
     // Drop a heading chevron at logged readings (decluttered by global stride + spacing).
@@ -1574,6 +1636,80 @@ function _ptSegDist(px, py, ax, ay, bx, by) {
   if (len2 === 0) return Math.hypot(px-ax, py-ay);
   const t = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / len2));
   return Math.hypot(px - (ax + t*dx), py - (ay + t*dy));
+}
+
+// ── Cross-view position marker ──────────────────────────────────────────────
+// A single geographic point shown at once as a dot on the map (top view) and a
+// dot on the side view (altitude cross-section), so hovering one panel reveals
+// where that point sits in the other. pt = {lat, lon, alt}.
+let _crossDotMap = null;   // Leaflet circleMarker on the map
+let _sideGhost = null;     // {lon, alt} drawn by drawSideView()
+
+function _setCrossDot(pt) {
+  if (!pt || pt.lat == null || pt.lon == null) return;
+  if (acMap) {
+    if (!_crossDotMap) {
+      _crossDotMap = L.circleMarker([pt.lat, pt.lon], {
+        radius:5, color:'#fff', weight:2, fillColor:'#4ea1ff', fillOpacity:0.95, interactive:false,
+      }).addTo(acMap);
+    } else {
+      _crossDotMap.setLatLng([pt.lat, pt.lon]);
+      if (!acMap.hasLayer(_crossDotMap)) _crossDotMap.addTo(acMap);
+    }
+  }
+  _sideGhost = { lon: pt.lon, alt: pt.alt || 0 };
+  drawSideView();
+}
+
+function _clearCrossDot() {
+  if (_crossDotMap && acMap && acMap.hasLayer(_crossDotMap)) acMap.removeLayer(_crossDotMap);
+  if (_sideGhost) { _sideGhost = null; drawSideView(); }
+}
+
+// Nearest interpolated point on a hex's logged track to a side-view canvas coord.
+// Returns {lat, lon, alt, ts, dist(px)} or null. Interpolates lat/lon/alt/ts by the
+// same parameter as the canvas-space projection so all panels agree on the point.
+function _sideNearestPoint(mx, my, pts) {
+  const vp = pts.filter(p => p.alt_baro != null && p.lon != null);
+  let best = null, bestD = Infinity;
+  for (let i = 0; i < vp.length - 1; i++) {
+    const a = vp[i], b = vp[i+1];
+    const [x1, y1] = _sideXY(a.lon, a.alt_baro);
+    const [x2, y2] = _sideXY(b.lon, b.alt_baro);
+    const dx = x2-x1, dy = y2-y1, len2 = dx*dx + dy*dy;
+    const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((mx-x1)*dx + (my-y1)*dy) / len2));
+    const d = Math.hypot(mx - (x1 + t*dx), my - (y1 + t*dy));
+    if (d < bestD) {
+      bestD = d;
+      best = { dist:d, lat:a.lat + t*(b.lat-a.lat), lon:a.lon + t*(b.lon-a.lon),
+               alt:(a.alt_baro||0) + t*((b.alt_baro||0)-(a.alt_baro||0)), ts:a.ts + t*(b.ts-a.ts) };
+    }
+  }
+  if (!best && vp.length === 1) {
+    const [x, y] = _sideXY(vp[0].lon, vp[0].alt_baro);
+    best = { dist:Math.hypot(mx-x, my-y), lat:vp[0].lat, lon:vp[0].lon, alt:vp[0].alt_baro, ts:vp[0].ts };
+  }
+  return best;
+}
+
+// Nearest interpolated point on a hex's logged track to a map latlng.
+function _mapNearestPoint(latlng, pts) {
+  const vp = pts.filter(p => p.lat != null && p.lon != null);
+  let best = null, bestD = Infinity;
+  for (let i = 0; i < vp.length - 1; i++) {
+    const a = vp[i], b = vp[i+1];
+    const dx = b.lat-a.lat, dy = b.lon-a.lon, len2 = dx*dx + dy*dy;
+    const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((latlng.lat-a.lat)*dx + (latlng.lng-a.lon)*dy) / len2));
+    const plat = a.lat + t*dx, plon = a.lon + t*dy;
+    const d = haversineKm(latlng.lat, latlng.lng, plat, plon);
+    if (d < bestD) {
+      bestD = d;
+      best = { dist:d, lat:plat, lon:plon,
+               alt:(a.alt_baro||0) + t*((b.alt_baro||0)-(a.alt_baro||0)), ts:a.ts + t*(b.ts-a.ts) };
+    }
+  }
+  if (!best && vp.length === 1) { const p = vp[0]; best = { dist:0, lat:p.lat, lon:p.lon, alt:p.alt_baro, ts:p.ts }; }
+  return best;
 }
 
 function drawSideView() {
@@ -1667,6 +1803,16 @@ function drawSideView() {
     ctx.globalAlpha = 1.0;
   }
   ctx.textBaseline = 'alphabetic';
+
+  // Cross-view ghost dot: the point currently hovered in the map (or the closest-
+  // approach scatter), projected onto this altitude cross-section.
+  if (_sideGhost && _sideGhost.lon != null) {
+    const [gx, gy] = toXY(_sideGhost.lon, _sideGhost.alt || 0);
+    ctx.beginPath(); ctx.arc(gx, gy, 5, 0, 2*Math.PI);
+    ctx.fillStyle = '#4ea1ff'; ctx.globalAlpha = 0.95; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+    ctx.globalAlpha = 1.0;
+  }
 }
 
 // Side-view click: find the closest track (live plane or logged path) and pop up
@@ -1780,6 +1926,13 @@ $('#pathSide').addEventListener('mousemove', e => {
   const hist = (_groupByHex(_pathData)[closestHex] || []);
   const last = hist.length ? hist[hist.length - 1] : null;
   const info = ac || last || { hex: closestHex };
+
+  // The exact point under the cursor (for the cross-view dot + height/noise readout).
+  let hp = _sideNearestPoint(mx, my, hist);
+  if (!hp && ac && ac.lat != null)
+    hp = { lat:ac.lat, lon:ac.lon, alt:ac.alt_baro, ts:Math.floor(Date.now()/1000) };
+  if (hp) _setCrossDot(hp); else _clearCrossDot();
+
   const { flag } = _regFlag(info.reg);
   const airline = acAirline(info.flight);
   const kind = acKind(info.category, info.flight);
@@ -1788,11 +1941,14 @@ $('#pathSide').addEventListener('mousemove', e => {
   const ri = _routeInfo[closestHex];
   const fromName = ri ? (ri.fromCity || ri.from || '?') : null;
   const toName   = ri ? (ri.toCity   || ri.to   || '?') : null;
+  const hAlt = hp && hp.alt != null ? hp.alt : info.alt_baro;   // height at hovered point
+  const noise = hp && hp.ts != null ? _peakNoiseNear(hp.ts, 60) : null;
   const rows = [
     `<b>${(info.flight || '').trim() || info.hex}</b>${flag ? ' ' + flag : ''}`,
     airline || kind ? `${airline}${airline && kind ? ' · ' : ''}${kind}` : '',
     info.desc || info.type || '',
-    info.alt_baro != null ? `${Math.round(info.alt_baro * 0.3048)} m ${trend}` : '',
+    hAlt != null ? `${Math.round(hAlt * 0.3048)} m ${trend}` : '',
+    noise != null ? `${noise.toFixed(1)} dB(A)` : '',
     info.gs != null ? `${Math.round(info.gs * 1.852)} km/h` : '',
     ri ? `${fromName} → ${toName}` : '',
   ].filter(Boolean);
@@ -1807,7 +1963,7 @@ $('#pathSide').addEventListener('mousemove', e => {
   box.style.top  = Math.max(4, ty) + 'px';
   box.style.display = 'block';
 });
-$('#pathSide').addEventListener('mouseleave', () => { _sideHideInfo(); _sideHoverHex = null; });
+$('#pathSide').addEventListener('mouseleave', () => { _sideHideInfo(); _sideHoverHex = null; _clearCrossDot(); });
 
 function updateAircraft(list) { acData = Array.isArray(list) ? list : []; renderAircraft(); }
 
@@ -2444,7 +2600,8 @@ function drawClosestApproachScatter() {
     colors.push(_pathColor({ type: meta.type, hex: a.hex }));
     sizes.push(sz);
     const wt = acWeight(meta.type, meta.category);
-    customdata.push([a.hex, peak != null ? peak.toFixed(1) : '—', meta.desc || meta.type || '—', wt || '—']);
+    customdata.push([a.hex, peak != null ? peak.toFixed(1) : '—', meta.desc || meta.type || '—', wt || '—',
+                     a.lat, a.lon, a.alt]);
   }
 
   const nowTs = Math.floor(Date.now() / 1000);
@@ -2476,6 +2633,29 @@ function drawClosestApproachScatter() {
   };
 
   Plotly.react(el, [trace], layout, { displayModeBar:false, responsive:true });
+
+  // Hover a closest-approach dot → grow it, highlight that flight's path in the map +
+  // side view, and drop the cross-view dot at the closest-approach location.
+  // drawClosestApproachScatter() re-runs on every window/data change, so drop any
+  // prior hover handlers (whose captured sizes are now stale) before re-registering.
+  if (el.removeAllListeners) { el.removeAllListeners('plotly_hover'); el.removeAllListeners('plotly_unhover'); }
+  const _baseSizes = sizes.slice();
+  el.on('plotly_hover', data => {
+    if (!data?.points?.length) return;
+    const p = data.points[0];
+    const hex = p.customdata[0];
+    if (!hex) return;
+    const grown = _baseSizes.map((s, i) => i === p.pointNumber ? Math.round(s * 1.8) + 6 : s);
+    Plotly.restyle(el, { 'marker.size': [grown] });
+    _highlightRow(hex, true);
+    _setCrossDot({ lat: p.customdata[4], lon: p.customdata[5], alt: p.customdata[6] });
+  });
+  el.on('plotly_unhover', data => {
+    Plotly.restyle(el, { 'marker.size': [_baseSizes] });
+    _clearCrossDot();
+    const hex = data?.points?.[0]?.customdata?.[0];
+    if (hex) _highlightRow(hex, false);
+  });
 
   // Cross-highlight: clicking a scatter dot selects the same aircraft in map, table, side view.
   el.on('plotly_click', data => {

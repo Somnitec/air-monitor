@@ -120,8 +120,15 @@ def query(conn: sqlite3.Connection, *, since: int | None = None, until: int | No
         sql += " AND source = ?"; args.append(source)
     if variable:
         sql += " AND json_extract(payload, '$.' || ?) IS NOT NULL"; args.append(variable)
-    sql += " ORDER BY valid_ts ASC LIMIT ?"; args.append(int(limit))
-    return [_flatten(r) for r in conn.execute(sql, args).fetchall()]
+    # Order DESC so LIMIT keeps the *most recent* rows, then reverse to hand back
+    # ascending-by-valid_ts (the contract callers/plots rely on). Ordering ASC here
+    # meant a busy window — e.g. sensor_community's ~16k rows/24h — hit the cap on
+    # the oldest rows and silently dropped everything recent, so today's weather
+    # never reached the dashboard.
+    sql += " ORDER BY valid_ts DESC LIMIT ?"; args.append(int(limit))
+    rows = [_flatten(r) for r in conn.execute(sql, args).fetchall()]
+    rows.reverse()
+    return rows
 
 
 def last_valid_ts(conn: sqlite3.Connection, source: str) -> int | None:

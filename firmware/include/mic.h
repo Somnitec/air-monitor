@@ -27,6 +27,14 @@ struct MicResult {
 // Initialise the I2S peripheral. Returns false on driver error.
 bool mic_begin();
 
+// Tear down the I2S driver (idempotent). Used before a re-init to recover a mic
+// whose driver has wedged (e.g. after light-sleep) or that was hot-unplugged.
+void mic_end();
+
+// Full recovery: tear the driver down and re-install it, then set `hz`. Returns
+// false on driver error. Called when reads keep failing / to reconnect a mic.
+bool mic_reinit(uint32_t hz);
+
 // Change the I2S sample rate at runtime (POWER_SAVING lowers it to cut FFT CPU).
 // No-op if unchanged; returns false on driver error.
 bool mic_set_rate(uint32_t hz);

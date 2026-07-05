@@ -30,12 +30,15 @@ Practical consequences when prioritizing:
 
 ## Commands
 
-PlatformIO CLI lives at `~/.platformio/penv/bin/pio`; the server's venv at `server/venv`.
+PlatformIO CLI lives at `~/.platformio/penv/bin/pio`; the server's venv at `server/.venv`.
 
 **The server runs as a systemd user service** (`air-monitor`, unit file at
-`server/air-monitor.service`, linger enabled so it survives logout). Two venvs exist on
-purpose: `server/venv` (VS Code flatpak python 3.13 — use for pytest inside the IDE) and
-`server/.venv` (host python 3.14 — what the service runs; rebuild with the host python).
+`server/air-monitor.service`, linger enabled so it survives logout). A single venv,
+`server/.venv` (host python 3.14), both runs the service and runs the tests. Runtime deps
+are in `requirements.txt`; test-only deps (pytest, pytest-asyncio, httpx2 for the FastAPI
+TestClient) are in `requirements-dev.txt` — `./.venv/bin/python -m pip install -r
+requirements-dev.txt` after a rebuild. (There used to be a second `server/venv` for a VS
+Code flatpak python 3.13; that flatpak python is gone, so the two were merged into `.venv`.)
 From inside the VS Code flatpak, host commands need `flatpak-spawn --host`:
 
 ```bash
@@ -51,10 +54,10 @@ flatpak-spawn --host journalctl --user -u air-monitor -f     # server logs
 ~/.platformio/penv/bin/pio run  -e esp32_phase1_ota -t upload   # flash over Wi-Fi (OTA)
 
 # --- server (run from server/) ---
-AIRMON_DB=:memory: ./venv/bin/python -m pytest -q              # full suite (never touches real db)
-AIRMON_DB=:memory: ./venv/bin/python -m pytest tests/test_aircraft_base.py::TestX::test_y   # one test
-./venv/bin/python server.py                                    # run server + dashboard on :8000
-AIRMON_DB=/media/usb/air-monitor.db ./venv/bin/python server.py  # db on a USB stick
+AIRMON_DB=:memory: ./.venv/bin/python -m pytest -q             # full suite (never touches real db)
+AIRMON_DB=:memory: ./.venv/bin/python -m pytest tests/test_aircraft_base.py::TestX::test_y  # one test
+./.venv/bin/python server.py                                   # run server + dashboard on :8000
+AIRMON_DB=/media/usb/air-monitor.db ./.venv/bin/python server.py  # db on a USB stick
 python simulate.py --backfill 24                               # fake data, no hardware
 ```
 

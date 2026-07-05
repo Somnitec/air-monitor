@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 struct DeviceConfig {
-    uint32_t poll_interval_ms;  // sample cadence; default 60000 (60 s)
+    uint32_t poll_interval_ms;  // FAST channel (mic+accel) quiet-store cadence; default 10 s
+    uint32_t slow_interval_ms;  // SLOW channel (air quality/gas/soil/battery) re-read; default 3 min
     // Future: gain, noise floor, operating mode, etc.
 };
 
