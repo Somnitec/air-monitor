@@ -32,3 +32,10 @@
 // HTTP Basic Auth password for the web dashboard (any username is accepted).
 // Set AIRMON_PASSWORD env var to override without editing this file.
 #define DASHBOARD_PASSWORD  "change-me"
+
+// ---- Dashboard expo mode ----
+// 1 = clean public-display mode: hides the home/plane toggle, the device
+// cadence/power controls, and the Soil / AQI / Pressure / Wind / Precipitation /
+// Cloud & Radiation charts (Temp/Humidity and the core sensor charts stay).
+// Read at server startup; AIRMON_EXPO env overrides. Default off.
+#define DASHBOARD_EXPO  0

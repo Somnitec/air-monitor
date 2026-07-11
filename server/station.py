@@ -91,6 +91,26 @@ def dashboard_password() -> str:
     return ""
 
 
+def expo_mode() -> bool:
+    """Whether the dashboard runs in 'expo' (public-display) mode.
+
+    AIRMON_EXPO env overrides; otherwise a `#define DASHBOARD_EXPO 1` in secrets.h.
+    Truthy = 1/true/yes/on (case-insensitive). Default off.
+    """
+    def _truthy(v: str) -> bool:
+        return v.strip().strip('"').lower() in ("1", "true", "yes", "on")
+
+    env = os.environ.get("AIRMON_EXPO")
+    if env is not None:
+        return _truthy(env)
+    for path in _CANDIDATE_PATHS:
+        if path.exists():
+            m = re.search(r'^\s*#define\s+DASHBOARD_EXPO\s+(\S+)', path.read_text(), re.MULTILINE)
+            if m:
+                return _truthy(m.group(1))
+    return False
+
+
 def _env_float(name: str, default):
     try:
         v = os.environ.get(name)

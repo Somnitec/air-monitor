@@ -953,6 +953,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # the ESP32 can keep posting without credentials.
 # --------------------------------------------------------------------------- #
 _DASHBOARD_PASSWORD = station.dashboard_password()
+_EXPO_MODE = station.expo_mode()
 _COOKIE_NAME = "air_monitor_auth"
 # Stateless session token: HMAC of the password. Rotating the password
 # invalidates all existing sessions automatically.
@@ -1706,10 +1707,11 @@ async def ws(ws: WebSocket):
 # ---- dashboard ------------------------------------------------------------- #
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTMLResponse(
-        (STATIC_DIR / "index.html").read_text(encoding="utf-8"),
-        headers={"X-Robots-Tag": "noindex, nofollow"},
-    )
+    # Read from disk each request so dashboard edits are live without a restart.
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    if _EXPO_MODE:
+        html = html.replace("<body>", '<body class="expo">', 1)
+    return HTMLResponse(html, headers={"X-Robots-Tag": "noindex, nofollow"})
 
 
 @app.get("/robots.txt")

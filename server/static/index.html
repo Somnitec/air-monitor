@@ -143,8 +143,8 @@
   .leaflet-popup-content-wrapper, .leaflet-popup-tip { background:#171a21; color:var(--fg); }
   .leaflet-bar a { background:#222633; color:var(--fg); border-color:var(--line); }
   .planeicon { filter:drop-shadow(0 0 2px #000); }    /* font-size set per-icon by weight */
-  /* public-only aircraft (reference feed, not heard by our SDR): dimmed + desaturated */
-  .planeicon.public { opacity:.45; filter:grayscale(1) drop-shadow(0 0 2px #000); }
+  /* public-only aircraft (reference feed, not heard by our SDR): desaturated but opaque */
+  .planeicon.public { filter:grayscale(1) drop-shadow(0 0 2px #000); }
   .actable tr.public td { color:var(--mut); }
   .kindbadge { font-size:10px; font-weight:600; padding:1px 5px; border-radius:4px;
                background:rgba(255,255,255,.07); color:var(--mut); margin-left:4px; vertical-align:middle; }
@@ -170,6 +170,16 @@
   body.homemode #aircraftPanel { display:none; }
   body.planemode header .pill.hide-sm { display:none; }
   body.planemode #homeSection { display:none; }
+  /* Expo mode (server-set via DASHBOARD_EXPO): a clean public display — hides the
+     home/plane toggle, the device cadence/power controls, and the non-core charts. */
+  body.expo #modeBtn,
+  body.expo #deviceControls { display:none; }
+  body.expo .chart[data-group="Soil"],
+  body.expo .chart[data-group="Air Quality Index"],
+  body.expo .chart[data-group="Pressure"],
+  body.expo .chart[data-group="Wind"],
+  body.expo .chart[data-group="Precipitation"],
+  body.expo .chart[data-group="Cloud & Radiation"] { display:none; }
   /* clickable flight number */
   .flightlink { color:var(--accent); text-decoration:none; }
   .flightlink:hover { text-decoration:underline; }
@@ -226,7 +236,6 @@
   <span id="co2Badge" title="Indoor CO₂ — green is fresh, red means open a window">—</span>
   <span class="grow"></span>
   <span class="pill hide-sm" id="stats"></span>
-  <button id="fs" class="iconbtn" aria-label="Fullscreen">⛶</button>
 </header>
 
 <div class="backdrop" id="backdrop"></div>
@@ -305,6 +314,8 @@
         <label>From</label><input type="datetime-local" id="from" />
         <label>To</label><input type="datetime-local" id="to" />
       </div>
+      <!-- Device-cadence + power controls; hidden in expo mode. -->
+      <div id="deviceControls">
       <label>Fast sensors — mic + accel <span id="liveHint" style="color:var(--mut)">— how often the board samples &amp; sends</span></label>
       <select id="sensorIntvl" title="Fast channel (mic + accelerometer) store cadence, pushed to the ESP32. Picking an interval also switches it to live streaming so readings arrive in real time. Applied within ~1 min (or instantly if the board just booted).">
         <option value="" selected>— (leave as configured)</option>
@@ -332,6 +343,7 @@
         <option value="testing">Testing (live stream)</option>
         <option value="power_saving">Power saving (battery)</option>
       </select>
+      </div>
     </section>
 
     <section id="serialSection">
@@ -1157,17 +1169,12 @@ $('#modeBtn').addEventListener('click', e => {
   applyMode(_appMode === 'home' ? 'plane' : 'home');
 });
 
-// ---- touch drawer + fullscreen + screen wake-lock -------------------------
+// ---- touch drawer + screen wake-lock --------------------------------------
 function openDrawer()  { document.body.classList.add('drawer-open'); }
 function closeDrawer() { document.body.classList.remove('drawer-open'); }
 $('#menu').onclick = () =>
   document.body.classList.contains('drawer-open') ? closeDrawer() : openDrawer();
 $('#backdrop').onclick = closeDrawer;
-
-$('#fs').onclick = () => {
-  if (document.fullscreenElement) document.exitFullscreen();
-  else document.documentElement.requestFullscreen?.();
-};
 
 // Keep the panel awake while the dashboard is on screen, and re-acquire the
 // lock when the display returns from sleep after a touch (wake-on-touch is an
@@ -2439,7 +2446,7 @@ function renderAircraft() {
       acIcons[a.hex].setIcon(planeIcon(a.track, a.source, a.type, a.category));
       acIcons[a.hex].setTooltipContent(tipHtml);
     } else {
-      const m = L.marker([a.lat, a.lon], { icon: planeIcon(a.track, a.source, a.type, a.category) }).addTo(acMap);
+      const m = L.marker([a.lat, a.lon], { icon: planeIcon(a.track, a.source, a.type, a.category), zIndexOffset: 1000 }).addTo(acMap);
       m.bindTooltip(tipHtml, { direction:'top', offset:[0,-10], sticky:false });
       m.on('mouseover', () => _highlightRow(a.hex, true));
       m.on('mouseout',  () => _highlightRow(a.hex, false));
