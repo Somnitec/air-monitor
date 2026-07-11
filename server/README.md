@@ -46,21 +46,78 @@ python simulate.py --backfill 24      # 24 h of history, then live 1/sec
 ## Running on the LattePanda touch screen (kiosk)
 
 The dashboard is built for the small touch panel: large tap targets, a slide-in
-controls drawer (tap **☰**) so charts get the full width, a fullscreen button
-(**⛶**), and a screen wake-lock so the browser won't dim while it's showing.
+controls drawer (tap **☰**) so charts get the full width, and a screen wake-lock so
+the browser won't dim while it's showing. Set `DASHBOARD_EXPO 1` in `secrets.h` first
+(see **Dashboard expo mode** in `secrets.example.h`) — that hides the controls, the
+home/plane toggle, the extra charts, and the map credit, and blocks right-click /
+long-press on the page. The pieces below auto-login, open Firefox on the dashboard,
+and put it fullscreen on boot.
 
-**Auto-start in fullscreen Chromium on boot** (Debian, X11). Create
-`~/.config/autostart/air-monitor.desktop`:
+**1. Auto-login to the desktop.** Depends on the display manager:
+
+GDM3 (Debian GNOME default) — `/etc/gdm3/daemon.conf`:
+
+```ini
+[daemon]
+AutomaticLoginEnable=true
+AutomaticLogin=USER
+```
+
+LightDM (XFCE/LXDE) — `/etc/lightdm/lightdm.conf` under `[Seat:*]`, and add the user
+to the `autologin` group:
+
+```ini
+autologin-user=USER
+autologin-user-timeout=0
+```
+```bash
+sudo groupadd -f autologin && sudo gpasswd -a USER autologin
+```
+
+**2. Open the dashboard fullscreen on login (Firefox, X11).** A dedicated kiosk
+profile keeps crash-restore and first-run prompts off the wall. Create it once:
+
+```bash
+firefox -CreateProfile "kiosk $HOME/.mozilla/firefox/kiosk"
+```
+
+Put this in `$HOME/.mozilla/firefox/kiosk/user.js`:
+
+```js
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("full-screen-api.warning.timeout", 0);
+user_pref("browser.tabs.warnOnClose", false);
+```
+
+Launch script `~/kiosk.sh` (`chmod +x` it; needs `sudo apt install xdotool`):
+
+```bash
+#!/bin/bash
+firefox -P kiosk --new-window http://localhost:8000 &
+# Enter *native* fullscreen once the window is up — F11 / Esc still toggle out of it.
+xdotool search --sync --onlyvisible --class firefox windowactivate --sync \
+        key --clearmodifiers F11
+```
+
+Autostart it via `~/.config/autostart/air-monitor.desktop`:
 
 ```ini
 [Desktop Entry]
 Type=Application
-Name=Air Monitor
-Exec=chromium --kiosk --app=http://localhost:8000 --start-fullscreen --noerrdialogs --disable-translate
+Name=Air Monitor kiosk
+Exec=/home/USER/kiosk.sh
 X-GNOME-Autostart-enabled=true
 ```
 
-(Use `chromium-browser` if that's the binary name on your install.)
+**Why native F11 fullscreen and not `firefox --kiosk`?** Firefox's built-in `--kiosk`
+locks the window and only exits on `Alt+F4` / `Ctrl+W` — not the `F11` / `Esc` you
+want. Native fullscreen hides the toolbar and tabs the same way, but plugging in a
+keyboard and pressing **F11** or **Esc** drops straight back to the desktop.
+Right-click is already blocked by the page in expo mode.
 
 **Wake the display on touch.** Letting the screen sleep but waking on a tap is an
 OS power setting, not something the page controls. On X11, touch input wakes the

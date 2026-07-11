@@ -1020,7 +1020,7 @@ async def login_post(request: Request, password: str = Form(...)):
     if _SESSION_TOKEN and hmac.compare_digest(password.encode(), _DASHBOARD_PASSWORD.encode()):
         resp = RedirectResponse(url=next_url, status_code=303)
         resp.set_cookie(_COOKIE_NAME, _SESSION_TOKEN,
-                        httponly=True, samesite="lax", max_age=30 * 24 * 3600)
+                        httponly=True, samesite="lax", max_age=10 * 365 * 24 * 3600)  # ~10y: log the wall kiosk in once
         return resp
     return HTMLResponse(
         _LOGIN_HTML.replace("<!--ERR-->", '<p class="err">Wrong password.</p>'),

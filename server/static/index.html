@@ -4,9 +4,10 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Air Monitor</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Self-hosted so the wall display works with no internet (see server/static/vendor/). -->
+<script src="/static/vendor/plotly-2.35.2.min.js" charset="utf-8"></script>
+<link rel="stylesheet" href="/static/vendor/leaflet-1.9.4.css" />
+<script src="/static/vendor/leaflet-1.9.4.js"></script>
 <style>
   /* Tuned for the LattePanda's small touch screen: large tap targets (>=44px),
      a slide-in controls drawer so charts get the full width, and big fonts. */
@@ -180,6 +181,9 @@
   body.expo .chart[data-group="Wind"],
   body.expo .chart[data-group="Precipitation"],
   body.expo .chart[data-group="Cloud & Radiation"] { display:none; }
+  body.expo .leaflet-control-attribution { display:none; }
+  body.expo #researchChev { display:none; }
+  body.expo #researchHead { cursor:default; }
   /* clickable flight number */
   .flightlink { color:var(--accent); text-decoration:none; }
   .flightlink:hover { text-decoration:underline; }
@@ -1187,6 +1191,27 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') keepAwake();
 });
 
+// After 60 s of no interaction, glide back to the top and re-frame the map on the
+// range ring — for the wall display so a scrolled/panned view resets itself.
+// User activity (below) restarts the countdown.
+let _idleTimer = null;
+function _resetIdleScroll() {
+  clearTimeout(_idleTimer);
+  _idleTimer = setTimeout(() => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    fitToRing();   // frame the map back to just clipping the home circle
+  }, 60000);
+}
+['mousemove', 'mousedown', 'keydown', 'touchstart', 'wheel'].forEach(
+  ev => window.addEventListener(ev, _resetIdleScroll, { passive: true }));
+_resetIdleScroll();
+
+// Expo/wall-display hardening: swallow the right-click / long-press context menu
+// so visitors can't open it. Expo-only — revert by turning DASHBOARD_EXPO off.
+if (document.body.classList.contains('expo')) {
+  window.addEventListener('contextmenu', e => e.preventDefault());
+}
+
 
 // ---- aircraft helpers -------------------------------------------------------
 
@@ -1364,9 +1389,17 @@ async function initAircraft() {
   renderSdr(cfg && cfg.sdr);
 
   acMap = L.map('acmap', { zoomControl:true }).setView(acHome, 13);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    maxZoom:18, attribution:'&copy; OpenStreetMap, &copy; CARTO',
-  }).addTo(acMap);
+  // Expo/wall display uses tiles pre-cached around home (server/static/tiles, z10-14)
+  // so the basemap works with no internet; native zoom is clamped so cached tiles
+  // scale to cover every zoom level. Online dashboards use live CARTO tiles.
+  const _expoMap = document.body.classList.contains('expo');
+  L.tileLayer(
+    _expoMap ? '/static/tiles/{z}/{x}/{y}.png'
+             : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    _expoMap
+      ? { maxZoom:18, minNativeZoom:10, maxNativeZoom:14, attribution:'&copy; OpenStreetMap, &copy; CARTO' }
+      : { maxZoom:18, attribution:'&copy; OpenStreetMap, &copy; CARTO' }
+  ).addTo(acMap);
   L.circleMarker(acHome, { radius:5, color:'#4ea1ff', fillColor:'#4ea1ff', fillOpacity:1 })
     .addTo(acMap).bindPopup('Home');
   acRing = L.circle(acHome, { radius: acRange*1000, color:'#4ea1ff', weight:1, fill:false, dashArray:'4 4' }).addTo(acMap);
@@ -2687,6 +2720,7 @@ function drawClosestApproachScatter() {
 
 $('#researchHead').addEventListener('click', e => {
   if (e.target.id === 'researchRefresh') return;
+  if (document.body.classList.contains('expo')) return;   // wall display: research stays open
   const p = $('#researchPanel');
   p.classList.toggle('rcollapsed');
   if (!p.classList.contains('rcollapsed')) loadResearch();
@@ -2707,6 +2741,11 @@ $('#researchRefresh').addEventListener('click', e => { e.stopPropagation(); load
   connectWS();
   keepAwake();
   setInterval(loadMetrics, 60000);
+  // Wall display: force the research panel open on load (it's non-collapsible in expo).
+  if (document.body.classList.contains('expo')) {
+    $('#researchPanel').classList.remove('rcollapsed');
+    loadResearch();
+  }
   // refresh the research panel periodically while it's open
   setInterval(() => { if (!$('#researchPanel').classList.contains('rcollapsed')) loadResearch(); }, 120000);
 })();
