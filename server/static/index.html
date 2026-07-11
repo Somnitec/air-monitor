@@ -1395,6 +1395,12 @@ function setAcRange(km) {
   fitToRing();
   renderAircraft();
   loadFlightPaths();
+  // Tell the server to widen/narrow what it actually ingests to match — the slider
+  // is pointless past whatever range the server already discarded before we saw it.
+  fetch('/api/aircraft/range', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ km }),
+  }).catch(() => {});
 }
 
 // ── Flight-path history graphs ──────────────────────────────────────────────

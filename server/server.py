@@ -850,6 +850,12 @@ async def _broadcast_weather(observations) -> None:
 _aircraft_snapshot: list = []
 _sdr_status: dict = {"connected": None, "name": None}
 _sdr_checked_at: float = 0.0
+# The scheduler re-reads max_range_km/public_radius_km from this dict every tick, so
+# mutating it in place (see set_aircraft_range below) changes the live ingest range
+# without restarting the poll loop — no separate "live range" plumbing needed.
+_aircraft_settings: dict = {}
+_AIRCRAFT_RANGE_MIN_KM = 0.5   # matches the dashboard slider's min/max
+_AIRCRAFT_RANGE_MAX_KM = 20.0
 
 
 def _sdr_status_cached(ttl: float = 5.0) -> dict:
@@ -897,7 +903,9 @@ async def lifespan(app: FastAPI):
         ))
 
     # Aircraft (ADS-B via readsb): its own background poll loop.
+    global _aircraft_settings
     asettings = aircraft_config.settings()
+    _aircraft_settings = asettings   # mutated live by set_aircraft_range()
     aircraft_task = None
     if asettings["enabled"]:
         aircraft_task = asyncio.create_task(aircraft_scheduler.run_loop(
@@ -1552,7 +1560,7 @@ async def weather_metrics():
 async def get_config():
     """Static-ish config the dashboard needs (home location for the map, SDR status,
     and any per-device pushed configs)."""
-    s = aircraft_config.settings()
+    s = _aircraft_settings or aircraft_config.settings()
     return {"home": [s["lat"], s["lon"]], "aircraft_enabled": s["enabled"],
             "max_range_km": s["max_range_km"], "sdr": _sdr_status_cached(),
             "devices": DEVICE_CONFIG}
@@ -1565,6 +1573,24 @@ async def get_aircraft(range_km: float | None = None):
     if range_km is not None:
         records = [a for a in records if a.distance_km <= range_km]
     return JSONResponse([a.as_dict() for a in records])
+
+
+@app.post("/api/aircraft/range")
+async def set_aircraft_range(request: Request):
+    """Dashboard pushes its range slider value here so the SDR/public ingest range
+    (and hence what gets logged for flight-path history) tracks what's on screen,
+    instead of a fixed ceiling the slider could never see past. Takes effect on the
+    next poll tick (~1 s). Clamped to the slider's own range."""
+    body = await request.json()
+    try:
+        km = float(body["km"])
+    except (KeyError, TypeError, ValueError):
+        return JSONResponse({"error": "km must be a number"}, status_code=400)
+    km = max(_AIRCRAFT_RANGE_MIN_KM, min(_AIRCRAFT_RANGE_MAX_KM, km))
+    if _aircraft_settings:
+        _aircraft_settings["max_range_km"] = km
+        _aircraft_settings["public_radius_km"] = km
+    return JSONResponse({"ok": True, "km": km})
 
 
 # ---- flight-path history --------------------------------------------------- #
