@@ -93,14 +93,18 @@ user_pref("full-screen-api.warning.timeout", 0);
 user_pref("browser.tabs.warnOnClose", false);
 ```
 
-Launch script `~/kiosk.sh` (`chmod +x` it; needs `sudo apt install xdotool`):
+Launch script `~/kiosk.sh` (`chmod +x` it):
 
 ```bash
 #!/bin/bash
-firefox -P kiosk --new-window http://localhost:8000 &
-# Enter *native* fullscreen once the window is up — F11 / Esc still toggle out of it.
-xdotool search --sync --onlyvisible --class firefox windowactivate --sync \
-        key --clearmodifiers F11
+# Air Monitor wall display: locked fullscreen (firefox --kiosk). No touch-reachable
+# browser chrome; exiting needs a keyboard (Alt+F4) or SSH (pkill firefox).
+export DISPLAY=${DISPLAY:-:0}
+# Keep the panel awake at the X level (the page wake-lock covers the browser).
+xset s off -dpms s noblank 2>/dev/null
+# Drop any stale profile lock from an unclean shutdown so Firefox opens clean.
+rm -f "$HOME/.mozilla/firefox/kiosk/lock" "$HOME/.mozilla/firefox/kiosk/.parentlock" 2>/dev/null
+exec firefox --profile "$HOME/.mozilla/firefox/kiosk" --kiosk "http://localhost:8000"
 ```
 
 Autostart it via `~/.config/autostart/air-monitor.desktop`:
@@ -113,11 +117,27 @@ Exec=/home/USER/kiosk.sh
 X-GNOME-Autostart-enabled=true
 ```
 
-**Why native F11 fullscreen and not `firefox --kiosk`?** Firefox's built-in `--kiosk`
-locks the window and only exits on `Alt+F4` / `Ctrl+W` — not the `F11` / `Esc` you
-want. Native fullscreen hides the toolbar and tabs the same way, but plugging in a
-keyboard and pressing **F11** or **Esc** drops straight back to the desktop.
-Right-click is already blocked by the page in expo mode.
+**Why `firefox --kiosk` and not native F11 fullscreen?** In F11 fullscreen the
+toolbars auto-hide but *slide back down when the pointer hits the top edge* — and on
+a touch panel a finger does exactly that, exposing the tab's ✕ (one tap closes the
+only tab and quits Firefox) and an editable URL bar. `--kiosk` draws no chrome at
+all, so touch can't escape it; the tradeoff is that exiting needs a keyboard
+(`Alt+F4` / `Ctrl+W`) or SSH. Right-click is already blocked by the page in expo mode.
+
+**Recovery shortcut.** In case the kiosk does get closed (keyboard, crash), a desktop
+icon relaunches it — `~/Desktop/air-monitor.desktop`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Air Monitor
+Comment=Reopen the dashboard fullscreen
+Exec=/home/USER/kiosk.sh
+Icon=firefox
+Terminal=false
+```
+
+`chmod +x` it; double-tap opens the dashboard again.
 
 **Wake the display on touch.** Letting the screen sleep but waking on a tap is an
 OS power setting, not something the page controls. On X11, touch input wakes the
