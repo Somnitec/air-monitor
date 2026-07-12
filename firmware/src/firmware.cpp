@@ -666,10 +666,32 @@ static void applyServerConfig(const JsonDocument& doc) {
     devconfig_apply_json(cfg_str.c_str(), g_config);
 }
 
-// Ordered list of server endpoints to try, so all three deployment modes work
-// without reconfiguration:
+// Subnet-adaptive server address: keep SYNC_HOST's host bits but swap in the subnet
+// we're actually on. A phone hotspot hands out a different /24 on each session
+// (192.168.138.x one day, 192.168.133.x the next), which strands the literal
+// SYNC_HOST — but the server keeps its host suffix (e.g. .104), so
+// (our_prefix | SYNC_HOST_host_bits) still finds it. This is the fallback that
+// survives subnet drift when mDNS also fails and the server isn't the gateway.
+// Assumes the server's host-part is stable across leases (reserve its DHCP lease if
+// it drifts). Returns "" if we can't compute one (no mask yet, or it resolves to us).
+static String subnetAdaptiveHost() {
+    IPAddress ref;
+    if (!ref.fromString(SYNC_HOST)) return String();
+    IPAddress local = WiFi.localIP();
+    IPAddress mask  = WiFi.subnetMask();
+    if (local == IPAddress(0, 0, 0, 0) || mask == IPAddress(0, 0, 0, 0)) return String();
+    IPAddress cand;
+    for (int i = 0; i < 4; ++i) cand[i] = (local[i] & mask[i]) | (ref[i] & ~mask[i]);
+    if (cand == local) return String();   // that would be us, not the server
+    return cand.toString();
+}
+
+// Ordered list of server endpoints to try, so all deployment modes work without
+// reconfiguration:
 //   1. the mDNS-resolved host (normal LAN / an external AP shared with the server)
-//   2. the static SYNC_HOST from secrets.h (hardcoded fallback)
+//   2. SYNC_HOST relocated onto our *current* subnet (subnetAdaptiveHost) — identical
+//      to the literal SYNC_HOST on the same subnet, but survives a hotspot handing out
+//      a fresh /24; falls back to the literal SYNC_HOST only if the mask isn't up yet.
 //   3. the WiFi gateway — when the SERVER itself runs the hotspot, it *is* the
 //      gateway, so this nails the laptop-as-hotspot case even if mDNS never resolves.
 // Duplicates are dropped. The winner is pinned into s_serverHost so subsequent
@@ -683,7 +705,8 @@ static uint8_t buildEndpoints(Endpoint out[3]) {
         out[nc++] = { h, p };
     };
     if (s_serverHost.length()) add(s_serverHost, s_serverPort);
-    add(String(SYNC_HOST), (uint16_t)SYNC_PORT);
+    String adaptive = subnetAdaptiveHost();
+    add(adaptive.length() ? adaptive : String(SYNC_HOST), (uint16_t)SYNC_PORT);
     IPAddress gw = WiFi.gatewayIP();
     if (gw != IPAddress(0, 0, 0, 0)) add(gw.toString(), (uint16_t)SYNC_PORT);
     return nc;

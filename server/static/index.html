@@ -1327,6 +1327,20 @@ let _highlightedHex = null;   // hex currently highlighted across all panels
 let _routeInfo = {};           // hex -> {from, to, fromCity, toCity} route info
 let _routeFetched = new Set(); // callsigns already queried (avoid re-fetching)
 
+const _AMS_ICAO = 'EHAM', _AMS_IATA = 'AMS';
+// Collapse a route for display: we sit next to Schiphol, so a Schiphol end is redundant.
+// Arrivals show "← origin", departures show "→ destination"; a true overflight (neither
+// end here) shows both. null when we know neither city.
+function _collapseRoute(fromCity, toCity, originHome, destHome) {
+  if (!fromCity && !toCity) return null;
+  if (destHome && fromCity) return `← ${fromCity}`;   // inbound to Schiphol
+  if (originHome && toCity) return `→ ${toCity}`;      // outbound from Schiphol
+  return `${fromCity || '?'} → ${toCity || '?'}`;
+}
+function _routeLabel(ri) {
+  return ri ? _collapseRoute(ri.fromCity, ri.toCity, ri.originHome, ri.destHome) : null;
+}
+
 // ICAO airport code → city name (major airports serving European hub traffic)
 const ICAO_CITY = {
   EHAM:'Amsterdam', EHRD:'Rotterdam', EHBK:'Maastricht',
@@ -1371,26 +1385,26 @@ async function _fetchRoute(callsign) {
     if (!r.ok) return;
     const data = await r.json();
     const o = data.origin, d = data.destination, route = data.route || [];
-    // Prefer adsbdb's city/IATA; fall back to the ICAO pair mapped through ICAO_CITY.
-    const fromCity = (o && (o.city || o.iata || o.icao))
-                  || (route.length ? (ICAO_CITY[route[0]] || route[0]) : null);
-    const toCity   = (d && (d.city || d.iata || d.icao))
-                  || (route.length ? (ICAO_CITY[route[route.length - 1]] || route[route.length - 1]) : null);
+    const oIcao = (o && o.icao) || route[0] || null;
+    const dIcao = (d && d.icao) || route[route.length - 1] || null;
+    // Prefer adsbdb's city/IATA; fall back to the ICAO mapped through ICAO_CITY.
+    const fromCity = (o && (o.city || o.iata || o.icao)) || (oIcao ? (ICAO_CITY[oIcao] || oIcao) : null);
+    const toCity   = (d && (d.city || d.iata || d.icao)) || (dIcao ? (ICAO_CITY[dIcao] || dIcao) : null);
     if (!fromCity && !toCity) return;
-    // Find any hex using this callsign and store city names
+    // Which end (if any) is Schiphol — so the display can drop the redundant home end.
+    const originHome = oIcao === _AMS_ICAO || (o && o.iata === _AMS_IATA);
+    const destHome   = dIcao === _AMS_ICAO || (d && d.iata === _AMS_IATA);
+    const assign = ri => { ri.fromCity = fromCity; ri.toCity = toCity;
+                           ri.originHome = originHome; ri.destHome = destHome; };
+    // Store the route on any hex flying this callsign, live or historical.
     for (const [hex, ri] of Object.entries(_routeInfo)) {
       const flight = (_pathMeta[hex] || {}).flight || (acData || []).find(a => a.hex === hex)?.flight;
-      if ((flight || '').trim().toUpperCase() === callsign) {
-        ri.fromCity = fromCity;
-        ri.toCity   = toCity;
-      }
+      if ((flight || '').trim().toUpperCase() === callsign) assign(ri);
     }
-    // Also pre-populate for live aircraft not yet in _routeInfo
     for (const a of (acData || [])) {
       if ((a.flight || '').trim().toUpperCase() === callsign) {
         if (!_routeInfo[a.hex]) _routeInfo[a.hex] = {};
-        _routeInfo[a.hex].fromCity = fromCity;
-        _routeInfo[a.hex].toCity   = toCity;
+        assign(_routeInfo[a.hex]);
       }
     }
   } catch (_) {}
@@ -1544,11 +1558,10 @@ function _pathPopupHtml(hex) {
   const wt = acWeight(m.type, m.category), age = acAge(m.year);
   const flightId = (m.flight || '').trim();
   const ri = _routeInfo[hex];
-  const fromName = ri && ri.fromCity ? ri.fromCity : '?';
-  const toName   = ri && ri.toCity   ? ri.toCity   : '?';
+  const routeLbl = _routeLabel(ri);
   const amsHint  = ri ? [ri.fromAMS, ri.toAMS].filter(Boolean).join(' · ') : '';
-  const routeLine = (ri && (ri.fromCity || ri.toCity))
-    ? `<br><small>${fromName} → ${toName}${amsHint ? ' · ' + amsHint : ''}</small>`
+  const routeLine = routeLbl
+    ? `<br><small>${routeLbl}${amsHint ? ' · ' + amsHint : ''}</small>`
     : (amsHint ? `<br><small>${amsHint}</small>` : '');
   return `<b>${flightId || hex}</b>${flag ? ' ' + flag : ''}`
     + `${airline ? ' · ' + airline : ''}${kind ? ' <small>(' + kind + ')</small>' : ''}<br>`
@@ -2037,8 +2050,7 @@ $('#pathSide').addEventListener('mousemove', e => {
   const vr = info.baro_rate || 0;
   const trend = vr > 64 ? '▲' : vr < -64 ? '▼' : '—';
   const ri = _routeInfo[closestHex];
-  const fromName = ri && ri.fromCity ? ri.fromCity : '?';
-  const toName   = ri && ri.toCity   ? ri.toCity   : '?';
+  const routeLbl = _routeLabel(ri);
   const hAlt = hp && hp.alt != null ? hp.alt : info.alt_baro;   // height at hovered point
   const noise = hp && hp.ts != null ? _peakNoiseNear(hp.ts, 60) : null;
   const rows = [
@@ -2048,7 +2060,7 @@ $('#pathSide').addEventListener('mousemove', e => {
     hAlt != null ? `${Math.round(hAlt * 0.3048)} m ${trend}` : '',
     noise != null ? `${noise.toFixed(1)} dB(A)` : '',
     info.gs != null ? `${Math.round(info.gs * 1.852)} km/h` : '',
-    (ri && (ri.fromCity || ri.toCity)) ? `${fromName} → ${toName}` : '',
+    routeLbl || '',
   ].filter(Boolean);
 
   const box = $('#sideInfo');
@@ -2364,6 +2376,56 @@ function _sampleCurve(cLat, cLon, tStart, tEnd, nPts) {
   return lls;
 }
 
+// ── Aircraft motion prediction ─────────────────────────────────────────────
+// Dead-reckon ahead with a constant-speed, constant-turn-rate model. Heading and
+// speed are the aircraft's own reported track/gs; the turn rate is estimated from
+// how its recent track readings are rotating. This bends the prediction to follow a
+// banking plane while staying bounded — unlike extrapolating a free polynomial fit,
+// which diverges (tens of km) a couple of minutes past its ~1-min data window.
+const PRED_HORIZON_SEC = 120;      // how far ahead the dashed prediction reaches
+const MAX_TURN_RATE_DPS = 3;       // deg/s cap (~rate-1 turn); rejects jittery estimates
+const MAX_PRED_TURN_DEG = 150;     // stop the arc once it's turned this far — beyond a
+                                   // typical maneuver, constant-rate extrapolation is guesswork
+
+const _angDiff = (a, b) => ((a - b + 540) % 360) - 180;   // signed a−b in (−180,180]
+
+// Turn rate (deg/s) from recent track readings, via least-squares on the unwrapped
+// heading vs. time. 0 (straight) when there isn't enough signal; clamped so GPS /
+// track jitter can't spin the prediction.
+function _estTurnRate(hist) {
+  const pts = hist.filter(p => p.track != null);
+  if (pts.length < 3) return 0;                 // need a few readings to trust a rate
+  const t0 = pts[0].ts;
+  const ts = pts.map(p => p.ts - t0);
+  const unwrapped = [pts[0].track];
+  for (let i = 1; i < pts.length; i++)
+    unwrapped.push(unwrapped[i-1] + _angDiff(pts[i].track, pts[i-1].track));
+  const c = polyFit(ts, unwrapped, 1);          // [intercept, slope]; slope = deg/s
+  return Math.max(-MAX_TURN_RATE_DPS, Math.min(MAX_TURN_RATE_DPS, c[1] || 0));
+}
+
+// Fallback ground speed (knots) from mean step distance, when gs isn't reported.
+function _histSpeedKts(hist) {
+  if (hist.length < 2) return 0;
+  const a = hist[0], b = hist.at(-1), dt = b.ts - a.ts;
+  if (dt <= 0) return 0;
+  return haversineKm(a.lat, a.lon, b.lat, b.lon) / dt * 3600 / 1.852;
+}
+
+// Sample an arc: start lat/lon, initial heading (deg), speed (kt), turn rate (deg/s).
+function _predictArc(lat, lon, hdg, spdKts, omega, horizonSec, stepSec) {
+  const legKm = spdKts * 1.852 / 3600 * stepSec;
+  const lls = [[lat, lon]];
+  let th = hdg;
+  for (let t = stepSec; t <= horizonSec; t += stepSec) {
+    [lat, lon] = destPoint(lat, lon, th, legKm);
+    th += omega * stepSec;                       // constant turn rate → arc
+    lls.push([lat, lon]);
+    if (Math.abs(th - hdg) >= MAX_PRED_TURN_DEG) break;   // don't extrapolate into a loop
+  }
+  return lls;
+}
+
 // Draw polynomial-fit trail + prediction for all planes within 2× acRange.
 // Trail = smooth curve from first DB point to current live position (solid).
 // Pred  = extrapolation 3 min ahead (dashed), starting from the live position.
@@ -2387,35 +2449,40 @@ function drawPredPaths() {
     const nowTs = Date.now() / 1000;
     const hist = rawHist.slice();
     const lastDbTs = hist.length ? hist.at(-1).ts : 0;
-    if (nowTs > lastDbTs + 3) hist.push({ lat:a.lat, lon:a.lon, ts:nowTs });
+    if (nowTs > lastDbTs + 3) hist.push({ lat:a.lat, lon:a.lon, ts:nowTs, track:a.track });
 
     let trailLLs = null, predLLs = null;
 
+    // Trail (where it's been): a smooth polynomial through the recent points. This is
+    // interpolation *within* the data window, so it stays well-behaved.
     if (hist.length >= 2) {
       const t0 = hist[0].ts;
-      const ts   = hist.map(p => p.ts - t0);
-      const lats = hist.map(p => p.lat);
-      const lons = hist.map(p => p.lon);
+      const ts  = hist.map(p => p.ts - t0);
       const deg = Math.min(2, hist.length - 1);
-      const cLat = polyFit(ts, lats, deg);
-      const cLon = polyFit(ts, lons, deg);
+      const cLat = polyFit(ts, hist.map(p => p.lat), deg);
+      const cLon = polyFit(ts, hist.map(p => p.lon), deg);
       const avgIntervalSec = (hist.at(-1).ts - hist[0].ts) / (hist.length - 1);
       if (_acAnimState[a.hex]) _acAnimState[a.hex].avgIntervalSec = avgIntervalSec;
-      const tTrailEnd = hist.at(-1).ts - t0;   // = nowTs - t0 after live-pos append
-      const tPredEnd  = tTrailEnd + 3*60;
-      trailLLs = _sampleCurve(cLat, cLon, 0, tTrailEnd, 10);
-      predLLs  = _sampleCurve(cLat, cLon, tTrailEnd, tPredEnd, 10);
-    } else if (a.track != null && a.gs) {
-      if (!_acAnimState[a.hex]) {
-        _acAnimState[a.hex] = { lat:a.lat, lon:a.lon, track:a.track, gs:a.gs,
-                                 reportedAt: nowTs, avgIntervalSec: 15 };
-      }
-      const distKm = a.gs * (3/60) * 1.852;
-      predLLs = [[a.lat, a.lon], destPoint(a.lat, a.lon, a.track, distKm)];
-    } else {
-      _removePredCurve(a.hex);
-      continue;
+      trailLLs = _sampleCurve(cLat, cLon, 0, hist.at(-1).ts - t0, 10);
     }
+
+    // Prediction (where it's going): a constant-speed / constant-turn-rate arc from
+    // the live position. Heading + speed are the plane's own reported track/gs (most
+    // current); the turn rate comes from how the recent track readings are rotating.
+    // Straight flight → straight dash; a banking plane → a matching curve.
+    const hdg = a.track != null ? a.track
+              : hist.length >= 2 ? _bearing(hist.at(-2).lat, hist.at(-2).lon, a.lat, a.lon)
+              : null;
+    const spdKts = a.gs || _histSpeedKts(hist);
+    if (hdg != null && spdKts > 0) {
+      if (!_acAnimState[a.hex])
+        _acAnimState[a.hex] = { lat:a.lat, lon:a.lon, track:hdg, gs:spdKts,
+                                reportedAt: nowTs, avgIntervalSec: 15 };
+      predLLs = _predictArc(a.lat, a.lon, hdg, spdKts, _estTurnRate(hist),
+                            PRED_HORIZON_SEC, 6);
+    }
+
+    if (!trailLLs && !predLLs) { _removePredCurve(a.hex); continue; }
 
     const allPts = [...(trailLLs || []), ...(predLLs || [])];
     const willBeInRange = a.distance_km <= acRange ||
@@ -2554,18 +2621,8 @@ function renderAircraft() {
               : a.source === 'both' ? ' · our SDR + reference' : ' · our SDR';
     const al = acAirline(a.flight); const kd = acKind(a.category, a.flight);
     const _tf = _regFlag(a.reg); const _tw = acWeight(a.type, a.category);
-    const _ri = _routeInfo[a.hex];
-    const _routeLine = _ri
-      ? (() => {
-          const vr = a.baro_rate || 0;
-          const fromName = _ri.fromCity || '?';
-          const toName   = _ri.toCity   || '?';
-          const phase = vr > 64 ? `↗ from ${fromName}${_ri.fromAMS ? ' (' + _ri.fromAMS + ')' : ''}`
-                       : vr < -64 ? `↘ to ${toName}${_ri.toAMS ? ' (' + _ri.toAMS + ')' : ''}`
-                       : (_ri.fromCity || _ri.toCity) ? `${fromName} → ${toName}` : '';
-          return phase ? `<br>${phase}` : '';
-        })()
-      : '';
+    const _routeLbl = _routeLabel(_routeInfo[a.hex]);
+    const _routeLine = _routeLbl ? `<br>${_routeLbl}` : '';
     const tipHtml =
         `<b>${a.flight || a.hex}</b>${_tf.flag ? ' ' + _tf.flag : ''}${al ? ' · ' + al : ''}${kd ? ' <small>(' + kd + ')</small>' : ''}<br>`
       + `${a.desc || a.type || '—'}${_tw ? ' · ' + _tw : ''}<br>`
@@ -2610,10 +2667,7 @@ function renderAircraft() {
     const flightCell = flightId
       ? `<a class="flightlink" href="https://www.flightradar24.com/${flightId.toLowerCase()}" target="_blank" rel="noopener">${flightId}</a>`
       : a.hex;
-    const ri = _routeInfo[a.hex];
-    const route = ri && (ri.fromCity || ri.toCity)
-      ? `${ri.fromCity || '?'}→${ri.toCity || '?'}`
-      : '—';
+    const route = _routeLabel(_routeInfo[a.hex]) || '—';
     return `<tr class="${a.source === 'public' ? 'public' : ''}" data-hex="${a.hex}" style="cursor:pointer">`
       + `<td title="${country}">${flag}</td>`
       + `<td>${flightCell}</td>`
@@ -2696,7 +2750,7 @@ async function loadResearch() {
     ], loud);
     const maxRouteAvg = Math.max(1, ...routeLoud.map(r => r.avg_dba || 0));
     _rtable($('#resRoutes'), [
-      { h:'Route', f:r => r.route },
+      { h:'Route', f:r => _collapseRoute(r.origin_city, r.dest_city, r.origin_iata === _AMS_IATA, r.dest_iata === _AMS_IATA) || r.route },
       { h:'Flights', k:'n_flights' },
       { h:'Avg dB', f:r => `${r.avg_dba}<span class="rbar" style="width:${Math.round((r.avg_dba/maxRouteAvg)*60)}px"></span>` },
       { h:'Max dB', k:'max_dba' },
