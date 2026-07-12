@@ -106,6 +106,8 @@
   .achead h2 { font-size:14px; margin:0; font-weight:600; }
   .achead .account { color:var(--accent); font-size:13px; font-weight:600; }
   .achead .acrange { color:var(--mut); font-size:12px; }
+  .achead .acoverhead { color:var(--mut); font-size:12px; display:inline-flex; align-items:center; gap:3px; cursor:pointer; user-select:none; }
+  .achead .acoverhead input { margin:0; cursor:pointer; }
   .acbody { display:flex; flex-wrap:wrap; }
   #pathSideWrap { position:relative; flex:0 0 360px; width:360px; border-right:1px solid var(--line); }
   #pathSide { display:block; height:360px; width:360px; background:#0e1117; cursor:pointer; }
@@ -154,6 +156,10 @@
               background:#3a1f23; color:#ffb3bd; }      /* default: not connected */
   .sdrbadge.on  { background:#1f7a44; color:#eafff1; }  /* dongle present */
   .sdrbadge.unknown { background:#222633; color:var(--mut); }
+  .rwybadge { font-size:11px; font-weight:700; padding:2px 7px; border-radius:7px;
+              background:#222633; color:var(--mut); cursor:default; }
+  .rwybadge.overhead { background:#7a5a1f; color:#fff1d6; }  /* Buitenveldertbaan: over us */
+  .rwybadge.closed { background:#1f4d5a; color:#d6f4ff; }   /* Buitenveldertbaan closed: quiet */
   .howlbtn { background:#1a2535; color:#8bb8e8; border:1px solid #2a3f5a; border-radius:7px;
              padding:2px 9px; font-size:12px; font-weight:600; cursor:pointer; line-height:1.6; }
   .howlbtn:active { background:#223047; }
@@ -251,7 +257,9 @@
     <span class="account" id="acCount">—</span>
     <input type="range" id="acRangeHead" min="0.5" max="20" step="0.5" class="acrangeslider" title="Range" />
     <span class="acrange" id="acRangeLbl"></span>
+    <label class="acoverhead" title="Only planes passing directly overhead (slant range ≤ 500 m), not distant ones"><input type="checkbox" id="overheadOnly" /> ⤓ overhead</label>
     <span class="sdrbadge" id="sdrBadge" title="RTL-SDR dongle">SDR —</span>
+    <span class="rwybadge" id="rwyBadge" title="Schiphol runway use (LVNL) — 🛬 landing / 🛫 departing">🛬 —</span>
     <button type="button" class="howlbtn" id="howlBtn" title="Mark: I heard the howl">🔊 Heard it howl</button>
     <span class="howllast" id="howlLast"></span>
   </div>
@@ -291,6 +299,10 @@
     <div class="research-block">
       <h3>Loudest aircraft types <small>avg / peak dB(A) when overhead</small></h3>
       <div class="rtable-wrap"><table class="rtable" id="resLoud"></table></div>
+    </div>
+    <div class="research-block">
+      <h3>Loudest routes <small>origin → destination, avg / peak dB(A) overhead</small></h3>
+      <div class="rtable-wrap"><table class="rtable" id="resRoutes"></table></div>
     </div>
     <div class="research-block">
       <h3>Recent noise events <small>loud reading → closest plane</small></h3>
@@ -893,6 +905,7 @@ function connectWS() {
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'aircraft') { renderSdr(msg.sdr); updateAircraft(msg.data); return; }
+    if (msg.type === 'runway')   { renderRunway(msg.data); return; }
     if (msg.type === 'weather')  { Object.assign(_weatherLatest, msg.data); _weatherLatest._source = msg.data.source || _weatherLatest._source; renderWeather(); return; }
     if (!live) return;
     if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); _scheduleRender(); _serialPush(msg.data); }
@@ -1299,6 +1312,17 @@ function _highlightRow(hex, on) {
 // ---- aircraft (ADS-B live map + table) ------------------------------------
 let acMap, acRing, acIcons = {}, _predCurves = {}, _acAnimState = {}, acData = [], acHome = null;
 let acRange = 5;   // always start at 5 km
+// "Overhead only": show just planes passing (near-)directly over the station, judged by
+// slant range (true 3-D distance), not ground-track distance — a jet at cruise whose
+// track crosses overhead is still km away and inaudible. Mirrors server _OVERHEAD_SLANT_KM.
+const OVERHEAD_SLANT_KM = 0.5;
+let overheadOnly = localStorage.getItem('overheadOnly') === '1';
+// Slant range (km) of a path point from home; Infinity when altitude is unknown so such
+// points never count as overhead. Live snapshot planes carry slant_km from the API already.
+function slantKmAt(lat, lon, alt_baro) {
+  if (alt_baro == null || !acHome) return Infinity;
+  return Math.hypot(haversineKm(acHome[0], acHome[1], lat, lon), alt_baro * 0.0003048);
+}
 let _highlightedHex = null;   // hex currently highlighted across all panels
 let _routeInfo = {};           // hex -> {from, to, fromCity, toCity} route info
 let _routeFetched = new Set(); // callsigns already queried (avoid re-fetching)
@@ -1346,10 +1370,13 @@ async function _fetchRoute(callsign) {
     const r = await fetch(`/api/route?callsign=${encodeURIComponent(callsign)}`);
     if (!r.ok) return;
     const data = await r.json();
-    const route = data.route || [];
-    if (route.length < 2) return;
-    const fromCity = ICAO_CITY[route[0]] || route[0];
-    const toCity   = ICAO_CITY[route[route.length - 1]] || route[route.length - 1];
+    const o = data.origin, d = data.destination, route = data.route || [];
+    // Prefer adsbdb's city/IATA; fall back to the ICAO pair mapped through ICAO_CITY.
+    const fromCity = (o && (o.city || o.iata || o.icao))
+                  || (route.length ? (ICAO_CITY[route[0]] || route[0]) : null);
+    const toCity   = (d && (d.city || d.iata || d.icao))
+                  || (route.length ? (ICAO_CITY[route[route.length - 1]] || route[route.length - 1]) : null);
+    if (!fromCity && !toCity) return;
     // Find any hex using this callsign and store city names
     for (const [hex, ri] of Object.entries(_routeInfo)) {
       const flight = (_pathMeta[hex] || {}).flight || (acData || []).find(a => a.hex === hex)?.flight;
@@ -1419,9 +1446,21 @@ async function initAircraft() {
   const slh = $('#acRangeHead'); slh.value = acRange;
   slh.addEventListener('input',     e => { e.stopPropagation(); $('#acRangeLbl').textContent = `· ≤ ${fmtKm(parseFloat(slh.value))}`; });
   slh.addEventListener('change',    e => { e.stopPropagation(); setAcRange(parseFloat(slh.value)); });
+  const oh = $('#overheadOnly');
+  if (oh) {
+    oh.checked = overheadOnly;
+    oh.addEventListener('change', e => {
+      e.stopPropagation();
+      overheadOnly = oh.checked;
+      localStorage.setItem('overheadOnly', overheadOnly ? '1' : '0');
+      renderAircraft();      // live icons + count
+      loadFlightPaths();     // re-filter history (map, side view, scatter, predictions)
+    });
+  }
   // (the aircraft panel is never collapsed — the flight map stays open)
 
   try { updateAircraft(await (await fetch('/api/aircraft')).json()); } catch (_) {}
+  loadRunway();   // current runway config + overhead outlook (also pushed live via WS)
   setTimeout(() => { if (acMap) { acMap.invalidateSize(); fitToRing(); } }, 250);   // layout pass, then frame the range
 }
 
@@ -1435,12 +1474,9 @@ function setAcRange(km) {
   fitToRing();
   renderAircraft();
   loadFlightPaths();
-  // Tell the server to widen/narrow what it actually ingests to match — the slider
-  // is pointless past whatever range the server already discarded before we saw it.
-  fetch('/api/aircraft/range', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ km }),
-  }).catch(() => {});
+  // Display-only: the server always ingests the full corridor (AIRCRAFT_MAX_RANGE_KM,
+  // ~30 km) so history keeps the wider flight paths; the slider just filters what this
+  // map/list shows (renderAircraft + loadFlightPaths?range_km). No server round-trip.
 }
 
 // ── Flight-path history graphs ──────────────────────────────────────────────
@@ -1489,13 +1525,15 @@ function _bearing(la1, lo1, la2, lo2) {
   return (Math.atan2(y, x) * 180/Math.PI + 360) % 360;
 }
 
-// A small "›" chevron rotated to the aircraft's heading (the glyph points east at 0°,
-// so rotate track−90 to align it with the compass track). Non-interactive so clicks
-// fall through to the underlying path line (which carries the identity popup).
+// A small filled triangle rotated to the aircraft's heading (points east at 0°, so rotate
+// track−90 to align it with the compass track). Its centroid is exactly the (7,7) icon
+// centre/anchor — base corners (5,3),(5,11), vertex (11,7) → centroid ((5+5+11)/3,7)=(7,7)
+// — so rotating about the centre keeps the marker's middle on the path line at any heading.
+// Non-interactive so clicks fall through to the underlying path line (identity popup).
 function _chevronIcon(track, color, op) {
   return L.divIcon({ className:'', iconSize:[14,14], iconAnchor:[7,7],
-    html:`<div style="transform:rotate(${((track||0)-90).toFixed(0)}deg);color:${color};`
-       + `opacity:${op.toFixed(2)};font:700 14px/14px system-ui;text-align:center">›</div>` });
+    html:`<svg width="14" height="14" viewBox="0 0 14 14" style="display:block;transform:rotate(${((track||0)-90).toFixed(0)}deg);opacity:${op.toFixed(2)}">`
+       + `<polygon points="5,3 11,7 5,11" fill="${color}"/></svg>` });
 }
 
 // Identity popup for a logged track — "what kind of aircraft was this?"
@@ -1506,9 +1544,12 @@ function _pathPopupHtml(hex) {
   const wt = acWeight(m.type, m.category), age = acAge(m.year);
   const flightId = (m.flight || '').trim();
   const ri = _routeInfo[hex];
-  const fromName = ri ? (ri.fromCity || ri.from || '?') : null;
-  const toName   = ri ? (ri.toCity   || ri.to   || '?') : null;
-  const routeLine = ri ? `<br><small>${fromName} → ${toName}${ri.fromAMS ? ' · ' + ri.fromAMS : ''}${ri.toAMS ? ' · ' + ri.toAMS : ''}</small>` : '';
+  const fromName = ri && ri.fromCity ? ri.fromCity : '?';
+  const toName   = ri && ri.toCity   ? ri.toCity   : '?';
+  const amsHint  = ri ? [ri.fromAMS, ri.toAMS].filter(Boolean).join(' · ') : '';
+  const routeLine = (ri && (ri.fromCity || ri.toCity))
+    ? `<br><small>${fromName} → ${toName}${amsHint ? ' · ' + amsHint : ''}</small>`
+    : (amsHint ? `<br><small>${amsHint}</small>` : '');
   return `<b>${flightId || hex}</b>${flag ? ' ' + flag : ''}`
     + `${airline ? ' · ' + airline : ''}${kind ? ' <small>(' + kind + ')</small>' : ''}<br>`
     + `${m.desc || m.type || '—'}${wt ? ' · ' + wt : ''}${age ? ' · ' + age : ''}`
@@ -1642,6 +1683,16 @@ async function loadFlightPaths() {
     if (!resp.ok) return;
     const j = await resp.json();
     _pathData = j.points || [];
+    // Overhead filter: keep only tracks whose closest approach actually came overhead
+    // (min slant range ≤ threshold). Drops distant/high tracks wholesale, so every
+    // downstream draw (map, side view, closest-approach scatter, predictions) inherits it.
+    if (overheadOnly) {
+      const keep = new Set();
+      for (const [hex, pts] of Object.entries(_groupByHex(_pathData))) {
+        if (pts.some(p => slantKmAt(p.lat, p.lon, p.alt_baro) <= OVERHEAD_SLANT_KM)) keep.add(hex);
+      }
+      _pathData = _pathData.filter(p => keep.has(p.hex));
+    }
     _pathMeta = j.meta || {};
     // Kick off route lookups for historical tracks.
     for (const m of Object.values(_pathMeta)) {
@@ -1835,7 +1886,8 @@ function drawSideView() {
 
   // live aircraft overlay (current snapshot)
   const live = (acData || []).filter(a => a.lat != null && a.lon != null && a.alt_baro != null
-                                       && a.distance_km != null && a.distance_km <= acRange);
+                                       && a.distance_km != null && a.distance_km <= acRange
+                                       && (!overheadOnly || (a.slant_km != null && a.slant_km <= OVERHEAD_SLANT_KM)));
   for (const a of live) {
     const [x, y] = toXY(a.lon, a.alt_baro);
     const sz = planeSize(a.type, a.category);
@@ -1985,8 +2037,8 @@ $('#pathSide').addEventListener('mousemove', e => {
   const vr = info.baro_rate || 0;
   const trend = vr > 64 ? '▲' : vr < -64 ? '▼' : '—';
   const ri = _routeInfo[closestHex];
-  const fromName = ri ? (ri.fromCity || ri.from || '?') : null;
-  const toName   = ri ? (ri.toCity   || ri.to   || '?') : null;
+  const fromName = ri && ri.fromCity ? ri.fromCity : '?';
+  const toName   = ri && ri.toCity   ? ri.toCity   : '?';
   const hAlt = hp && hp.alt != null ? hp.alt : info.alt_baro;   // height at hovered point
   const noise = hp && hp.ts != null ? _peakNoiseNear(hp.ts, 60) : null;
   const rows = [
@@ -1996,7 +2048,7 @@ $('#pathSide').addEventListener('mousemove', e => {
     hAlt != null ? `${Math.round(hAlt * 0.3048)} m ${trend}` : '',
     noise != null ? `${noise.toFixed(1)} dB(A)` : '',
     info.gs != null ? `${Math.round(info.gs * 1.852)} km/h` : '',
-    ri ? `${fromName} → ${toName}` : '',
+    (ri && (ri.fromCity || ri.toCity)) ? `${fromName} → ${toName}` : '',
   ].filter(Boolean);
 
   const box = $('#sideInfo');
@@ -2012,6 +2064,49 @@ $('#pathSide').addEventListener('mousemove', e => {
 $('#pathSide').addEventListener('mouseleave', () => { _sideHideInfo(); _sideHoverHex = null; _clearCrossDot(); });
 
 function updateAircraft(list) { acData = Array.isArray(list) ? list : []; renderAircraft(); }
+
+// ---- Schiphol runway use + overhead outlook -------------------------------
+// Ground truth for "is it overhead": which runway Schiphol is landing/departing on
+// (LVNL feed). Overhead here = Buitenveldertbaan 27 landings / 09 departures.
+function renderRunway(cur) {
+  const b = $('#rwyBadge'); if (!b) return;
+  if (!cur) { b.textContent = '🛬 —'; b.classList.remove('overhead'); b.title = 'Schiphol runway use — no data yet'; return; }
+  const land = (cur.landing || []).join(',') || '—';
+  const dep  = (cur.departing || []).join(',') || '—';
+  b.textContent = `🛬${land} 🛫${dep}${cur.overhead ? ' · OVERHEAD' : ''}`;
+  b.classList.toggle('overhead', !!cur.overhead);
+  b.title = cur.overhead
+    ? 'Schiphol is landing/departing over the station (Buitenveldertbaan) — expect flyovers'
+    : 'Schiphol runway use (LVNL). Not over the station right now.';
+}
+
+async function loadRunway() {
+  let cur = null;
+  try { cur = (await (await fetch('/api/runway/current')).json()).current; } catch (_) {}
+  renderRunway(cur);
+  const b = $('#rwyBadge');
+  try {
+    const f = await (await fetch('/api/research/overhead_forecast')).json();
+    if (b && f && f.summary) b.title += `\n\nOutlook: ${f.summary}`;
+  } catch (_) {}
+  // Runway maintenance: a Buitenveldertbaan closure = guaranteed quiet days.
+  try {
+    const m = await (await fetch('/api/runway/maintenance')).json();
+    const fmtD = s => new Date(s + 'T00:00:00').toLocaleDateString(undefined, {day:'numeric', month:'short'});
+    const closedNow = (m.current || []).find(c => c.affects_overhead);
+    if (b && closedNow) {                          // Buitenveldertbaan closed right now
+      b.textContent = `🛬 Buitenveldertbaan dicht t/m ${fmtD(closedNow.until)} · geen overhead`;
+      b.classList.remove('overhead'); b.classList.add('closed');
+      b.title = `${closedNow.name} closed for maintenance (${fmtD(closedNow.from)}–${fmtD(closedNow.until)}) — guaranteed no flights overhead.\n${closedNow.note || ''}`;
+    } else if (b) {
+      const soon = (m.upcoming || []).filter(c => c.affects_overhead && c.days_until <= 90);
+      if (soon.length) {
+        const c = soon[0];
+        b.title += `\n\n🔧 ${c.name} closed ${fmtD(c.from)}–${fmtD(c.until)} (in ${c.days_until}d) → guaranteed no overhead then.`;
+      }
+    }
+  } catch (_) {}
+}
 
 // ── Smooth icon interpolation ───────────────────────────────────────────────
 // Dead-reckon at 60 fps using requestAnimationFrame so movement is compositor-smooth.
@@ -2421,10 +2516,13 @@ $('#howlBtn').addEventListener('click', e => {
 
 function renderAircraft() {
   if (!acMap) return;
-  const inRange = acData.filter(a => a.distance_km != null && a.distance_km <= acRange);
+  const inRange = acData.filter(a => a.distance_km != null && a.distance_km <= acRange
+                                  && (!overheadOnly || (a.slant_km != null && a.slant_km <= OVERHEAD_SLANT_KM)));
   const nSdr = inRange.filter(a => a.source !== 'public').length;   // 'sdr' or 'both'
   const nPublic = inRange.length - nSdr;
-  $('#acCount').textContent = nPublic && nSdr
+  $('#acCount').textContent = overheadOnly
+    ? `${inRange.length} overhead`
+    : nPublic && nSdr
     ? `${nSdr} SDR · ${nPublic} ref`
     : nPublic
     ? `${nPublic} in range (internet — SDR offline)`
@@ -2460,12 +2558,12 @@ function renderAircraft() {
     const _routeLine = _ri
       ? (() => {
           const vr = a.baro_rate || 0;
-          const fromName = _ri.fromCity || _ri.from || '?';
-          const toName   = _ri.toCity   || _ri.to   || '?';
+          const fromName = _ri.fromCity || '?';
+          const toName   = _ri.toCity   || '?';
           const phase = vr > 64 ? `↗ from ${fromName}${_ri.fromAMS ? ' (' + _ri.fromAMS + ')' : ''}`
                        : vr < -64 ? `↘ to ${toName}${_ri.toAMS ? ' (' + _ri.toAMS + ')' : ''}`
-                       : `${fromName} → ${toName}`;
-          return `<br>${phase}`;
+                       : (_ri.fromCity || _ri.toCity) ? `${fromName} → ${toName}` : '';
+          return phase ? `<br>${phase}` : '';
         })()
       : '';
     const tipHtml =
@@ -2513,8 +2611,8 @@ function renderAircraft() {
       ? `<a class="flightlink" href="https://www.flightradar24.com/${flightId.toLowerCase()}" target="_blank" rel="noopener">${flightId}</a>`
       : a.hex;
     const ri = _routeInfo[a.hex];
-    const route = ri
-      ? (ri.fromCity && ri.toCity ? `${ri.fromCity}→${ri.toCity}` : `${ri.from || '?'}→${ri.to || '?'}`)
+    const route = ri && (ri.fromCity || ri.toCity)
+      ? `${ri.fromCity || '?'}→${ri.toCity || '?'}`
       : '—';
     return `<tr class="${a.source === 'public' ? 'public' : ''}" data-hex="${a.hex}" style="cursor:pointer">`
       + `<td title="${country}">${flag}</td>`
@@ -2573,10 +2671,11 @@ function _rtable(el, cols, rows) {
 
 async function loadResearch() {
   try {
-    const [daily, loud, events] = await Promise.all([
+    const [daily, loud, events, routeLoud] = await Promise.all([
       fetch('/api/research/daily?limit=14').then(r => r.json()),
       fetch('/api/research/loudness?limit=15').then(r => r.json()),
       fetch('/api/research/noise_events?limit=60').then(r => r.json()),
+      fetch('/api/research/routes?limit=15').then(r => r.json()),
     ]);
     _rtable($('#resDaily'), [
       { h:'Day', f:r => r.day },
@@ -2595,6 +2694,13 @@ async function loadResearch() {
       { h:'Avg dB', f:r => `${r.avg_dba}<span class="rbar" style="width:${Math.round((r.avg_dba/maxAvg)*60)}px"></span>` },
       { h:'Max dB', k:'max_dba' },
     ], loud);
+    const maxRouteAvg = Math.max(1, ...routeLoud.map(r => r.avg_dba || 0));
+    _rtable($('#resRoutes'), [
+      { h:'Route', f:r => r.route },
+      { h:'Flights', k:'n_flights' },
+      { h:'Avg dB', f:r => `${r.avg_dba}<span class="rbar" style="width:${Math.round((r.avg_dba/maxRouteAvg)*60)}px"></span>` },
+      { h:'Max dB', k:'max_dba' },
+    ], routeLoud);
     _rtable($('#resEvents'), [
       { h:'Time', f:r => (r.time || '').slice(5, 16) },
       { h:'dB', f:r => r.lamax ?? r.noise_dba },

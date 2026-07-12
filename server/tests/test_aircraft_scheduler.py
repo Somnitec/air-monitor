@@ -12,9 +12,13 @@ FIXTURE = Path(__file__).parent / "fixtures" / "aircraft_sample.json"
 
 
 def _settings(**kw):
+    # drop_on_ground=False keeps these plumbing/count tests exercising the whole fixture
+    # (it includes a taxiing aircraft); the ground-drop policy itself is covered in
+    # test_aircraft_base. Pass drop_on_ground=True to test the drop path here.
     s = dict(enabled=True, lat=52.179722, lon=5.284722,
              json_path=str(FIXTURE), json_url=None,
-             poll_sec=1.0, stale_sec=60.0, max_range_km=300.0, log_sec=15.0)
+             poll_sec=1.0, stale_sec=60.0, max_range_km=300.0, log_sec=15.0,
+             drop_on_ground=False)
     s.update(kw)
     return s
 

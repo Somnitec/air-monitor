@@ -1,0 +1,13 @@
+{
+  "_comment": "Schiphol runway maintenance / closures. Hand-maintained: Schiphol publishes a yearly 'baanonderhoud en werkzaamheden' schedule (no clean API), so paste new entries here when they update it. A Buitenveldertbaan (09/27) closure means GUARANTEED no overhead flights over the station for those dates. Dates are inclusive local days (Europe/Amsterdam). Source page: https://www.schiphol.nl/nl/schiphol-als-buur/baanonderhoud-en-werkzaamheden/",
+  "closures": [
+    {
+      "runway": "09/27",
+      "name": "Buitenveldertbaan",
+      "from": "2026-08-31",
+      "until": "2026-09-08",
+      "note": "Groot onderhoud — niet inzetbaar voor vliegverkeer",
+      "source": "https://www.schiphol.nl/nl/schiphol-als-buur/baanonderhoud-en-werkzaamheden/"
+    }
+  ]
+}

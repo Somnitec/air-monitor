@@ -49,6 +49,23 @@ class TestNormalize(unittest.TestCase):
         self.assertEqual(ac.alt_baro, 0)          # "ground" -> 0
         self.assertEqual(ac.gs, 12.5)
 
+    def test_drop_on_ground_removes_tarmac_traffic(self):
+        # A taxiing jet ("ground" -> alt 0) is dropped; an airborne one is kept.
+        planes = raw([
+            {"hex": "taxi", "lat": 52.01, "lon": 5.0, "alt_baro": "ground", "seen": 1.0},
+            {"hex": "fly",  "lat": 52.02, "lon": 5.0, "alt_baro": 3000, "seen": 1.0},
+        ])
+        kept = normalize(planes, HOME_LAT, HOME_LON, drop_on_ground=True)
+        self.assertEqual([a.hex for a in kept], ["fly"])
+        # Default (off) keeps both.
+        self.assertEqual(len(normalize(planes, HOME_LAT, HOME_LON)), 2)
+
+    def test_drop_on_ground_keeps_unknown_altitude(self):
+        # No alt_baro at all (flaky transponder) is airborne-ambiguous -> kept.
+        out = normalize(raw([{"hex": "noalt", "lat": 52.01, "lon": 5.0, "seen": 1.0}]),
+                        HOME_LAT, HOME_LON, drop_on_ground=True)
+        self.assertEqual([a.hex for a in out], ["noalt"])
+
     def test_sorted_nearest_first(self):
         out = normalize(raw([
             {"hex": "far",  "lat": 52.5,  "lon": 5.0, "seen": 1.0},

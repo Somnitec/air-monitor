@@ -48,9 +48,12 @@ from weather import scheduler as weather_scheduler
 from weather import store as weather_store
 
 from aircraft import config as aircraft_config
+from aircraft import routes as aircraft_routes
 from aircraft import scheduler as aircraft_scheduler
 from aircraft import store as aircraft_store
 from aircraft import usb as aircraft_usb
+
+import runway
 
 # Load .env before reading any env vars so CLOUDFLARED_TUNNEL (and API keys) are
 # available at module level. A second load inside lifespan is harmless (setdefault).
@@ -212,8 +215,32 @@ def _init_db() -> sqlite3.Connection:
     conn.commit()
     weather_store.init_weather_table(conn)    # external weather/air-quality series
     aircraft_store.init_aircraft_table(conn)  # ADS-B sightings (logged, throttled)
+    aircraft_routes.init_routes_table(conn)   # callsign → origin/destination cache
+    runway.init_table(conn)                   # Schiphol runway-in-use labels (LVNL feed)
     _create_research_views(conn)              # analysis views over the joined data
     return conn
+
+
+# Radius of the "circle of influence" for cause attribution: how close an airborne
+# aircraft must pass to be a plausible source of a noise event. A shade past the 5 km
+# audible-flyover mark (planes just beyond 5 km are still faintly audible). Kept in one
+# place so every research view agrees; applied with `alt_baro > 0` so taxiing/parked
+# jets at Schiphol (~7-9 km) are never attributed — this also retroactively excludes the
+# tarmac rows already logged on wide-range days, not just new ones.
+_INFLUENCE_KM = 7.0
+
+# "Directly overhead" = small *slant range* (true 3-D distance to the plane), not small
+# ground-track distance: a jet at 38000 ft whose track crosses the station is 11 km away
+# and inaudible, yet its horizontal distance is ~0. Slant range excludes those cleanly.
+# The low Buitenveldertbaan-style approach traffic bottoms out at ~250-500 m slant
+# (≈250 m up + ≈250 m sideways), so 0.5 km captures the genuine loud passes. Tune here.
+_OVERHEAD_SLANT_KM = 0.5
+
+
+def _slant_km_sql(alt: str = "alt_baro", dist: str = "distance_km") -> str:
+    """SQL for slant range in km from a horizontal-distance-km column and a
+    barometric-altitude-ft column. 0.0003048 = ft→km."""
+    return f"sqrt({dist}*{dist} + ({alt}*0.0003048)*({alt}*0.0003048))"
 
 
 def _create_research_views(conn: sqlite3.Connection) -> None:
@@ -225,7 +252,7 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
     # 404 % / PM 5000) never pollute the analysis — non-destructive (rows stay in the
     # table; the views just ignore the impossible ones).
     conn.executescript(
-        """
+        f"""
         -- Every reading at/above 65 dB(A), tagged with hour + night flag (23:00–07:00).
         DROP VIEW IF EXISTS noise_loud;
         CREATE VIEW noise_loud AS
@@ -251,30 +278,68 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
                r.noise_dba, r.lamax,
                a.hex, a.flight, a.type, a.category, a.operator,
                a.alt_baro, a.gs, a.baro_rate,
-               round(a.distance_km, 2) AS dist_km
+               round(a.distance_km, 2) AS dist_km,
+               round({_slant_km_sql('a.alt_baro', 'a.distance_km')}, 2) AS slant_km,
+               ({_slant_km_sql('a.alt_baro', 'a.distance_km')} <= {_OVERHEAD_SLANT_KM}) AS overhead
         FROM readings r INDEXED BY idx_readings_research
         LEFT JOIN aircraft a ON a.id = (
             SELECT a2.id FROM aircraft a2
             WHERE a2.ts BETWEEN r.ts - 30 AND r.ts + 30
+              AND a2.distance_km <= {_INFLUENCE_KM} AND a2.alt_baro > 0
             ORDER BY a2.distance_km ASC LIMIT 1)
         WHERE COALESCE(r.lamax, r.noise_dba) BETWEEN 60 AND 140
         ORDER BY r.ts;
 
-        -- Which aircraft TYPES are loudest (avg + peak), for types seen overhead (≤8 km).
+        -- Which aircraft TYPES are loudest (avg + peak), for types seen overhead.
         -- Driven from readings (the smaller table) with a BETWEEN range join so each
         -- reading probes the aircraft ts index; the old ABS() join compared every
         -- reading against every sighting and stopped finishing after a week of data.
         DROP VIEW IF EXISTS loudness_by_type;
+        -- avg_dba/max_dba use every in-influence sighting; the *_overhead columns narrow
+        -- to slant range <= {_OVERHEAD_SLANT_KM} km (plane genuinely over the station), so
+        -- you can see whether the same type is louder on a close pass vs off to the side.
         CREATE VIEW loudness_by_type AS
         SELECT a.type,
                COUNT(*) AS n_samples,
                round(AVG(r.noise_dba), 1) AS avg_dba,
-               round(MAX(COALESCE(r.lamax, r.noise_dba)), 1) AS max_dba
+               round(MAX(COALESCE(r.lamax, r.noise_dba)), 1) AS max_dba,
+               COUNT(CASE WHEN {_slant_km_sql('a.alt_baro', 'a.distance_km')} <= {_OVERHEAD_SLANT_KM}
+                          THEN 1 END) AS n_overhead,
+               round(AVG(CASE WHEN {_slant_km_sql('a.alt_baro', 'a.distance_km')} <= {_OVERHEAD_SLANT_KM}
+                             THEN r.noise_dba END), 1) AS avg_dba_overhead,
+               round(MAX(CASE WHEN {_slant_km_sql('a.alt_baro', 'a.distance_km')} <= {_OVERHEAD_SLANT_KM}
+                             THEN COALESCE(r.lamax, r.noise_dba) END), 1) AS max_dba_overhead
         FROM readings r INDEXED BY idx_readings_research
         JOIN aircraft a ON a.ts BETWEEN r.ts - 15 AND r.ts + 15
-        WHERE a.distance_km <= 8 AND a.type IS NOT NULL
+        WHERE a.distance_km <= {_INFLUENCE_KM} AND a.alt_baro > 0 AND a.type IS NOT NULL
           AND r.noise_dba BETWEEN 0 AND 140
         GROUP BY a.type
+        HAVING n_samples >= 3
+        ORDER BY avg_dba DESC;
+
+        -- Which ROUTES (origin→destination city pair) are loudest overhead. Joins each
+        -- in-influence sighting to its callsign's route (resolved rows only); depends on
+        -- the routes backfill having caught up. Same slant/influence bounds as
+        -- loudness_by_type so a route's numbers are directly comparable to a type's.
+        DROP VIEW IF EXISTS loudness_by_route;
+        CREATE VIEW loudness_by_route AS
+        SELECT rt.origin_city || ' → ' || rt.dest_city AS route,
+               rt.origin_city, rt.dest_city, rt.origin_iata, rt.dest_iata,
+               COUNT(*) AS n_samples,
+               COUNT(DISTINCT a.hex) AS n_flights,
+               round(AVG(r.noise_dba), 1) AS avg_dba,
+               round(MAX(COALESCE(r.lamax, r.noise_dba)), 1) AS max_dba,
+               COUNT(CASE WHEN {_slant_km_sql('a.alt_baro', 'a.distance_km')} <= {_OVERHEAD_SLANT_KM}
+                          THEN 1 END) AS n_overhead,
+               round(AVG(CASE WHEN {_slant_km_sql('a.alt_baro', 'a.distance_km')} <= {_OVERHEAD_SLANT_KM}
+                             THEN r.noise_dba END), 1) AS avg_dba_overhead
+        FROM readings r INDEXED BY idx_readings_research
+        JOIN aircraft a ON a.ts BETWEEN r.ts - 15 AND r.ts + 15
+        JOIN routes rt ON rt.callsign = upper(a.flight) AND rt.found = 1
+        WHERE a.distance_km <= {_INFLUENCE_KM} AND a.alt_baro > 0
+          AND rt.origin_city IS NOT NULL AND rt.dest_city IS NOT NULL
+          AND r.noise_dba BETWEEN 0 AND 140
+        GROUP BY rt.origin_city, rt.dest_city
         HAVING n_samples >= 3
         ORDER BY avg_dba DESC;
 
@@ -304,11 +369,14 @@ def _create_research_views(conn: sqlite3.Connection) -> None:
             FROM readings INDEXED BY idx_readings_research GROUP BY day),
         ac AS (
             SELECT date(ts,'unixepoch','localtime') AS day,
-                   COUNT(DISTINCT hex) AS flights
-            FROM aircraft WHERE distance_km <= 10 GROUP BY day),
+                   COUNT(DISTINCT hex) AS flights,
+                   COUNT(DISTINCT CASE WHEN {_slant_km_sql()} <= {_OVERHEAD_SLANT_KM}
+                                       THEN hex END) AS overhead_flights
+            FROM aircraft WHERE distance_km <= {_INFLUENCE_KM} AND alt_baro > 0 GROUP BY day),
         days AS (SELECT day FROM rd UNION SELECT day FROM ac)
         SELECT days.day,
                COALESCE(ac.flights, 0) AS flights,
+               COALESCE(ac.overhead_flights, 0) AS overhead_flights,
                rd.max_db, rd.n_ge65, rd.n_ge70, rd.n_ge65_night,
                rd.avg_pm25, rd.avg_co2
         FROM days
@@ -878,6 +946,16 @@ async def _on_aircraft_snapshot(records) -> None:
                          "data": [a.as_dict() for a in records]})
 
 
+_runway_current: dict | None = None   # latest Schiphol runway config (from the LVNL feed)
+
+
+async def _on_runway_update(cur: dict) -> None:
+    """Cache + push the current runway config so the dashboard can show overhead status."""
+    global _runway_current
+    _runway_current = cur
+    await hub.broadcast({"type": "runway", "ts": int(time.time()), "data": cur})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _conn, _ro_conn
@@ -907,12 +985,26 @@ async def lifespan(app: FastAPI):
     asettings = aircraft_config.settings()
     _aircraft_settings = asettings   # mutated live by set_aircraft_range()
     aircraft_task = None
+    routes_task = None
     if asettings["enabled"]:
         aircraft_task = asyncio.create_task(aircraft_scheduler.run_loop(
             _conn, _db_lock, settings=asettings, on_snapshot=_on_aircraft_snapshot,
         ))
         print(f"[aircraft] polling {asettings['json_url'] or asettings['json_path']} "
               f"every {asettings['poll_sec']}s; home=({asettings['lat']},{asettings['lon']})")
+        # Backfill origin/destination for logged callsigns (incl. ones seen while
+        # offline) whenever the internet is up. Internet-only; harmless when down.
+        routes_task = asyncio.create_task(aircraft_routes.run_loop(_conn, _db_lock))
+
+    # Schiphol runway-in-use labels (LVNL via dutchplanespotters). Internet-only; a dead
+    # feed is non-fatal. Banks ground-truth "was it overhead" to correlate with wind.
+    runway_task = None
+    if os.environ.get("RUNWAY_ENABLED", "1") not in ("0", "false", "False", "no"):
+        url = os.environ.get("RUNWAY_URL", runway.DEFAULT_URL)
+        poll = float(os.environ.get("RUNWAY_POLL_SEC", "300"))
+        runway_task = asyncio.create_task(runway.run_loop(
+            _conn, _db_lock, url=url, poll_sec=poll, on_update=_on_runway_update))
+        print(f"[runway] polling {url} every {poll:.0f}s")
 
     yield
 
@@ -922,12 +1014,13 @@ async def lifespan(app: FastAPI):
             await weather_task
         except asyncio.CancelledError:
             pass
-    if aircraft_task is not None:
-        aircraft_task.cancel()
-        try:
-            await aircraft_task
-        except asyncio.CancelledError:
-            pass
+    for t in (aircraft_task, routes_task, runway_task):
+        if t is not None:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
     mdns_stop.set()
     try:
         await mdns_task
@@ -1273,6 +1366,16 @@ async def research_loudness(limit: int = 25):
     return JSONResponse(rows)
 
 
+@app.get("/api/research/routes")
+async def research_routes(limit: int = 25):
+    """Average + peak noise per origin→destination route seen overhead — which routes are
+    loudest. Populates only as the callsign→route backfill resolves flights."""
+    rows = await _cached_read(f"routes:{limit}", lambda c: [
+        dict(r) for r in c.execute("SELECT * FROM loudness_by_route LIMIT ?",
+                                   (int(limit),)).fetchall()])
+    return JSONResponse(rows)
+
+
 @app.get("/api/research/noise_events")
 async def research_noise_events(limit: int = 100, since: int | None = None):
     """Loud readings attributed to the closest aircraft overhead at that moment.
@@ -1285,6 +1388,93 @@ async def research_noise_events(limit: int = 100, since: int | None = None):
     rows = await _cached_read(f"noise_events:{limit}:{since}", lambda c: [
         dict(r) for r in c.execute(sql, args).fetchall()])
     return JSONResponse(rows)
+
+
+# ---- Schiphol runway use + overhead forecast ----------------------------- #
+
+# Overhead here needs a westerly wind (Schiphol lands on the Buitenveldertbaan 27, from
+# the east over the station). Calibrated on ~3 weeks of our own data: every overhead
+# sighting occurred with wind FROM 263°–335°; nothing overhead otherwise. Band widened
+# slightly for forecast margin. This is a v0 heuristic — it will be replaced by a model
+# trained on the runway_use labels the ingester is now banking against wind history.
+_OVERHEAD_WIND_LO, _OVERHEAD_WIND_HI = 245.0, 340.0
+
+
+def _overhead_outlook(wind_rows: list[dict], *, tz_offset_h: int = 2) -> dict:
+    """Turn forecast (valid_ts, wind_direction_10m, wind_speed_10m) rows into a per-hour
+    overhead likelihood + a plain-language summary. Westerly ⇒ likely (possible at night,
+    when Schiphol's night regime suppresses Buitenveldertbaan ops); else unlikely."""
+    hours = []
+    for r in wind_rows:
+        d = r.get("wind_direction_10m")
+        if d is None:
+            continue
+        local_h = ((r["valid_ts"] // 3600) + tz_offset_h) % 24
+        night = local_h < 6 or local_h >= 23
+        westerly = _OVERHEAD_WIND_LO <= d <= _OVERHEAD_WIND_HI
+        label = "unlikely" if not westerly else ("possible" if night else "likely")
+        hours.append({"ts": r["valid_ts"], "wind_dir": round(d),
+                      "wind_speed": r.get("wind_speed_10m"), "overhead": label})
+    # Summarize: the contiguous 'likely' window(s), described by local time.
+    likely = [h for h in hours if h["overhead"] == "likely"]
+    if not hours:
+        summary = "No wind forecast available yet to assess overhead chance."
+    elif not likely:
+        summary = ("Overhead unlikely for the forecast window — winds aren't westerly, "
+                   "so Schiphol won't be landing over the station.")
+    else:
+        lo = min(h["ts"] for h in likely); hi = max(h["ts"] for h in likely)
+        def _hhmm(ts):
+            lh = ((ts // 3600) + tz_offset_h) % 24
+            return f"{int(lh):02d}:00"
+        frac = len(likely) / max(1, len([h for h in hours if h["overhead"] != "possible"]))
+        summary = (f"Overhead likely around {_hhmm(lo)}–{_hhmm(hi)} (westerly wind, "
+                   f"~{round(frac*100)}% of daytime forecast hours). Treat as a rough "
+                   f"heuristic until the runway model is trained.")
+    return {"rule": f"westerly wind {int(_OVERHEAD_WIND_LO)}–{int(_OVERHEAD_WIND_HI)}° ⇒ Buitenveldertbaan 27 (overhead)",
+            "hours": hours, "summary": summary}
+
+
+@app.get("/api/runway/current")
+async def runway_current():
+    """Latest Schiphol runway config (from the LVNL feed) + whether it's over the station.
+    Serves the in-memory cache; falls back to the DB if the poller hasn't ticked yet."""
+    cur = _runway_current
+    if cur is None:
+        cur = await _read_query(runway.latest)
+    return JSONResponse({"current": cur})
+
+
+@app.get("/api/runway/history")
+async def runway_history(hours: float = 48.0):
+    """Runway-use intervals over the last `hours` — the overhead-vs-not timeline."""
+    since = int(time.time()) - int(min(max(hours, 1), 24 * 30) * 3600)
+    rows = await _read_query(lambda c: runway.query(c, since=since))
+    return JSONResponse({"intervals": rows})
+
+
+@app.get("/api/runway/maintenance")
+async def runway_maintenance():
+    """Scheduled Schiphol runway closures. A Buitenveldertbaan (09/27) closure means
+    guaranteed no overhead flights for those dates — the surest 'quiet day' signal.
+    Hand-maintained from Schiphol's yearly baanonderhoud schedule (no clean API)."""
+    closures = runway.load_maintenance(str(Path(__file__).parent / "runway_maintenance.json"))
+    return JSONResponse(runway.maintenance_status(closures, now=int(time.time())))
+
+
+@app.get("/api/research/overhead_forecast")
+async def overhead_forecast():
+    """v0 outlook: will planes pass overhead in the coming hours? Reads the Open-Meteo
+    wind *forecast* rows already in the weather table and applies the westerly-wind rule."""
+    now = int(time.time())
+    wind = await _cached_read("overhead_forecast", lambda c: [
+        dict(r) for r in c.execute(
+            "SELECT valid_ts, wind_direction_10m, wind_speed_10m FROM weather "
+            "WHERE source='open_meteo' AND valid_ts > ? AND wind_direction_10m IS NOT NULL "
+            "ORDER BY valid_ts", (now,)).fetchall()])
+    out = _overhead_outlook(wind)
+    out["generated_ts"] = now
+    return JSONResponse(out)
 
 
 # ---- Dutch / EU aircraft noise statistics -------------------------------- #
@@ -1578,20 +1768,17 @@ async def get_aircraft(range_km: float | None = None):
 
 @app.post("/api/aircraft/range")
 async def set_aircraft_range(request: Request):
-    """Dashboard pushes its range slider value here so the SDR/public ingest range
-    (and hence what gets logged for flight-path history) tracks what's on screen,
-    instead of a fixed ceiling the slider could never see past. Takes effect on the
-    next poll tick (~1 s). Clamped to the slider's own range."""
+    """Deprecated / no-op. The slider is now display-only: ingest is fixed at
+    AIRCRAFT_MAX_RANGE_KM (~30 km) so flight-path history keeps the full corridor
+    regardless of zoom, and the dashboard filters what it shows client-side. Kept so a
+    stale open tab still gets a clean 200 instead of shrinking the ingest range back."""
     body = await request.json()
     try:
         km = float(body["km"])
     except (KeyError, TypeError, ValueError):
         return JSONResponse({"error": "km must be a number"}, status_code=400)
     km = max(_AIRCRAFT_RANGE_MIN_KM, min(_AIRCRAFT_RANGE_MAX_KM, km))
-    if _aircraft_settings:
-        _aircraft_settings["max_range_km"] = km
-        _aircraft_settings["public_radius_km"] = km
-    return JSONResponse({"ok": True, "km": km})
+    return JSONResponse({"ok": True, "km": km, "note": "display-only; ingest range is fixed"})
 
 
 # ---- flight-path history --------------------------------------------------- #
@@ -1617,44 +1804,43 @@ async def aircraft_paths(range_km: float = 1.0, hours: float = 48.0):
 
 
 # ---- flight route lookup --------------------------------------------------- #
-# Cache callsign → {from_city, to_city} for 24 h (routes don't change mid-day).
-_route_cache: dict[str, tuple[float, dict]] = {}  # callsign → (fetched_at, result)
-_ROUTE_TTL = 86400  # seconds
-_ROUTE_CACHE_MAX = 512  # far more than a day of distinct callsigns overhead
+def _route_json(r: dict | None) -> dict:
+    """Shape a stored/looked-up route for the dashboard. `route` (the ICAO pair) is
+    kept for backward-compat; origin/destination carry the richer fields the UI now
+    prefers (municipality, IATA). `None` (unknown / offline) → empty route."""
+    if not r:
+        return {"route": [], "origin": None, "destination": None, "airline": None}
+    icaos = [c for c in (r.get("origin_icao"), r.get("dest_icao")) if c]
+    return {
+        "route": icaos,
+        "origin": {"icao": r.get("origin_icao"), "iata": r.get("origin_iata"),
+                   "city": r.get("origin_city"), "name": r.get("origin_name")},
+        "destination": {"icao": r.get("dest_icao"), "iata": r.get("dest_iata"),
+                        "city": r.get("dest_city"), "name": r.get("dest_name")},
+        "airline": r.get("airline"),
+    }
+
 
 @app.get("/api/route")
 async def get_route(callsign: str):
-    """Look up origin/destination city for a flight callsign via OpenSky Network."""
+    """Origin/destination for a callsign, from the persisted `routes` cache (adsbdb-
+    backed). A cache hit — or a recent miss — answers without touching the network;
+    otherwise we look it up and persist so the background backfill and future views
+    share the result. Offline just returns whatever we already had (or empty)."""
     cs = callsign.strip().upper()
-    now = time.time()
-    if cs in _route_cache:
-        fetched_at, result = _route_cache[cs]
-        if now - fetched_at < _ROUTE_TTL:
-            return JSONResponse(result)
+    if not cs:
+        return JSONResponse(_route_json(None))
+    now = int(time.time())
+    cached = await _read_query(lambda c: aircraft_routes.get(c, cs))
+    if cached is not None and aircraft_routes.is_fresh(cached, now):
+        return JSONResponse(_route_json(cached if cached["found"] else None))
     try:
-        import requests as _req
-        resp = await asyncio.to_thread(
-            lambda: _req.get(
-                f"https://opensky-network.org/api/routes?callsign={cs}",
-                timeout=4.0,
-                headers={"User-Agent": "air-monitor/1.0"},
-            )
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            route = data.get("route") or []
-            result = {"route": route}
-        else:
-            result = {"route": []}
-    except Exception:
-        result = {"route": []}
-    _route_cache[cs] = (now, result)
-    if len(_route_cache) > _ROUTE_CACHE_MAX:
-        for k in [k for k, (t, _) in _route_cache.items() if now - t >= _ROUTE_TTL]:
-            del _route_cache[k]
-        while len(_route_cache) > _ROUTE_CACHE_MAX:
-            del _route_cache[min(_route_cache, key=lambda k: _route_cache[k][0])]
-    return JSONResponse(result)
+        route = await asyncio.to_thread(aircraft_routes.fetch, cs)
+    except Exception:                     # offline / rate-limited — keep any prior hit
+        return JSONResponse(_route_json(cached if cached and cached["found"] else None))
+    async with _db_lock:
+        await asyncio.to_thread(aircraft_routes.upsert, _conn, cs, route, now)
+    return JSONResponse(_route_json(route))
 
 
 # ---- events (home mode) ---------------------------------------------------- #

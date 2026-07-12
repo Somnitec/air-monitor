@@ -30,7 +30,8 @@ async def poll_once(conn: sqlite3.Connection, db_lock, *, settings: dict,
     if raw is not None:
         # Dongle is feeding — trust it exclusively.
         records = normalize(raw, s["lat"], s["lon"], stale_sec=s["stale_sec"],
-                            max_range_km=s["max_range_km"], source="sdr")
+                            max_range_km=s["max_range_km"], source="sdr",
+                            drop_on_ground=s.get("drop_on_ground", True))
     else:
         # No local feed — fall back to the public reference feed (already tagged 'public').
         records = list(public_records or [])
@@ -52,9 +53,10 @@ async def _refresh_public(settings: dict) -> list:
                                   s["public_radius_km"], url_template=s["public_url"])
     if raw is None:
         return []
-    # Bound public planes by the (smaller) public radius, not the local SDR's range.
+    # Bound public planes by the public radius; drop tarmac traffic same as the SDR.
     return normalize(raw, s["lat"], s["lon"], stale_sec=s["stale_sec"],
-                     max_range_km=s["public_radius_km"], source="public")
+                     max_range_km=s["public_radius_km"], source="public",
+                     drop_on_ground=s.get("drop_on_ground", True))
 
 
 async def run_loop(conn: sqlite3.Connection, db_lock, *, settings: dict, on_snapshot=None):

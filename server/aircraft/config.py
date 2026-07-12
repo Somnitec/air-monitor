@@ -30,22 +30,22 @@ def settings() -> dict:
         "json_url": os.environ.get("AIRCRAFT_JSON_URL") or None,
         "poll_sec": _f("AIRCRAFT_POLL_SEC", 1.0),
         "stale_sec": _f("AIRCRAFT_STALE_SEC", 60.0),
-        # Starting value only. The dashboard's range slider (server.py
-        # POST /api/aircraft/range) overwrites this live, in both directions, so it
-        # tracks whatever the slider is set to for the rest of the process's life —
-        # this default just governs what's ingested before the first dashboard
-        # connects (or after a restart). The SDR still *receives* out to the radio
-        # horizon; this bounds what we log/show/correlate.
-        "max_range_km": _f("AIRCRAFT_MAX_RANGE_KM", 5.0),
+        # Ingest range: log/show/correlate everything out to here. Decoupled from the
+        # dashboard slider (which is now display-only) so history captures the wider
+        # flight-path corridors even while the map is zoomed to the influence circle.
+        # The SDR still *receives* out to the radio horizon; this bounds what we store.
+        "max_range_km": _f("AIRCRAFT_MAX_RANGE_KM", 30.0),
+        # Drop taxiing/parked aircraft (alt_baro "ground") at ingest: we're ~7-9 km
+        # from Schiphol, so ground traffic would otherwise be the bulk of the log and
+        # pure noise for the overflight study. See base.normalize().
+        "drop_on_ground": os.environ.get("AIRCRAFT_DROP_ON_GROUND", "1") not in ("0", "false", "False", "no"),
         "log_sec": _f("AIRCRAFT_LOG_SEC", 15.0),
         # Public reference feed (cross-correlation). On by default so the map still
         # populates when local reception is weak; set =0 to disable the outbound call.
         "public_enabled": os.environ.get("AIRCRAFT_PUBLIC_ENABLED", "1") not in ("0", "false", "False", "no"),
         "public_url": os.environ.get("AIRCRAFT_PUBLIC_URL", public.DEFAULT_URL),
         "public_poll_sec": _f("AIRCRAFT_PUBLIC_POLL_SEC", 10.0),   # be polite to the community API
-        # Starting value only, same live override as max_range_km above: when the
-        # dongle is unavailable, the public fallback is pulled within whatever range
-        # the dashboard slider currently asks for, so it shows the same overhead
-        # planes the SDR would.
-        "public_radius_km": _f("AIRCRAFT_PUBLIC_RADIUS_KM", 5.0),
+        # Public fallback range, matched to max_range_km so the internet feed shows the
+        # same wide corridor the SDR would when the dongle is unavailable.
+        "public_radius_km": _f("AIRCRAFT_PUBLIC_RADIUS_KM", 30.0),
     }
