@@ -71,6 +71,9 @@ Record record_pack(const RecordFields& f) {
         r.pm4 = qU16(f.pm4, 10); r.pm10 = qU16(f.pm10, 10);
         r.co2 = f.co2; r.voc = qU16(f.voc, 1); r.nox = qU16(f.nox, 1);
         r.temp = qI16(f.temp, 100); r.rh = qU16(f.rh, 100);
+        // v4 — already quantized by the sensor (x10 / ticks); 0xFFFF passes through
+        r.pc05 = f.pc05; r.pc1 = f.pc1; r.pc25 = f.pc25; r.pc4 = f.pc4; r.pc10 = f.pc10;
+        r.voc_raw = f.voc_raw; r.nox_raw = f.nox_raw;
     }
     if (groupHasValue(f.status[GRP_BH1750])) r.lux = qU16(f.lux, 1);
     if (groupHasValue(f.status[GRP_BME])) {
@@ -125,6 +128,8 @@ void record_unpack(const Record& r, RecordFields& f) {
         f.pm1 = r.pm1/10.0f; f.pm25 = r.pm25/10.0f; f.pm4 = r.pm4/10.0f; f.pm10 = r.pm10/10.0f;
         f.co2 = r.co2; f.voc = r.voc; f.nox = r.nox;
         f.temp = r.temp/100.0f; f.rh = r.rh/100.0f;
+        f.pc05 = r.pc05; f.pc1 = r.pc1; f.pc25 = r.pc25; f.pc4 = r.pc4; f.pc10 = r.pc10;
+        f.voc_raw = r.voc_raw; f.nox_raw = r.nox_raw;
     }
     if (f.has_bh1750) f.lux = r.lux;
     if (f.has_bme) { f.pressure = r.pressure/10.0f; f.bme_temp = r.bme_temp/100.0f; f.bme_rh = r.bme_rh/100.0f; }
@@ -182,8 +187,15 @@ void record_to_json(const Record& r, JsonDocument& doc, bool full_slow) {
         doc["pm1"] = f.pm1; doc["pm25"] = f.pm25; doc["pm4"] = f.pm4; doc["pm10"] = f.pm10;
         doc["co2"] = f.co2; doc["voc"] = f.voc; doc["nox"] = f.nox;
         doc["temp"] = f.temp; doc["rh"] = f.rh;
+        // v4 — 0xFFFF is the sensor's "unknown"; omit rather than send a fake number
+        auto pcOut = [&](const char* k, uint16_t v) { if (v != 0xFFFF) doc[k] = v / 10.0f; };
+        pcOut("pc05", f.pc05); pcOut("pc1", f.pc1); pcOut("pc25", f.pc25);
+        pcOut("pc4", f.pc4);   pcOut("pc10", f.pc10);
+        if (f.voc_raw != 0xFFFF) doc["voc_raw"] = f.voc_raw;
+        if (f.nox_raw != 0xFFFF) doc["nox_raw"] = f.nox_raw;
     } else if (f.status[GRP_SEN66] == FS_INVALID) {
-        for (const char* k : {"pm1","pm25","pm4","pm10","co2","voc","nox","temp","rh"}) jsonNull(doc, k);
+        for (const char* k : {"pm1","pm25","pm4","pm10","co2","voc","nox","temp","rh",
+                              "pc05","pc1","pc25","pc4","pc10","voc_raw","nox_raw"}) jsonNull(doc, k);
     }
     if (emitSlow(f.status[GRP_BH1750]))          doc["lux"] = f.lux;
     else if (f.status[GRP_BH1750] == FS_INVALID) jsonNull(doc, "lux");

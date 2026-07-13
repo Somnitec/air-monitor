@@ -42,6 +42,7 @@
 #include "record.h"
 #include "ringstore.h"
 #include "cadence.h"
+#include "fan.h"
 
 // ---------------------------------------------------------------------------
 // Sensor objects + presence flags
@@ -465,6 +466,22 @@ static void readSlow(RecordFields& f) {
             f.status[GRP_SEN66] = FS_OK;
             f.pm1 = pm1; f.pm25 = pm25; f.pm4 = pm4; f.pm10 = pm10;
             f.co2 = co2; f.voc = voc; f.nox = nox; f.temp = t; f.rh = rh;
+            // v4 extras from the same measurement frame. On failure store the sensor's
+            // 0xFFFF "unknown" sentinel — record_to_json omits those keys, no fake zeros.
+            // PC values are cumulative (<0.5µm ⊆ <1µm ⊆ …), so non-monotonic = corrupt.
+            uint16_t pc05, pc1, pc25, pc4, pc10;
+            if (sen66.readNumberConcentrationValuesAsIntegers(pc05, pc1, pc25, pc4, pc10) == 0
+                && pc05 <= pc1 && pc1 <= pc25 && pc25 <= pc4 && pc4 <= pc10) {
+                f.pc05 = pc05; f.pc1 = pc1; f.pc25 = pc25; f.pc4 = pc4; f.pc10 = pc10;
+            } else {
+                f.pc05 = f.pc1 = f.pc25 = f.pc4 = f.pc10 = 0xFFFF;
+            }
+            int16_t rawRh, rawT; uint16_t rawVoc, rawNox, rawCo2;
+            if (sen66.readMeasuredRawValues(rawRh, rawT, rawVoc, rawNox, rawCo2) == 0) {
+                f.voc_raw = rawVoc; f.nox_raw = rawNox;   // 0xFFFF = SGP41 still warming up
+            } else {
+                f.voc_raw = f.nox_raw = 0xFFFF;
+            }
         } else {
             f.status[GRP_SEN66] = FS_INVALID;
         }
@@ -561,10 +578,16 @@ static void markSlowUnchanged(RecordFields& f) {
 // Print a human-readable snapshot of all sensor values in f to Serial.
 static void printFields(const RecordFields& f) {
     Serial.printf("%s[snap] ts=%u up=%.1fs\n", clockStr().c_str(), f.ts, f.up_ms / 1000.0f);
-    if (f.has_sen66)
+    if (f.has_sen66) {
         Serial.printf("  SEN66   PM1=%.1f PM2.5=%.1f PM4=%.1f PM10=%.1f ug/m3"
                       "  CO2=%u ppm  VOC=%.0f  NOx=%.0f  T=%.1fC  RH=%.1f%%\n",
                       f.pm1, f.pm25, f.pm4, f.pm10, f.co2, f.voc, f.nox, f.temp, f.rh);
+        if (f.pc05 != 0xFFFF)
+            Serial.printf("          PC0.5=%.1f PC2.5=%.1f #/cm3", f.pc05 / 10.0f, f.pc25 / 10.0f);
+        if (f.voc_raw != 0xFFFF)
+            Serial.printf("  VOCraw=%u NOxraw=%u", f.voc_raw, f.nox_raw);
+        if (f.pc05 != 0xFFFF || f.voc_raw != 0xFFFF) Serial.println();
+    }
     if (f.has_bh1750)
         Serial.printf("  BH1750  lux=%.1f\n", f.lux);
     if (f.has_bme)
@@ -934,6 +957,7 @@ void setup() {
 #endif
 
     initSensors();
+    fanInit();
 
     // Register every known network with WiFiMulti.
     WiFi.persistent(false);          // don't thrash flash storing creds every connect
@@ -976,6 +1000,8 @@ void loop() {
 
     applyModeTransition();  // run hardware side of any pending mode change once
 
+    fanTick();  // FAN_RAMP_TEST_MODE step timing; no-op otherwise
+
     if (wifiShouldStayOn() && WiFi.status() != WL_CONNECTED) wifiConnect();
     if (WiFi.status() == WL_CONNECTED) { syncTimeIfNeeded();
         if (s_serverHost.length() == 0) discoverServer(); }
@@ -1001,6 +1027,7 @@ void loop() {
         if (g_mode == MODE_POWER_SAVING) readSlowPowerSaving(g_fields);
         else                             readSlow(g_fields);   // fresh -> FS_OK (or INVALID/ABSENT)
         g_tSlow = now;
+        fanControlStep(g_fields.co2);
     } else {
         markSlowUnchanged(g_fields);  // carry forward -> FS_UNCHANGED (omitted on wire)
     }

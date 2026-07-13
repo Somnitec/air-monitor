@@ -129,6 +129,8 @@ EPOCH_VALID_AFTER = 1735689600
 # (noise_bands, accel bands) stay in the payload — query them with json_extract as needed.
 READING_METRIC_COLS = [
     "pm1", "pm25", "pm4", "pm10", "co2", "voc", "nox", "temp", "rh", "lux",
+    "pc05", "pc1", "pc25", "pc4", "pc10",   # SEN66 number concentrations, #/cm³ (fw v4)
+    "voc_raw", "nox_raw",                   # SGP41 raw ticks — unnormalized gas signal (fw v4)
     "pressure_hpa", "bme_temp", "bme_rh",
     "rumble", "rumble_peak", "accel_mag", "ppv_mm_s", "accel_dom_hz",
     "co_mv", "co_rs", "hcho_mv", "hcho_rs", "soil_mv", "soil_pct",
@@ -144,6 +146,7 @@ READING_METRIC_COLS = [
 # rumble*, ppv*) are NOT here — they're read every record, never carried.
 SLOW_FILL_KEYS = [
     "pm1", "pm25", "pm4", "pm10", "co2", "voc", "nox", "temp", "rh",  # SEN66
+    "pc05", "pc1", "pc25", "pc4", "pc10", "voc_raw", "nox_raw",       # SEN66 v4 extras
     "lux",                                                            # BH1750
     "pressure_hpa", "bme_temp", "bme_rh",                             # BME280
     "co_mv", "co_rs", "hcho_mv", "hcho_rs",                           # gas
@@ -558,6 +561,7 @@ PENDING_CMD: dict[str, str] = {}       # dev -> "testing" | "normal"
 # minutes of slow-channel NULLs are expected until the next fresh read repopulates it.
 SLOW_FILL_KEYS: tuple[str, ...] = (
     "pm1", "pm25", "pm4", "pm10", "co2", "voc", "nox", "temp", "rh",   # SEN66
+    "pc05", "pc1", "pc25", "pc4", "pc10", "voc_raw", "nox_raw",        # SEN66 v4 extras
     "lux",                                                             # BH1750
     "pressure_hpa", "bme_temp", "bme_rh",                              # BME280
     "co_mv", "co_rs", "hcho_mv", "hcho_rs",                            # gas

@@ -14,6 +14,9 @@ static RecordFields sample() {
     f.has_sen66 = true;
     f.pm1 = 1.2f; f.pm25 = 3.4f; f.pm4 = 5.6f; f.pm10 = 7.8f;
     f.co2 = 812; f.voc = 101; f.nox = 3; f.temp = 21.37f; f.rh = 48.5f;
+    // v4: sensor-encoded (x10 / raw ticks)
+    f.pc05 = 1234; f.pc1 = 1300; f.pc25 = 1350; f.pc4 = 1360; f.pc10 = 1365;
+    f.voc_raw = 28901; f.nox_raw = 17444;
     f.has_bh1750 = true; f.lux = 333;
     f.has_bme = true; f.pressure = 1013.2f; f.bme_temp = 21.5f; f.bme_rh = 49.0f;
     f.has_adxl = true;
@@ -36,7 +39,7 @@ static RecordFields sample() {
     return f;
 }
 
-void test_size_is_88() { TEST_ASSERT_EQUAL_UINT(88, sizeof(Record)); }
+void test_size_is_102() { TEST_ASSERT_EQUAL_UINT(102, sizeof(Record)); }
 
 void test_roundtrip_preserves_within_quantization() {
     RecordFields in = sample();
@@ -57,6 +60,46 @@ void test_roundtrip_preserves_within_quantization() {
     TEST_ASSERT_FLOAT_WITHIN(0.05f, in.noise_dbfs, out.noise_dbfs);
     TEST_ASSERT_EQUAL_UINT16(in.bat_raw_mv, out.bat_raw_mv);
     TEST_ASSERT_FLOAT_WITHIN(0.6f, in.bands[5], out.bands[5]);  // u8 dB rounding
+    // v4: sensor-encoded values pass through exactly
+    TEST_ASSERT_EQUAL_UINT16(in.pc05, out.pc05);
+    TEST_ASSERT_EQUAL_UINT16(in.pc10, out.pc10);
+    TEST_ASSERT_EQUAL_UINT16(in.voc_raw, out.voc_raw);
+    TEST_ASSERT_EQUAL_UINT16(in.nox_raw, out.nox_raw);
+}
+
+// ---- v4: SEN66 number concentrations + raw ticks ----
+
+void test_v4_json_emits_scaled_pc_and_raw_ticks() {
+    RecordFields in = sample();
+    Record r = record_pack(in);
+    JsonDocument doc; record_to_json(r, doc);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 123.4f, doc["pc05"].as<float>());  // 1234 x10 → 123.4 #/cm³
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 136.5f, doc["pc10"].as<float>());
+    TEST_ASSERT_EQUAL_UINT(28901, doc["voc_raw"].as<unsigned>());      // ticks, unscaled
+    TEST_ASSERT_EQUAL_UINT(17444, doc["nox_raw"].as<unsigned>());
+}
+
+void test_v4_unknown_sentinel_omits_keys() {
+    RecordFields in = sample();
+    in.pc05 = in.pc1 = in.pc25 = in.pc4 = in.pc10 = 0xFFFF;   // sensor "unknown"
+    in.voc_raw = 0xFFFF;
+    Record r = record_pack(in);
+    JsonDocument doc; record_to_json(r, doc);
+    TEST_ASSERT_FALSE(doc["pc05"].is<float>());
+    TEST_ASSERT_FALSE(doc["voc_raw"].is<unsigned>());
+    TEST_ASSERT_TRUE(doc["nox_raw"].is<unsigned>());          // only the unknown ones drop
+    TEST_ASSERT_TRUE(doc["pm25"].is<float>());                // rest of SEN66 unaffected
+}
+
+void test_v4_invalid_group_nulls_pc_keys() {
+    RecordFields in = sample();
+    in.status[GRP_SEN66] = FS_INVALID;
+    Record r = record_pack(in);
+    JsonDocument doc; record_to_json(r, doc);
+    char buf[2048]; serializeJson(doc, buf, sizeof(buf));
+    std::string s(buf);
+    TEST_ASSERT_TRUE(s.find("\"pc05\":null") != std::string::npos);
+    TEST_ASSERT_TRUE(s.find("\"voc_raw\":null") != std::string::npos);
 }
 
 void test_absent_sensors_clear_present_bits() {
@@ -199,8 +242,11 @@ void test_to_json_omits_absent_sensor_keys() {
 
 int main(int, char**) {
     UNITY_BEGIN();
-    RUN_TEST(test_size_is_88);
+    RUN_TEST(test_size_is_102);
     RUN_TEST(test_roundtrip_preserves_within_quantization);
+    RUN_TEST(test_v4_json_emits_scaled_pc_and_raw_ticks);
+    RUN_TEST(test_v4_unknown_sentinel_omits_keys);
+    RUN_TEST(test_v4_invalid_group_nulls_pc_keys);
     RUN_TEST(test_absent_sensors_clear_present_bits);
     RUN_TEST(test_quantization_clamps_high_values);
     RUN_TEST(test_status_roundtrip);

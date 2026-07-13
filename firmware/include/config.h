@@ -130,6 +130,42 @@
 #define PIN_EXT_LED          13   // external LED: GPIO13 → 330Ω → LED → GND
 
 // =========================================================================
+// Fan control (ventilation experiment — extraction fan in the south floor
+// vent hole). 4-wire PC/server fan: PWM drives speed. Tach (green) unwired.
+// =========================================================================
+#define PIN_FAN_PWM             14   // blue wire. GPIO14 is not a strapping pin.
+#define FAN_PWM_FREQ_HZ       25000  // standard 4-wire fan PWM spec (Intel)
+#define FAN_PWM_RESOLUTION_BITS   8  // 0-255 duty steps; plenty at 25 kHz
+
+#define FAN_CONTROL_ENABLED       1  // 0 = fan held off entirely
+#define FAN_RAMP_TEST_MODE        0  // ramp test 2026-07-13: confirmed real, audible
+                                     // speed steps across the range on 12V. Leave at
+                                     // 0; flip to 1 to re-diagnose if behavior gets
+                                     // weird again. Takes priority over the mode below.
+#define FAN_RAMP_STEP_PCT        10
+#define FAN_RAMP_STEP_MS       3000
+
+#define FAN_MANUAL_TEST_MODE      0  // 1 = ignore CO2, hold FAN_TEST_DUTY_PCT.
+#define FAN_TEST_DUTY_PCT      0.0f
+
+// Closed-loop control (FAN_MANUAL_TEST_MODE == 0). Two CO2 thresholds, not a
+// PID: at/below FAN_CO2_FLOOR_PPM run FAN_DUTY_FLOOR_PCT, at/above
+// FAN_CO2_CEILING_PPM run FAN_DUTY_CEILING_PCT (full force), linear taper
+// between. CO2 here moves on a minutes-long time constant with a single
+// monotonic actuator, so this settles fine without integral/derivative terms.
+//
+// Duty floor from tonight's listening test (2026-07-13, 12V, NMB-MAT
+// 36010RL): no audible change below 20%. Duty ceiling 100 accepts the noise
+// cost to actually knock down bad spikes. PPM thresholds are deliberately
+// tight (700-800) so it goes full force well before CO2 drifts up toward
+// where it was hanging (~900) -- widen the gap if full force triggers too
+// eagerly/too often once you're actually sleeping.
+#define FAN_CO2_FLOOR_PPM        700
+#define FAN_CO2_CEILING_PPM      900
+#define FAN_DUTY_FLOOR_PCT     20.0f
+#define FAN_DUTY_CEILING_PCT   100.0f
+
+// =========================================================================
 // Sample cadence (ms) — tune later, these are reasonable defaults.
 // =========================================================================
 #define SAMPLE_MS_BME280     30000   // env. drifts slowly

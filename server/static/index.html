@@ -13,7 +13,10 @@
      a slide-in controls drawer so charts get the full width, and big fonts. */
   :root { --bg:#0f1115; --panel:#171a21; --line:#252a35; --fg:#e6e9ef; --mut:#8b93a7; --accent:#4ea1ff; --tap:46px; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html, body { margin:0; height:100%; }
+  /* min-height, not height: a fixed-height body caps the sticky header's containing
+     block at one viewport, so it stopped sticking after the first screen of scroll. */
+  html { height:100%; }
+  body { margin:0; min-height:100%; }
   body { background:var(--bg); color:var(--fg); font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
          -webkit-user-select:none; user-select:none; overscroll-behavior:none; }
 
@@ -78,11 +81,10 @@
   /* backdrop shown when drawer is open on small screens */
   .backdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:18; display:none; }
 
-  /* big low-battery warning across the top */
-  #batwarn { position:fixed; top:0; left:0; right:0; z-index:50; display:none;
-             background:#b3261e; color:#fff; font-size:18px; font-weight:800; letter-spacing:.02em;
-             text-align:center; padding:14px 16px; box-shadow:0 2px 14px rgba(0,0,0,.55); }
-  #batwarn.show { display:block; animation:batpulse 1.3s ease-in-out infinite; }
+  /* low-battery warning: a header badge alongside the air-quality badges
+     (was a fixed full-width banner, which covered them) */
+  #batwarn { display:none; }
+  #batwarn.show { display:inline-block; animation:batpulse 1.3s ease-in-out infinite; }
   @keyframes batpulse { 0%,100%{ background:#b3261e; } 50%{ background:#e0392b; } }
 
   /* --- small screen (the LattePanda touch panel) --- */
@@ -209,13 +211,26 @@
      Colour = severity: green good → amber → orange → red concern; grey = no/dead signal. */
   .airbadges { display:flex; flex-wrap:wrap; gap:5px; align-items:center; }
   .airbadge { font-size:13px; font-weight:800; padding:4px 10px; border-radius:9px; white-space:nowrap;
-    letter-spacing:.01em; transition:background .4s; text-align:center; }
+    letter-spacing:.01em; transition:background .4s; text-align:center; cursor:help; }
   .airbadge.sev-good { background:hsl(120,55%,45%); color:#06130a; }
   .airbadge.sev-ok   { background:hsl(48,88%,55%);  color:#2a1e00; }
   .airbadge.sev-warn { background:hsl(26,90%,55%);  color:#2a1300; }
   .airbadge.sev-bad  { background:hsl(0,75%,53%);   color:#fff; animation:co2pulse 1.6s ease-in-out infinite; }
   .airbadge.sev-dead { background:#2a2f3b; color:var(--mut); font-weight:700; }
+  /* Station silent (no ingest for ≳3× its send cadence) — badges hollow out to dashed
+     outlines: the values shown are the last received, not live air. */
+  .airbadges.stale .airbadge { background:transparent; color:var(--mut);
+    outline:1.5px dashed #566078; outline-offset:-1.5px; animation:none; }
   @keyframes co2pulse { 0%,100%{ filter:brightness(1); } 50%{ filter:brightness(1.25); } }
+  /* Rich hover card for the badges — a native title is too cramped to explain how a
+     sensor works and how to read it. One shared fixed panel, placed under the badge. */
+  #airTip { position:fixed; z-index:40; max-width:380px; background:#171a21; border:1px solid #2c3243;
+    border-radius:10px; padding:10px 12px; font-size:12.5px; line-height:1.5; color:var(--fg);
+    box-shadow:0 8px 28px rgba(0,0,0,.55); display:none; pointer-events:none; }
+  #airTip .tipval { font-weight:700; margin-bottom:6px; }
+  #airTip .tipbody { color:#aeb6c8; }
+  #airTip .tipbody b { color:var(--fg); font-weight:600; }
+  #airTip .tipsrc { margin-top:6px; color:var(--mut); font-size:11px; }
   /* Leaflet weather control */
   .leaflet-weather-ctrl { background:rgba(14,17,23,0.82); color:#cfd5e3; padding:6px 8px;
     border-radius:6px; font-size:11px; line-height:1.6; pointer-events:none; }
@@ -249,13 +264,13 @@
   <h1>🌫️ Air Monitor</h1>
   <button type="button" id="modeBtn" class="modebtn" title="Toggle home/plane mode">🏠 Home</button>
   <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt" class="hide-sm">connecting…</span></span>
+  <span id="batwarn" class="airbadge sev-bad">🔋 Battery low</span>
   <span id="airBadges" class="airbadges"></span>
   <span class="grow"></span>
   <span class="pill hide-sm" id="stats"></span>
 </header>
 
 <div class="backdrop" id="backdrop"></div>
-<div id="batwarn">🔋 Battery low</div>
 
 <div id="aircraftPanel" class="acpanel">
   <div class="achead" id="acHead">
@@ -405,8 +420,14 @@
 const META = {
   pm1:{g:'Particulates',n:'PM1'}, pm25:{g:'Particulates',n:'PM2.5'},
   pm4:{g:'Particulates',n:'PM4'}, pm10:{g:'Particulates',n:'PM10'},
+  // Number concentrations (fw v4): counts, not mass — PC0.5 is the most
+  // combustion/aircraft-sensitive channel this hardware has.
+  pc05:{g:'Particle Counts',n:'PC0.5'}, pc1:{g:'Particle Counts',n:'PC1'},
+  pc25:{g:'Particle Counts',n:'PC2.5'}, pc4:{g:'Particle Counts',n:'PC4'},
+  pc10:{g:'Particle Counts',n:'PC10'},
   // All gases on one chart: levels/indices/mV on the left, Rs (Ω) on the right.
   co2:{g:'Gases',n:'CO₂'}, voc:{g:'Gases',n:'VOC'}, nox:{g:'Gases',n:'NOx'},
+  voc_raw:{g:'Gases',n:'VOC raw',a:2}, nox_raw:{g:'Gases',n:'NOx raw',a:2},
   co_ppm:{g:'Gases',n:'CO ppm'}, hcho_ppm:{g:'Gases',n:'HCHO ppm'},
   co_mv:{g:'Gases',n:'CO mV',a:2}, hcho_mv:{g:'Gases',n:'HCHO mV',a:2},
   co_rs:{g:'Gases',n:'CO Rs',a:2}, hcho_rs:{g:'Gases',n:'HCHO Rs',a:2},
@@ -427,7 +448,8 @@ const META = {
 // Per-chart axis titles for the dual-axis groups (left = y, right = y2).
 const GROUP_AXES = {
   'Temp / Humidity':   { y:'°C', y2:'% RH' },
-  'Gases':             { y:'ppm / index / mV', y2:'Rs (Ω)' },
+  'Gases':             { y:'ppm / index / mV', y2:'Rs (Ω) / raw ticks' },
+  'Particle Counts':   { y:'#/cm³' },
   'Noise & Vibration': { y:'dB', y2:'m/s²' },
   'Soil':              { y:'%', y2:'mV' },
   'Battery':           { y:'V', y2:'%' },
@@ -440,7 +462,7 @@ const GROUP_Y_RANGE = {
 };
 // Chart stacking order (top→bottom). Battery is always forced last regardless.
 const GROUP_ORDER = [
-  'Noise & Vibration','Particulates','Gases','Air Quality Index','Temp / Humidity','Pressure',
+  'Noise & Vibration','Particulates','Particle Counts','Gases','Air Quality Index','Temp / Humidity','Pressure',
   'Cloud & Radiation','Wind','Precipitation','Light','Soil',
 ];
 function groupRank(g) {
@@ -478,7 +500,9 @@ const WEATHER_META = {
 // Units per metric — appended to the legend value, e.g. "CO₂ = 1020 ppm".
 const UNITS = {
   pm1:'µg/m³', pm25:'µg/m³', pm4:'µg/m³', pm10:'µg/m³', pm2_5:'µg/m³',
-  co2:'ppm', voc:'', nox:'', co_ppm:'ppm', hcho_ppm:'ppm', co_mv:'mV', hcho_mv:'mV', co_rs:'Ω', hcho_rs:'Ω',
+  pc05:'#/cm³', pc1:'#/cm³', pc25:'#/cm³', pc4:'#/cm³', pc10:'#/cm³',
+  co2:'ppm', voc:'', nox:'', voc_raw:'ticks', nox_raw:'ticks',
+  co_ppm:'ppm', hcho_ppm:'ppm', co_mv:'mV', hcho_mv:'mV', co_rs:'Ω', hcho_rs:'Ω',
   temp:'°C', rh:'%', bme_temp:'°C', bme_rh:'%', pressure_hpa:'hPa', pressure_msl:'hPa',
   lux:'lux', noise_dba:'dB(A)', noise_spl:'dB', noise_dbfs:'dBFS', lamax:'dB(A)', lceq:'dB(C)',
   lc_minus_la:'dB', rumble:'m/s²', rumble_peak:'m/s²', accel_mag:'m/s²', ppv_mm_s:'mm/s', accel_dom_hz:'Hz',
@@ -491,7 +515,11 @@ const UNITS = {
 // Which physical sensor produces each metric (shown in the hover explanation).
 const METRIC_SENSOR = {
   pm1:'Sensirion SEN66 (laser PM)', pm25:'Sensirion SEN66 (laser PM)', pm4:'Sensirion SEN66 (laser PM)', pm10:'Sensirion SEN66 (laser PM)',
+  pc05:'Sensirion SEN66 (laser PM, number count)', pc1:'Sensirion SEN66 (laser PM, number count)',
+  pc25:'Sensirion SEN66 (laser PM, number count)', pc4:'Sensirion SEN66 (laser PM, number count)',
+  pc10:'Sensirion SEN66 (laser PM, number count)',
   co2:'Sensirion SEN66 (NDIR CO₂)', voc:'SEN66 (SGP41 gas)', nox:'SEN66 (SGP41 gas)',
+  voc_raw:'SEN66 (SGP41 raw resistance ticks)', nox_raw:'SEN66 (SGP41 raw resistance ticks)',
   temp:'SEN66 (RH/T)', rh:'SEN66 (RH/T)', bme_temp:'BME280', bme_rh:'BME280', pressure_hpa:'BME280 (barometer)',
   lux:'BH1750 (ambient light)', noise_dba:'INMP441 MEMS mic', noise_spl:'INMP441 MEMS mic',
   noise_dbfs:'INMP441 MEMS mic', lamax:'INMP441 MEMS mic', lceq:'INMP441 MEMS mic',
@@ -510,6 +538,10 @@ const METRIC_NORM = {
   pm25:'WHO 24h guideline <15 µg/m³; >35 unhealthy', pm10:'WHO 24h guideline <45 µg/m³',
   pm1:'no formal limit; ultrafine, tracks combustion', co2:'<800 fresh · >1000 stuffy · >1500 ventilate',
   voc:'Sensirion index 1–500; 100≈typical, higher=more VOCs', nox:'index 1–500; needs days to learn a baseline',
+  pc05:'particle count <0.5 µm; combustion marker — best aircraft-exhaust proxy here (optical floor ~0.3 µm; true ultrafines invisible)',
+  pc1:'particle count <1 µm', pc25:'particle count <2.5 µm', pc4:'particle count <4 µm', pc10:'particle count <10 µm',
+  voc_raw:'raw SGP41 ticks, unnormalized — keeps long-term trends the VOC index erases',
+  nox_raw:'raw SGP41 ticks, unnormalized — keeps long-term trends the NOx index erases',
   temp:'comfort 20–24 °C', rh:'comfort 40–60 %; mould risk >70 %', bme_temp:'comfort 20–24 °C (BME runs warm)', bme_rh:'comfort 40–60 %',
   pressure_hpa:'sea-level ≈1013 hPa; falling = weather coming',
   lux:'dark <1 · dim room 50–200 · office 300–500 · daylight >1000',
@@ -628,6 +660,7 @@ async function query() {
 
 async function loadStats() {
   const s = await (await fetch('/api/stats')).json();
+  if (s.last_ts) _stationLastSeen = Math.max(_stationLastSeen, s.last_ts);
   const span = (s.first_ts && s.last_ts)
     ? `${new Date(s.first_ts*1000).toLocaleString()} → ${new Date(s.last_ts*1000).toLocaleString()}`
     : 'no data yet';
@@ -738,7 +771,7 @@ function render() {
         connectgaps: false,
         yaxis: meta?.a === 2 ? 'y2' : 'y',
         visible: _hiddenMetrics.has(m) ? 'legendonly' : true,
-        hovertemplate: `${meta?.n || m}: %{y} ${UNITS[m] || ''}<extra></extra>`,
+        hovertemplate: `${meta?.n || m}: %{y} ${UNITS[m] || ''} · %{x|%d %b %H:%M:%S}<extra></extra>`,
       };
     });
     const ax = GROUP_AXES[g] || {};
@@ -913,6 +946,7 @@ function connectWS() {
     if (msg.type === 'aircraft') { renderSdr(msg.sdr); updateAircraft(msg.data); return; }
     if (msg.type === 'runway')   { renderRunway(msg.data); return; }
     if (msg.type === 'weather')  { Object.assign(_weatherLatest, msg.data); _weatherLatest._source = msg.data.source || _weatherLatest._source; renderWeather(); return; }
+    if (msg.type === 'device')   noteStationSeen(msg.data);   // liveness even while paused
     if (!live) return;
     if (msg.type === 'reading') { dataCache.push(msg.data); trimToWindow(); _scheduleRender(); _serialPush(msg.data); }
     if (msg.type === 'device')  { reflectDeviceConfig(msg.data); }
@@ -1060,28 +1094,49 @@ function hchoPpm(rs) {
   }
   return null;
 }
+// Each badge: fn() → live severity/text/title (title = the bold value line in the hover
+// card); info = static HTML explaining how the sensor works, how to read it, and what
+// the project is watching that channel for.
 const AIR_BADGES = [
   { key:'dust', fields:['pm25'], fn:(pm) => {
       if (pm == null || pm < 0 || pm > 1000) return null;
       const sev = pm < 15 ? 'good' : pm < 35 ? 'ok' : pm < 55 ? 'warn' : 'bad';
       const lbl = pm < 15 ? 'clean' : pm < 35 ? 'moderate' : pm < 55 ? 'poor' : 'unhealthy';
       return { sev, text:`🌫️ Dust ${Math.round(pm)} · ${lbl}`,
-        title:`PM2.5 = ${pm.toFixed(1)} µg/m³ — ${lbl}. WHO 24 h guideline <15; >35 unhealthy.` };
-  }},
+        title:`PM2.5 = ${pm.toFixed(1)} µg/m³ — ${lbl}` };
+  },
+    info:`<b>How:</b> the SEN66 draws air past a laser and sizes each particle by its scattered
+      light → µg/m³ of particles under 2.5 µm. Factory-calibrated; the most trustworthy gas/dust
+      channel on the station.<br>
+      <b>Read:</b> WHO 24 h guideline &lt;15 · &gt;35 unhealthy. Indoor spikes: cooking, candles,
+      smoke. Outdoor: traffic, wood smoke, fireworks.<br>
+      <b>Watching for:</b> whether flyovers / Schiphol plumes lift particle levels above background.` },
   { key:'voc', fields:['voc'], fn:(v) => {
       if (v == null || v <= 0) return null;
       const sev = v < 150 ? 'good' : v < 250 ? 'ok' : v < 400 ? 'warn' : 'bad';
       const lbl = v < 150 ? 'low' : v < 250 ? 'elevated' : v < 400 ? 'high' : 'very high';
       return { sev, text:`VOC ${Math.round(v)} · ${lbl}`,
-        title:`SEN66 VOC index = ${Math.round(v)} — ${lbl}. 100 ≈ recent baseline; higher = more VOCs.` };
-  }},
+        title:`SEN66 VOC index = ${Math.round(v)} — ${lbl}` };
+  },
+    info:`<b>How:</b> SGP41 metal-oxide cell inside the SEN66. Not a concentration — an index
+      1–500 against its own ~24 h rolling baseline, where 100 = "the usual air here". After a
+      power cycle it needs a day to re-learn.<br>
+      <b>Read:</b> spikes on solvents, cooking, alcohol, off-gassing — then slowly re-centres
+      toward 100 even if the air stays bad, so trust the spike, not the resting level.<br>
+      <b>Watching for:</b> short exhaust/kerosene events that line up with flyovers, vs indoor sources.` },
   { key:'co2', fields:['co2'], fn:(c) => {
       if (c == null || c <= 0 || c > 40000) return null;
       const sev = c < 800 ? 'good' : c < 1200 ? 'ok' : c < 1500 ? 'warn' : 'bad';
       const lbl = c < 800 ? 'fresh' : c < 1200 ? 'ok' : c < 1500 ? 'stuffy' : 'ventilate';
       return { sev, text:`CO₂ ${Math.round(c)} · ${lbl}`,
-        title:`CO₂ = ${Math.round(c)} ppm — ${lbl}. <800 fresh · >1000 stuffy · >1500 open a window.` };
-  }},
+        title:`CO₂ = ${Math.round(c)} ppm — ${lbl}` };
+  },
+    info:`<b>How:</b> NDIR cell in the SEN66 — CO₂ absorbs a specific infrared band; measured
+      absorption → ppm. Absolute, no baseline needed. Outdoor air ≈ 420 ppm.<br>
+      <b>Read:</b> indoors it tracks people vs ventilation: &lt;800 fresh · &gt;1200 stuffy ·
+      &gt;1500 open a window.<br>
+      <b>Role:</b> ventilation channel — aircraft won't move it. Outdoors it should sit near
+      420 ppm; anything else flags a sensor problem.` },
   { key:'hcho', fields:['hcho_rs'], fn:(rs) => {
       const ppm = hchoPpm(rs);
       if (ppm == null) return null;
@@ -1089,29 +1144,167 @@ const AIR_BADGES = [
       const lbl = ppm < 0.08 ? 'low' : ppm < 0.2 ? 'mild' : ppm < 0.5 ? 'elevated' : 'high';
       const shown = ppm < 0.05 ? '<0.05' : '~' + ppm.toFixed(2);
       return { sev, text:`HCHO ${shown} · ${lbl}`,
-        title:`Formaldehyde ≈ ${shown} ppm — ${lbl}. Qualitative estimate vs yesterday's outdoor baseline (R0 ≈ 146 kΩ). WHO 30-min guideline 0.08 ppm.` };
-  }},
+        title:`Formaldehyde ≈ ${shown} ppm — ${lbl}` };
+  },
+    info:`<b>How:</b> DFRobot MEMS cell (SMD1001) whose electrical resistance falls as
+      formaldehyde rises. We convert resistance → ≈ppm against a clean-air baseline
+      (R0 ≈ 146 kΩ, set outdoors 11 Jul 2026) via the datasheet curve.<br>
+      <b>Read:</b> qualitative — cross-sensitive to other VOCs, so trust trends, not decimals.
+      WHO 30-min guideline 0.08 ppm. Usual indoor source: furniture/paint off-gassing.` },
   { key:'co', fields:['co_mv'], fn:(mv) => {
       if (mv != null && mv > CO_FLOOR_MV) {       // sensor actually moving off the floor
         const sev = mv < 250 ? 'ok' : mv < 450 ? 'warn' : 'bad';
         return { sev, text:`CO ${Math.round(mv)} mV ↑`,
-          title:`CO sensor responding: ${Math.round(mv)} mV (baseline ≈142). Rising = reducing gas / CO present. Qualitative, uncalibrated.` };
+          title:`CO sensor responding: ${Math.round(mv)} mV (baseline ≈142) — reducing gas / CO present` };
       }
       return { sev:'dead', text:`CO —`,
-        title:`CO sensor pinned at its 142 mV floor: either no detectable CO (normal — ambient CO sits far below this element's ~10 ppm floor) or the channel is dead. Test: hold an unlit butane lighter or blown-out match smoke at it and watch this badge jump.` };
-  }},
+        title:`CO sensor at its 142 mV floor — no usable signal` };
+  },
+    info:`<b>How:</b> DFRobot MEMS reducing-gas cell, read as raw millivolts (baseline ≈ 142 mV).
+      Uncalibrated.<br>
+      <b>Read:</b> ambient CO sits far below this element's ~10 ppm floor, so a flat 142 mV is
+      normal — and indistinguishable from a dead channel. Rising mV = CO / smoke / reducing gas.<br>
+      <b>Aliveness test:</b> blown-out match smoke or unlit-lighter gas held at the sensor
+      should make this badge jump.` },
+  { key:'temp', fields:['temp','bme_temp'], fn:(t, bt) => {
+      const v = t ?? bt;
+      if (v == null || v < -40 || v > 85) return null;
+      const sev = (v >= 18 && v <= 26) ? 'good' : (v >= 15 && v < 30) ? 'ok' : (v >= 5 && v < 35) ? 'warn' : 'bad';
+      const lbl = v < 5 ? 'freezing' : v < 15 ? 'cold' : v < 18 ? 'cool' : v <= 26 ? 'comfy' : v < 30 ? 'warm' : v < 35 ? 'hot' : 'roasting';
+      const title = (t != null && bt != null)
+        ? `SEN66 ${t.toFixed(1)} °C · BME280 ${bt.toFixed(1)} °C (BME ${bt - t >= 0 ? '+' : ''}${(bt - t).toFixed(1)}°)`
+        : t != null ? `SEN66 ${t.toFixed(1)} °C (no BME280 reading)` : `BME280 ${bt.toFixed(1)} °C (no SEN66 reading)`;
+      return { sev, text:`🌡️ ${v.toFixed(1)}° · ${lbl}`, title };
+  },
+    info:`<b>Two thermometers:</b> the SEN66's factory-calibrated RH/T element (±0.5 °C class,
+      compensated for its own electronics) and a BME280 on the carrier board. Badge shows the SEN66.<br>
+      <b>Why they diverge:</b> the BME280 self-heats and soaks up board heat — it has been running
+      ≈3 °C above the SEN66 (Jul 2026). Dew points computed from both agree within ~0.5 °C, so
+      they're sampling the same air: the gap is heat at the BME's die, not a fault.<br>
+      <b>Pick one or average?</b> Don't average — that folds half the BME's heat bias into a good
+      reading. SEN66 is the reference; the BME280 is a drift check (if their gap changes over
+      weeks, investigate).` },
+  { key:'rh', fields:['rh','bme_rh'], fn:(h, bh) => {
+      const v = h ?? bh;
+      if (v == null || v <= 0 || v > 100) return null;
+      const sev = (v >= 40 && v <= 60) ? 'good' : (v >= 30 && v <= 70) ? 'ok' : (v >= 20 && v <= 80) ? 'warn' : 'bad';
+      const lbl = v < 20 ? 'parched' : v < 30 ? 'very dry' : v < 40 ? 'dry' : v <= 60 ? 'ok' : v <= 70 ? 'humid' : v <= 80 ? 'damp' : 'wet';
+      const title = (h != null && bh != null)
+        ? `SEN66 ${h.toFixed(0)} % · BME280 ${bh.toFixed(0)} % (BME ${bh - h >= 0 ? '+' : ''}${(bh - h).toFixed(0)} pt)`
+        : h != null ? `SEN66 ${h.toFixed(0)} % (no BME280 reading)` : `BME280 ${bh.toFixed(0)} % (no SEN66 reading)`;
+      return { sev, text:`💧 ${v.toFixed(0)}% · ${lbl}`, title };
+  },
+    info:`<b>Same sensor pair</b> as temperature. %RH is relative to temperature, so the BME280's
+      self-heating makes identical air read drier — it sits ≈12 %RH below the SEN66. Badge shows
+      the SEN66.<br>
+      <b>Read:</b> comfort 40–60 % · sustained &gt;70 % risks mould/condensation · &lt;30 % dries
+      airways.<br>
+      <b>Trust:</b> SEN66, same reasoning as temperature — matching dew points confirm the two
+      humidity elements themselves agree.` },
 ];
+
+// Rich hover card. Shown on hover (desktop) or tap (kiosk touch); hidden on
+// mouse-out, scroll, or a tap anywhere else. pointer-events:none so it never
+// steals the mouse from the badge.
+let _airTipHost = null, _airTipKey = null;
+function _airTipEl() {
+  if (!_airTipHost) {
+    _airTipHost = document.createElement('div');
+    _airTipHost.id = 'airTip';
+    document.body.appendChild(_airTipHost);
+    document.addEventListener('click', e => { if (!e.target.closest('.airbadge')) hideAirTip(); });
+    window.addEventListener('scroll', hideAirTip, { passive:true });
+  }
+  return _airTipHost;
+}
+function showAirTip(badge, spec) {
+  const tip = _airTipEl();
+  tip.innerHTML = `<div class="tipval"></div><div class="tipbody">${spec.info}</div>
+    <div class="tipsrc">${_airTipSrcText()}</div>`;
+  tip.querySelector('.tipval').textContent = badge._tipline || 'no data yet';
+  tip.style.display = 'block';
+  const r = badge.getBoundingClientRect();
+  tip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - tip.offsetWidth - 8)) + 'px';
+  tip.style.top  = (r.bottom + 6) + 'px';
+  _airTipKey = spec.key;
+}
+function hideAirTip() { if (_airTipHost) _airTipHost.style.display = 'none'; _airTipKey = null; }
+
+// ---- station link watchdog -------------------------------------------------
+// The badges show the *last received* values, so if the station drops off they'd
+// stay green forever. Track the newest sign of life — /api/devices on load, the WS
+// 'device' broadcast that rides every ingest, /api/stats last_ts as the fallback
+// that survives server restarts (DEVICE_STATE is in-memory) — and call the link
+// stale once the silence is ≳3× the station's own send cadence.
+let _stationLastSeen = 0;                          // unix s, newest evidence of life
+let _stationMode = null, _stationPollMs = null;    // for the expected cadence
+function noteStationSeen(st) {
+  if (!st) return;
+  if (st.last_seen) _stationLastSeen = Math.max(_stationLastSeen, st.last_seen);
+  if (st.mode) _stationMode = st.mode;
+  if (st.poll_interval_ms) _stationPollMs = st.poll_interval_ms;
+}
+function stationSilentMs() { return _stationLastSeen ? Date.now() - _stationLastSeen * 1000 : 0; }
+function stationStale() {
+  if (!_stationLastSeen) return false;             // nothing known yet — don't cry wolf
+  // Expected arrival cadence: NORMAL flushes ~10 s batches, TESTING streams each
+  // sample, POWER_SAVING only checks in every ~5 min. 90 s floor absorbs one missed
+  // sync + minor clock skew between server and viewer.
+  const expect = _stationMode === 'power_saving'
+    ? Math.max(_stationPollMs || 0, 300000)
+    : Math.max(_stationPollMs || 0, 10000);
+  return stationSilentMs() > Math.max(3 * expect, 90000);
+}
+function _fmtAgo(ms) {
+  const m = Math.round(ms / 60000);
+  return m < 1 ? '<1 min' : m < 90 ? `${m} min` : m < 48 * 60 ? `${(m / 60).toFixed(1)} h` : `${Math.round(m / 1440)} d`;
+}
+function _airTipSrcText() {
+  return stationStale()
+    ? `📡 Station silent for ${_fmtAgo(stationSilentMs())} — showing its last received values.`
+    : 'Live value = newest station reading in the selected time window.';
+}
+
+// Fallback for the badges when the selected window holds no readings (station silent
+// longer than the window, e.g. after an outage): the tail of the DB around the very
+// last reading, fetched once at load. Only consulted after the window scan misses.
+let _dbTail = [];
+async function loadDbTail() {
+  try {
+    const last = await (await fetch('/api/latest')).json();
+    if (!last.ts) return;
+    // 10 min before the last reading — enough to find a non-null for every field
+    // (slow/carried-forward channels may be missing from any single record).
+    _dbTail = await (await fetch(`/api/readings?since=${Math.floor(last.ts) - 600}&limit=2000`)).json();
+  } catch (_) {}
+}
+
 function updateAirBadges() {
   const host = $('#airBadges'); if (!host) return;
-  const latest = (f) => { for (let i = dataCache.length - 1; i >= 0; i--) { if (dataCache[i][f] != null) return dataCache[i][f]; } return null; };
+  host.classList.toggle('stale', stationStale());
+  const latest = (f) => {
+    for (let i = dataCache.length - 1; i >= 0; i--) { if (dataCache[i][f] != null) return dataCache[i][f]; }
+    for (let i = _dbTail.length - 1; i >= 0; i--) { if (_dbTail[i][f] != null) return _dbTail[i][f]; }
+    return null;
+  };
   for (const spec of AIR_BADGES) {
     let el = host.querySelector(`#badge_${spec.key}`);
-    if (!el) { el = document.createElement('span'); el.id = `badge_${spec.key}`; host.appendChild(el); }
+    if (!el) {
+      el = document.createElement('span'); el.id = `badge_${spec.key}`; host.appendChild(el);
+      el.addEventListener('mouseenter', () => showAirTip(el, spec));
+      el.addEventListener('mouseleave', hideAirTip);
+      el.addEventListener('click', e => { e.stopPropagation(); showAirTip(el, spec); });  // touch
+    }
     const r = spec.fn(...spec.fields.map(latest))
            || { sev:'dead', text:`${spec.key.toUpperCase()} —`, title:'no data yet' };
     el.className = `airbadge sev-${r.sev}`;
     el.textContent = r.text;
-    el.title = r.title;
+    el._tipline = r.title;
+    // live-refresh the value + staleness lines if this badge's card is open
+    if (_airTipKey === spec.key && _airTipHost) {
+      const v = _airTipHost.querySelector('.tipval'); if (v) v.textContent = r.title;
+      const s = _airTipHost.querySelector('.tipsrc'); if (s) s.textContent = _airTipSrcText();
+    }
   }
 }
 
@@ -1126,7 +1319,7 @@ function checkBattery() {
               (pct == null && v != null && v < BAT_LOW_V);
   const el = $('#batwarn');
   el.classList.toggle('show', low);
-  if (low) el.textContent = `🔋 Battery low — ${pct != null ? pct.toFixed(0) + '%' : v.toFixed(2) + ' V'} · charge soon`;
+  if (low) el.textContent = `🔋 ${pct != null ? pct.toFixed(0) + '%' : v.toFixed(2) + ' V'} — charge`;
 
   // Runtime estimate line
   const bs = $('#batStat');
@@ -1216,6 +1409,7 @@ function reflectDeviceConfig(st) {
   try {
     const devs = await (await fetch('/api/devices')).json();
     const st = devs.sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0))[0];
+    noteStationSeen(st);
     reflectDeviceConfig(st);
   } catch (_) {}
 })();
@@ -1275,7 +1469,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // After 60 s of no interaction, glide back to the top and re-frame the map on the
-// range ring — for the wall display so a scrolled/panned view resets itself.
+// range ring — expo/kiosk only, so the wall display resets itself between visitors.
 // User activity (below) restarts the countdown.
 let _idleTimer = null;
 function _resetIdleScroll() {
@@ -1285,9 +1479,11 @@ function _resetIdleScroll() {
     fitToRing();   // frame the map back to just clipping the home circle
   }, 60000);
 }
-['mousemove', 'mousedown', 'keydown', 'touchstart', 'wheel'].forEach(
-  ev => window.addEventListener(ev, _resetIdleScroll, { passive: true }));
-_resetIdleScroll();
+if (document.body.classList.contains('expo')) {
+  ['mousemove', 'mousedown', 'keydown', 'touchstart', 'wheel'].forEach(
+    ev => window.addEventListener(ev, _resetIdleScroll, { passive: true }));
+  _resetIdleScroll();
+}
 
 // Expo/wall-display hardening: swallow the right-click / long-press context menu
 // so visitors can't open it. Expo-only — revert by turning DASHBOARD_EXPO off.
@@ -2961,6 +3157,12 @@ $('#researchRefresh').addEventListener('click', e => { e.stopPropagation(); load
   renderToggles();
   await loadMetrics();
   await query();
+  // Window empty (station silent longer than the window)? Badges + last-reading line
+  // fall back to the newest values in the DB, shown dashed by the staleness watchdog.
+  loadDbTail().then(() => {
+    updateAirBadges();
+    if (!_lastReadingTs && _dbTail.length) _serialPush(_dbTail[_dbTail.length - 1]);
+  });
   applyMode(_appMode);
   await initAircraft();
   loadFlightPaths();
@@ -2971,6 +3173,8 @@ $('#researchRefresh').addEventListener('click', e => { e.stopPropagation(); load
   connectWS();
   keepAwake();
   setInterval(loadMetrics, 60000);
+  // Staleness flips precisely when NO data arrives to trigger a re-render — poll it.
+  setInterval(updateAirBadges, 15000);
   // Wall display: force the research panel open on load (it's non-collapsible in expo).
   if (document.body.classList.contains('expo')) {
     $('#researchPanel').classList.remove('rcollapsed');

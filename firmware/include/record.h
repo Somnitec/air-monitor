@@ -6,13 +6,22 @@
 // Schema v2 adds Dutch/EU aircraft noise metrics (LAmax, LCeq) and infrasound
 // vibration metrics (PPV, 1/3-oct accel bands, dominant frequency).
 //
+// Schema v4 adds the SEN66 outputs we weren't draining: particle number
+// concentrations (PC0.5..PC10, #/cm³ — closest this hardware gets to aircraft
+// ultrafines) and raw SGP41 VOC/NOx ticks (the index self-normalizes and erases
+// long-term trends; raw ticks keep them). All seven use the sensor's own 0xFFFF
+// "unknown" sentinel verbatim instead of a status bit.
+//
 // Quantization scales are chosen so resolution far exceeds each sensor's real
 // accuracy. Absent sensors store 0 and clear their present bit.
 
 #include <stdint.h>
 #include <ArduinoJson.h>   // header-only; record_to_json takes a real JsonDocument
 
-static constexpr uint8_t  RECORD_SCHEMA_VERSION = 3;   // v3: per-group tri-state status word
+// v4: SEN66 number conc. + raw gas ticks. v5: layout identical to v4 — bumped only to
+// force a queue wipe on units whose v4 flash resumed into mixed-stride segments (the
+// wipeQueue basename bug had re-stamped their fmt file as v4 without deleting anything).
+static constexpr uint8_t  RECORD_SCHEMA_VERSION = 5;
 static constexpr int      REC_NBANDS      = 9;   // must match MIC_NBANDS
 static constexpr int      REC_ACCEL_BANDS = 6;   // must match ACCEL_NBANDS: 4,8,16,31.5,63,125 Hz
 
@@ -89,11 +98,15 @@ struct Record {
     uint16_t ppv_mm10;              // Peak Particle Velocity, 0.1 mm/s units (max 6553 mm/s)
     uint8_t  accel_dom_hz;          // dominant vibration frequency 1–255 Hz (0 = no signal)
     int8_t   accel_bands[REC_ACCEL_BANDS]; // 1/3-oct accel levels, dB re 1 m/s² (dBm/s²)
+
+    // ---- v4: SEN66 number concentrations + raw gas ticks ----
+    uint16_t pc05, pc1, pc25, pc4, pc10;  // particles/cm³ x10; 0xFFFF = unknown
+    uint16_t voc_raw, nox_raw;            // SGP41 raw ticks; 0xFFFF = unknown
 };
 #pragma pack(pop)
 
-static constexpr unsigned RECORD_SIZE = 88;
-static_assert(sizeof(Record) == RECORD_SIZE, "Record must be tightly packed to 88 bytes");
+static constexpr unsigned RECORD_SIZE = 102;
+static_assert(sizeof(Record) == RECORD_SIZE, "Record must be tightly packed to 102 bytes");
 
 // Plain (Arduino-free) inputs to pack. firmware.cpp fills this from live sensors.
 struct RecordFields {
@@ -110,6 +123,9 @@ struct RecordFields {
     bool  has_sen66 = false;
     float pm1 = 0, pm25 = 0, pm4 = 0, pm10 = 0, voc = 0, nox = 0, temp = 0, rh = 0;
     uint16_t co2 = 0;
+    // v4 — kept in the sensor's own encoding (x10 / raw ticks, 0xFFFF = unknown)
+    uint16_t pc05 = 0xFFFF, pc1 = 0xFFFF, pc25 = 0xFFFF, pc4 = 0xFFFF, pc10 = 0xFFFF;
+    uint16_t voc_raw = 0xFFFF, nox_raw = 0xFFFF;
 
     bool  has_bh1750 = false; float lux = 0;
     bool  has_bme = false;    float pressure = 0, bme_temp = 0, bme_rh = 0;

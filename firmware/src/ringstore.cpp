@@ -117,8 +117,15 @@ static void wipeQueue() {
         String victims[MAX_SEGMENTS + 4];
         int nv = 0;
         for (File e = dir.openNextFile(); e && nv < (int)(MAX_SEGMENTS + 4); e = dir.openNextFile()) {
-            victims[nv++] = e.name();   // name() returns full path on arduino-esp32
+            // File::name() returns the BASENAME on arduino-esp32 2.x+ (full path only
+            // on 1.x), and remove() wants an absolute path — a bare basename fails
+            // silently, so the "wiped" segments survived. Seen live 2026-07-14: after
+            // the v3→v4 reflash the ring resumed into mixed-stride segment files and
+            // every synced record was a misaligned-read garbage frame.
+            String n = e.name();
             e.close();
+            if (!n.startsWith("/")) n = String(QUEUE_DIR) + "/" + n;
+            victims[nv++] = n;
         }
         dir.close();
         for (int i = 0; i < nv; ++i) LittleFS.remove(victims[i]);
@@ -127,6 +134,14 @@ static void wipeQueue() {
     }
     LittleFS.remove(QUEUE_CURSOR_PATH);
     LittleFS.remove(QUEUE_FMT_PATH);
+}
+
+// (Re)write the current layout signature. Kept separate from checkFormat so the
+// segment-integrity wipe in ringstore_begin can restamp after clearing the queue.
+static void stampFormat() {
+    RingFmt want{ RINGFMT_MAGIC, RECORD_SCHEMA_VERSION, (uint16_t)RECORD_SIZE };
+    File w = LittleFS.open(QUEUE_FMT_PATH, "w");
+    if (w) { w.write((const uint8_t*)&want, sizeof(want)); w.close(); }
 }
 
 // Verify the stored format signature matches this build; wipe + re-stamp on mismatch.
@@ -145,10 +160,7 @@ static void checkFormat() {
                       got.schema, got.record_size, want.schema, want.record_size);
         wipeQueue();
     }
-    if (!match) {                                   // (re)stamp current signature
-        File w = LittleFS.open(QUEUE_FMT_PATH, "w");
-        if (w) { w.write((const uint8_t*)&want, sizeof(want)); w.close(); }
-    }
+    if (!match) stampFormat();
 }
 
 bool ringstore_begin() {
@@ -167,13 +179,18 @@ bool ringstore_begin() {
     checkFormat();
 
     // Recover head/tail by scanning the segment directory.
-    bool any = false;
+    bool any = false, corrupt = false;
     uint32_t minSeg = 0, maxSeg = 0;
     File dir = LittleFS.open(QUEUE_DIR);
     if (dir && dir.isDirectory()) {
         for (File e = dir.openNextFile(); e; e = dir.openNextFile()) {
             uint32_t idx;
             if (parseSeg(e.name(), idx)) {
+                // A segment whose size isn't a whole number of Records can't be read
+                // at RECORD_SIZE stride (truncated write, or leftovers from an older
+                // layout that a failed wipe left behind) — resuming into it syncs
+                // garbage frames. Cheaper to drop the queue than to trust it.
+                if (e.size() % RECORD_SIZE != 0) corrupt = true;
                 if (!any) { minSeg = maxSeg = idx; any = true; }
                 else { if (idx < minSeg) minSeg = idx; if (idx > maxSeg) maxSeg = idx; }
             }
@@ -181,6 +198,13 @@ bool ringstore_begin() {
         }
     }
     if (dir) dir.close();
+
+    if (corrupt) {
+        Serial.println("[ring] segment size not a multiple of RECORD_SIZE — mixed/truncated stride; starting fresh");
+        wipeQueue();
+        stampFormat();
+        any = false;
+    }
 
     if (!any) {
         s_headSeq = s_tailSeq = s_syncedSeq = 0;
