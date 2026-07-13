@@ -205,10 +205,16 @@
   #weatherStrip .witem strong { color:#cfd5e3; }
   #weatherStrip .wsrc { margin-left:auto; color:#556; font-size:10px; }
   .windArrow { display:inline-block; font-size:14px; line-height:1; }
-  /* CO2 health badge in the header — colour ramps green→red with concentration */
-  #co2Badge { font-size:14px; font-weight:800; padding:4px 12px; border-radius:9px; white-space:nowrap;
-    color:#06130a; background:#3a3f4b; letter-spacing:.01em; transition:background .4s; min-width:74px; text-align:center; }
-  #co2Badge.warn { animation:co2pulse 1.6s ease-in-out infinite; }
+  /* Air-quality header badges — one per channel (dust · VOC · CO₂ · HCHO · CO).
+     Colour = severity: green good → amber → orange → red concern; grey = no/dead signal. */
+  .airbadges { display:flex; flex-wrap:wrap; gap:5px; align-items:center; }
+  .airbadge { font-size:13px; font-weight:800; padding:4px 10px; border-radius:9px; white-space:nowrap;
+    letter-spacing:.01em; transition:background .4s; text-align:center; }
+  .airbadge.sev-good { background:hsl(120,55%,45%); color:#06130a; }
+  .airbadge.sev-ok   { background:hsl(48,88%,55%);  color:#2a1e00; }
+  .airbadge.sev-warn { background:hsl(26,90%,55%);  color:#2a1300; }
+  .airbadge.sev-bad  { background:hsl(0,75%,53%);   color:#fff; animation:co2pulse 1.6s ease-in-out infinite; }
+  .airbadge.sev-dead { background:#2a2f3b; color:var(--mut); font-weight:700; }
   @keyframes co2pulse { 0%,100%{ filter:brightness(1); } 50%{ filter:brightness(1.25); } }
   /* Leaflet weather control */
   .leaflet-weather-ctrl { background:rgba(14,17,23,0.82); color:#cfd5e3; padding:6px 8px;
@@ -243,7 +249,7 @@
   <h1>🌫️ Air Monitor</h1>
   <button type="button" id="modeBtn" class="modebtn" title="Toggle home/plane mode">🏠 Home</button>
   <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt" class="hide-sm">connecting…</span></span>
-  <span id="co2Badge" title="Indoor CO₂ — green is fresh, red means open a window">—</span>
+  <span id="airBadges" class="airbadges"></span>
   <span class="grow"></span>
   <span class="pill hide-sm" id="stats"></span>
 </header>
@@ -611,7 +617,7 @@ async function query() {
   ]);
   render();
   restoreToggleStates();
-  checkBattery(); updateCo2Badge();
+  checkBattery(); updateAirBadges();
   loadStats();
   if (typeof loadFlightPaths === 'function') loadFlightPaths();   // map paths follow the window
   if (typeof drawClosestApproachScatter === 'function') drawClosestApproachScatter();
@@ -897,7 +903,7 @@ function connectWS() {
       _renderPending = true;
       requestAnimationFrame(() => {
         _renderPending = false;
-        render(); checkBattery(); updateCo2Badge(); loadStats();
+        render(); checkBattery(); updateAirBadges(); loadStats();
       });
     }
   }
@@ -1029,20 +1035,84 @@ function _batEstimate() {
 
 // CO₂ health badge: green (fresh) → amber → red (open a window!). Thresholds follow
 // common indoor-air guidance: <800 good, 800–1200 ok, 1200–1500 stuffy, >1500 poor.
-function updateCo2Badge() {
-  const el = $('#co2Badge'); if (!el) return;
-  let co2 = null;
-  for (let i = dataCache.length - 1; i >= 0; i--) {
-    if (dataCache[i].co2 != null) { co2 = dataCache[i].co2; break; }
+// ---- air-quality header badges -------------------------------------------
+// Five channels, glanceable colour = severity (green good → red concern, grey = no signal).
+// CO₂, VOC, PM2.5 are direct SEN66 values. HCHO is a relative MEMS sensor turned into an
+// approximate ppm against R0_HCHO — the median Rs on 2026-07-11, a full day outdoors in clean
+// air (matches the ~143 kΩ datasheet baseline). CO is currently railed at its 142 mV floor
+// (no detectable CO *or* a dead channel — indistinguishable), so it shows grey until it moves;
+// introducing a reducing gas (unlit butane / blown-out match smoke) will light it up if alive.
+const R0_HCHO = 146000;        // Ω, clean-air baseline (Jul 11 outdoor median)
+const CO_FLOOR_MV = 150;       // co_mv ≤ this ⇒ pinned at the ADC floor, no usable CO signal
+// SMD1001 datasheet Fig 1, Rs/R0 → ppm (ratio falls as HCHO rises).
+const HCHO_RATIO_PPM = [[0.76,0.1],[0.63,0.2],[0.56,0.4],[0.52,0.6],[0.44,0.8],[0.42,1.0],[0.34,1.2]];
+function hchoPpm(rs) {
+  if (rs == null) return null;
+  const r = rs / R0_HCHO;
+  if (r >= 0.80) return 0;                      // at/above clean-air baseline → negligible
+  if (r <= 0.34) return 1.4;                    // past the bottom of the curve
+  for (let i = 0; i < HCHO_RATIO_PPM.length - 1; i++) {
+    const [r1, p1] = HCHO_RATIO_PPM[i], [r2, p2] = HCHO_RATIO_PPM[i + 1];
+    if (r <= r1 && r >= r2) {                    // log-log interpolate within the bracket
+      const f = (Math.log(r) - Math.log(r1)) / (Math.log(r2) - Math.log(r1));
+      return Math.exp(Math.log(p1) + f * (Math.log(p2) - Math.log(p1)));
+    }
   }
-  if (co2 == null || co2 <= 0 || co2 > 40000) { el.textContent = '—'; el.style.background = '#3a3f4b'; el.classList.remove('warn'); return; }
-  // map 450→1800 ppm onto a green→amber→red hue ramp (120°→0°)
-  const t = Math.max(0, Math.min(1, (co2 - 450) / (1800 - 450)));
-  const hue = 120 * (1 - t);                       // 120=green, 60=amber, 0=red
-  const label = co2 < 800 ? 'fresh' : co2 < 1200 ? 'ok' : co2 < 1500 ? 'stuffy' : 'open a window';
-  el.style.background = `hsl(${hue.toFixed(0)},75%,55%)`;
-  el.textContent = `CO₂ ${Math.round(co2)} · ${label}`;
-  el.classList.toggle('warn', co2 >= 1500);
+  return null;
+}
+const AIR_BADGES = [
+  { key:'dust', fields:['pm25'], fn:(pm) => {
+      if (pm == null || pm < 0 || pm > 1000) return null;
+      const sev = pm < 15 ? 'good' : pm < 35 ? 'ok' : pm < 55 ? 'warn' : 'bad';
+      const lbl = pm < 15 ? 'clean' : pm < 35 ? 'moderate' : pm < 55 ? 'poor' : 'unhealthy';
+      return { sev, text:`🌫️ Dust ${Math.round(pm)} · ${lbl}`,
+        title:`PM2.5 = ${pm.toFixed(1)} µg/m³ — ${lbl}. WHO 24 h guideline <15; >35 unhealthy.` };
+  }},
+  { key:'voc', fields:['voc'], fn:(v) => {
+      if (v == null || v <= 0) return null;
+      const sev = v < 150 ? 'good' : v < 250 ? 'ok' : v < 400 ? 'warn' : 'bad';
+      const lbl = v < 150 ? 'low' : v < 250 ? 'elevated' : v < 400 ? 'high' : 'very high';
+      return { sev, text:`VOC ${Math.round(v)} · ${lbl}`,
+        title:`SEN66 VOC index = ${Math.round(v)} — ${lbl}. 100 ≈ recent baseline; higher = more VOCs.` };
+  }},
+  { key:'co2', fields:['co2'], fn:(c) => {
+      if (c == null || c <= 0 || c > 40000) return null;
+      const sev = c < 800 ? 'good' : c < 1200 ? 'ok' : c < 1500 ? 'warn' : 'bad';
+      const lbl = c < 800 ? 'fresh' : c < 1200 ? 'ok' : c < 1500 ? 'stuffy' : 'ventilate';
+      return { sev, text:`CO₂ ${Math.round(c)} · ${lbl}`,
+        title:`CO₂ = ${Math.round(c)} ppm — ${lbl}. <800 fresh · >1000 stuffy · >1500 open a window.` };
+  }},
+  { key:'hcho', fields:['hcho_rs'], fn:(rs) => {
+      const ppm = hchoPpm(rs);
+      if (ppm == null) return null;
+      const sev = ppm < 0.08 ? 'good' : ppm < 0.2 ? 'ok' : ppm < 0.5 ? 'warn' : 'bad';
+      const lbl = ppm < 0.08 ? 'low' : ppm < 0.2 ? 'mild' : ppm < 0.5 ? 'elevated' : 'high';
+      const shown = ppm < 0.05 ? '<0.05' : '~' + ppm.toFixed(2);
+      return { sev, text:`HCHO ${shown} · ${lbl}`,
+        title:`Formaldehyde ≈ ${shown} ppm — ${lbl}. Qualitative estimate vs yesterday's outdoor baseline (R0 ≈ 146 kΩ). WHO 30-min guideline 0.08 ppm.` };
+  }},
+  { key:'co', fields:['co_mv'], fn:(mv) => {
+      if (mv != null && mv > CO_FLOOR_MV) {       // sensor actually moving off the floor
+        const sev = mv < 250 ? 'ok' : mv < 450 ? 'warn' : 'bad';
+        return { sev, text:`CO ${Math.round(mv)} mV ↑`,
+          title:`CO sensor responding: ${Math.round(mv)} mV (baseline ≈142). Rising = reducing gas / CO present. Qualitative, uncalibrated.` };
+      }
+      return { sev:'dead', text:`CO —`,
+        title:`CO sensor pinned at its 142 mV floor: either no detectable CO (normal — ambient CO sits far below this element's ~10 ppm floor) or the channel is dead. Test: hold an unlit butane lighter or blown-out match smoke at it and watch this badge jump.` };
+  }},
+];
+function updateAirBadges() {
+  const host = $('#airBadges'); if (!host) return;
+  const latest = (f) => { for (let i = dataCache.length - 1; i >= 0; i--) { if (dataCache[i][f] != null) return dataCache[i][f]; } return null; };
+  for (const spec of AIR_BADGES) {
+    let el = host.querySelector(`#badge_${spec.key}`);
+    if (!el) { el = document.createElement('span'); el.id = `badge_${spec.key}`; host.appendChild(el); }
+    const r = spec.fn(...spec.fields.map(latest))
+           || { sev:'dead', text:`${spec.key.toUpperCase()} —`, title:'no data yet' };
+    el.className = `airbadge sev-${r.sev}`;
+    el.textContent = r.text;
+    el.title = r.title;
+  }
 }
 
 function checkBattery() {
