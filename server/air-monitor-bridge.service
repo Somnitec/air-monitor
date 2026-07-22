@@ -1,0 +1,32 @@
+# Air Monitor USB serial bridge — systemd user unit.
+#
+# Relays the station's #SYNC# batches from the USB console to /ingest and
+# heartbeats so the firmware keeps its WiFi radio off (see usb_bridge.py).
+# Doubles as the serial monitor: journalctl --user -u air-monitor-bridge -f
+# shows the firmware's live log output.
+#
+# Install (once):
+#   cp server/air-monitor-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now air-monitor-bridge
+#   (linger is already enabled for the air-monitor service)
+#
+# PlatformIO serial uploads pause this unit automatically —
+# firmware/pause_bridge_on_upload.py stops it before esptool takes the port
+# and restarts it afterwards. If an upload dies mid-way, a dead-man timer
+# brings the bridge back within ~3 minutes anyway.
+
+[Unit]
+Description=Air Monitor USB serial bridge (station sync over USB)
+After=air-monitor.service
+
+[Service]
+WorkingDirectory=%h/Documents/code/air-monitor/server
+ExecStart=%h/Documents/code/air-monitor/server/.venv/bin/python usb_bridge.py
+# usb_bridge.py already loops waiting for the port, so restarts are only for
+# crashes/killed processes, not for an unplugged station.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

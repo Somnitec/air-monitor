@@ -14,6 +14,12 @@ struct CadenceParams {
     float    densify_delta_dba;  // |Δ LAeq| between captures that arms densification
     uint32_t densify_hold_ms;    // densified window persists this long after each trigger
     uint32_t quiet_store_ms;     // when not densified, store at most this often
+    float    densify_abs_dba;    // LAeq at/above this arms densification outright.
+                                 // The delta test alone misses aircraft: captures are
+                                 // ~1.3 s apart and a flyover ramps ~0.5 dB/capture, so
+                                 // only impulsive noises ever jumped 6 dB (measured
+                                 // 2026-07-14: median flyover stored at pure baseline
+                                 // cadence, 9 records in 90 s).
 };
 
 struct CadenceState {

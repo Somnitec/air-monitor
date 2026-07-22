@@ -99,8 +99,25 @@ static bool s_ringReady = false;
 enum Mode { MODE_NORMAL, MODE_TESTING, MODE_POWER_SAVING };
 static Mode     g_mode           = MODE_NORMAL;
 static Mode     g_appliedMode    = MODE_NORMAL;   // last mode whose hardware transition ran
+static bool     g_modeFromServer = false;         // dashboard set_mode wins over auto-mode
 static uint32_t g_bootStartMs    = 0;
 static uint32_t g_lastSyncAttempt = 0;
+
+// ---- USB serial bridge (host runs server/usb_bridge.py on the console port) ----
+// The bridge heartbeats a JSON line every ~2 s; while we hear it, sync batches go
+// out as "#SYNC# <json>" lines (acked with the server's /ingest reply) and the WiFi
+// radio stays off. Silence past BRIDGE_TIMEOUT_MS = unplugged / plain serial
+// monitor / no host: fall back to WiFi, and auto-select POWER_SAVING (an unattended
+// deployment) unless the dashboard has pinned a mode.
+static uint32_t g_bridgeLastRxMs = 0;      // millis() of last bridge line (0 = never)
+static bool     g_bridgeEverSeen = false;
+static String   s_serialLine;              // RX line accumulator (console is shared)
+static String   s_bridgeAck;               // last {"bridge":"ack",...} line received
+static bool     s_bridgeAckFresh = false;  // consumed by bridgePostBatch
+
+static bool bridgeUp() {
+    return g_bridgeLastRxMs != 0 && (millis() - g_bridgeLastRxMs) < BRIDGE_TIMEOUT_MS;
+}
 
 // Connection supervisor state. The device is unattended and all buffered data is
 // durable, so recovery escalates: reconnect -> power-cycle radio -> reboot.
@@ -130,6 +147,7 @@ static const char* modeStr(Mode m) {
 // (off between syncs) to save power — but the boot window always keeps it up so a
 // dashboard command (e.g. leave power-saving) still lands fast after a reboot.
 static bool wifiShouldStayOn() {
+    if (bridgeUp()) return false;               // USB transport active — radio stays off
     if (g_mode == MODE_POWER_SAVING) return inBootWindow();
     return true;
 }
@@ -233,6 +251,57 @@ static void adoptServerTime(const String& resp) {
     }
 }
 
+// Drain pending serial RX. Bridge traffic is JSON lines with a "bridge" key
+// (heartbeats + batch acks); anything else on the console is ignored. Heartbeats
+// carry server_time, so a USB-only station gets its clock without WiFi/NTP.
+static void serialPoll() {
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\r') continue;
+        if (c != '\n') {
+            if (s_serialLine.length() < 4096) s_serialLine += c;
+            continue;
+        }
+        String line = s_serialLine;
+        s_serialLine = "";
+        if (!line.length() || line[0] != '{') continue;
+        JsonDocument doc;
+        if (deserializeJson(doc, line) || !doc["bridge"].is<const char*>()) continue;
+        if (!g_bridgeEverSeen) Serial.println("[bridge] host heartbeat detected");
+        g_bridgeLastRxMs = millis();
+        g_bridgeEverSeen = true;
+        adoptServerTime(line);
+        if (!strcmp(doc["bridge"] | "", "ack")) {
+            s_bridgeAck = line;
+            s_bridgeAckFresh = true;
+        }
+    }
+}
+
+// POST one pre-serialized batch over the bridge: a "#SYNC# <json>" line out, then
+// wait for the host's ack (which relays the server's /ingest reply). Returns the
+// relayed HTTP code, or 0 on timeout/garbage (records stay buffered — same
+// contract as a transport failure in httpPostTo).
+static int bridgePostBatch(const String& body, String& resp) {
+    s_bridgeAckFresh = false;
+    Serial.print("#SYNC# ");
+    Serial.println(body);
+    Serial.flush();
+    uint32_t t0 = millis();
+    while (millis() - t0 < BRIDGE_REPLY_TIMEOUT_MS) {
+        esp_task_wdt_reset();
+        serialPoll();
+        if (s_bridgeAckFresh) {
+            JsonDocument doc;
+            if (deserializeJson(doc, s_bridgeAck)) return 0;
+            serializeJson(doc["body"], resp);   // the server's /ingest reply, verbatim
+            return doc["code"] | 0;
+        }
+        delay(10);
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Status LED (GPIO13). Idle = OFF. Blinks once at boot, then pulses briefly
 // each time a sync batch is acknowledged by the server.
@@ -320,6 +389,39 @@ static bool wifiConnect() {
         Serial.println("[wifi] no known network in range (will retry next cycle)");
     }
     return ok;
+}
+
+// Transport supervisor: called every loop. The USB bridge, when heartbeating, is
+// the preferred transport — radio fully off. Without it the station assumes an
+// unattended deployment: auto POWER_SAVING, radio duty-cycled up per sync. A
+// dashboard set_mode (g_modeFromServer) pins the mode until the next reboot.
+static void transportSupervise() {
+    static bool s_bridgeWasUp = false;
+    bool up = bridgeUp();
+    if (up != s_bridgeWasUp) {
+        s_bridgeWasUp = up;
+        if (up) {
+            Serial.println("[bridge] syncing over USB — WiFi radio off");
+            if (WiFi.getMode() != WIFI_OFF) wifiPowerDown();
+            if (!g_modeFromServer && g_mode == MODE_POWER_SAVING) {
+                g_mode = MODE_NORMAL;            // USB-powered: full fidelity
+                Serial.println("[mode] -> normal (USB bridge present)");
+            }
+        } else {
+            Serial.println("[bridge] heartbeat lost — falling back to WiFi");
+            if (!g_modeFromServer && g_mode != MODE_TESTING) {
+                g_mode = MODE_POWER_SAVING;
+                Serial.println("[mode] -> power_saving (no USB bridge)");
+            }
+        }
+    }
+    // Boot verdict: powered but no host ever heartbeated once the probe window
+    // closes -> unattended deployment, save power between WiFi syncs.
+    if (!g_bridgeEverSeen && !g_modeFromServer && g_mode == MODE_NORMAL
+        && millis() - g_bootStartMs > BRIDGE_PROBE_MS) {
+        g_mode = MODE_POWER_SAVING;
+        Serial.println("[mode] -> power_saving (no USB bridge at boot; dashboard can override)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +777,7 @@ static void applyServerCommand(const JsonDocument& doc) {
     else if (!strcmp(sm, "normal"))       want = MODE_NORMAL;
     else if (!strcmp(sm, "power_saving")) want = MODE_POWER_SAVING;
     else return;
+    g_modeFromServer = true;   // explicit dashboard choice — pin it over transport auto-mode
     if (want != g_mode) {
         g_mode = want;   // hardware transition (mic rate, SEN66, heater) runs in loop()
         Serial.printf("[mode] -> %s (server)\n", modeStr(g_mode));
@@ -777,6 +880,34 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
     }
     String body; serializeJson(doc, body);
 
+    // Shared ack bookkeeping: apply the server's reply (time/command/config),
+    // advance the ring cursor, reset the failure escalation.
+    auto acked = [&](const char* via, const String& resp, int code) {
+        JsonDocument rdoc;
+        if (!deserializeJson(rdoc, resp)) {
+            adoptServerTime(resp);
+            applyServerCommand(rdoc);
+            applyServerConfig(rdoc);
+        }
+        ringstore_mark_synced(lastSeq);
+        g_consecutiveSyncFail = 0;
+        g_lastGoodSyncMs      = millis();
+        Serial.printf("%s[sync] %u acked via %s (unsynced now %u)\n",
+                      clockStr().c_str(), n, via, ringstore_unsynced());
+        ledPulse();
+        return code;
+    };
+
+    // USB bridge takes priority over WiFi whenever its heartbeat is alive.
+    if (bridgeUp()) {
+        String resp;
+        int code = bridgePostBatch(body, resp);
+        if (code == 200 || code == 201 || code == 204) return acked("USB bridge", resp, code);
+        g_consecutiveSyncFail++;
+        Serial.printf("[sync] bridge POST failed (code=%d) — records stay buffered\n", code);
+        return code;
+    }
+
     Endpoint eps[3];
     uint8_t nep = buildEndpoints(eps);
     int lastCode = -1;
@@ -787,20 +918,8 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
         if (code == 200 || code == 201 || code == 204) {
             s_serverHost = eps[i].host;   // pin the working endpoint for next time
             s_serverPort = eps[i].port;
-            JsonDocument rdoc;
-            if (!deserializeJson(rdoc, resp)) {
-                adoptServerTime(resp);
-                applyServerCommand(rdoc);
-                applyServerConfig(rdoc);
-            }
-            ringstore_mark_synced(lastSeq);
-            g_consecutiveSyncFail = 0;
-            g_lastGoodSyncMs      = millis();
-            Serial.printf("%s[sync] %u acked via %s:%u (unsynced now %u)\n",
-                          clockStr().c_str(), n, eps[i].host.c_str(), eps[i].port,
-                          ringstore_unsynced());
-            ledPulse();
-            return code;
+            String via = eps[i].host + ":" + String(eps[i].port);
+            return acked(via.c_str(), resp, code);
         }
         lastCode = code;
     }
@@ -814,7 +933,8 @@ static int postBatch(const Record* recs, uint32_t n, uint32_t lastSeq) {
 
 // Drain the ring to the server in batches until empty or a POST fails.
 static void drainRing() {
-    if (WiFi.status() != WL_CONNECTED) return;
+    bool viaBridge = bridgeUp();
+    if (!viaBridge && WiFi.status() != WL_CONNECTED) return;
     Record batch[SYNC_BATCH_MAX];
     for (int guard = 0; guard < 64; ++guard) {
         uint32_t lastSeq = 0;
@@ -822,9 +942,11 @@ static void drainRing() {
         if (n == 0) break;
         int code = postBatch(batch, n, lastSeq);
         // Stop on any non-2xx: >=400 is a server reject, <=0 is a transport failure
-        // (connection refused / not connected). Retrying the same batch in a tight
-        // loop just burns the watchdog budget — the supervisor handles recovery.
-        if (code < 200 || code >= 400 || WiFi.status() != WL_CONNECTED) break;
+        // (connection refused / not connected / bridge ack timeout). Retrying the
+        // same batch in a tight loop just burns the watchdog budget — the
+        // supervisor handles recovery.
+        if (code < 200 || code >= 400) break;
+        if (!viaBridge && WiFi.status() != WL_CONNECTED) break;
         if (ringstore_unsynced() == 0) break;
     }
 }
@@ -835,20 +957,25 @@ static void drainRing() {
 static void syncSession() {
     g_lastSyncAttempt = millis();
 
-    // Escalation step 1: after repeated failures, a plain reconnect isn't enough —
-    // power-cycle the radio to clear a wedged DHCP/TCP stack before trying again.
-    if (g_consecutiveSyncFail >= WIFI_HARD_CYCLE_FAIL) {
-        wifiHardCycle();
-        g_consecutiveSyncFail = 0;   // give the fresh stack a clean slate of attempts
-    }
-
-    if (wifiConnect()) {
-        syncTimeIfNeeded();
-        if (s_serverHost.length() == 0) discoverServer();
+    if (bridgeUp()) {
+        // USB transport: no radio, no NTP (heartbeats carry server time), no mDNS.
         drainRing();
-        // POWER_SAVING: turn the radio back off once drained (outside the boot window,
-        // where we keep it up so dashboard commands still land promptly).
-        if (g_mode == MODE_POWER_SAVING && !inBootWindow()) wifiPowerDown();
+    } else {
+        // Escalation step 1: after repeated failures, a plain reconnect isn't enough —
+        // power-cycle the radio to clear a wedged DHCP/TCP stack before trying again.
+        if (g_consecutiveSyncFail >= WIFI_HARD_CYCLE_FAIL) {
+            wifiHardCycle();
+            g_consecutiveSyncFail = 0;   // give the fresh stack a clean slate of attempts
+        }
+
+        if (wifiConnect()) {
+            syncTimeIfNeeded();
+            if (s_serverHost.length() == 0) discoverServer();
+            drainRing();
+            // POWER_SAVING: turn the radio back off once drained (outside the boot window,
+            // where we keep it up so dashboard commands still land promptly).
+            if (g_mode == MODE_POWER_SAVING && !inBootWindow()) wifiPowerDown();
+        }
     }
 
     // Escalation step 2: if nothing has acked for a long time, reboot. All buffered
@@ -934,6 +1061,7 @@ void setup() {
     pinMode(PIN_GAS_HEATER_EN, OUTPUT);
     digitalWrite(PIN_GAS_HEATER_EN, HIGH);
 
+    Serial.setRxBufferSize(SERIAL_RX_BUF_BYTES);   // bridge acks outgrow the 256 B default
     Serial.begin(115200);
     delay(300);
     g_resetReason = (uint8_t)esp_reset_reason();
@@ -998,9 +1126,12 @@ void loop() {
 
     esp_task_wdt_reset();   // we're alive — defer the watchdog reboot
 
+    serialPoll();           // pick up bridge heartbeats/acks from the USB console
+    transportSupervise();   // bridge appeared/vanished: radio + auto-mode follow
+
     applyModeTransition();  // run hardware side of any pending mode change once
 
-    fanTick();  // FAN_RAMP_TEST_MODE step timing; no-op otherwise
+    fanTick();      // FAN_RAMP_TEST_MODE step timing; no-op otherwise
 
     if (wifiShouldStayOn() && WiFi.status() != WL_CONNECTED) wifiConnect();
     if (WiFi.status() == WL_CONNECTED) { syncTimeIfNeeded();
@@ -1013,7 +1144,8 @@ void loop() {
     // Adaptive storage: densify when the level moves fast, decimate when quiet.
     // quiet_store_ms tracks the server-set poll_interval_ms so the dashboard's
     // cadence knob still governs the quiet baseline. TESTING stores every capture.
-    CadenceParams cp{ NOISE_DENSIFY_DELTA_DBA, DENSIFY_HOLD_MS, g_config.poll_interval_ms };
+    CadenceParams cp{ NOISE_DENSIFY_DELTA_DBA, DENSIFY_HOLD_MS, g_config.poll_interval_ms,
+                      NOISE_DENSIFY_ABS_DBA };
     CadenceDecision cd = cadence_decide(g_cadence, cp, g_fields.has_mic, g_fields.noise_dba, now);
     bool store = (g_mode == MODE_TESTING) ? true : cd.store;
 
@@ -1044,8 +1176,8 @@ void loop() {
             Serial.printf("[rec] ts=%u (ring not ready, discarding)\n", rec.ts);
         }
 
-        // TESTING: push live right after each sample.
-        if (g_mode == MODE_TESTING && WiFi.status() == WL_CONNECTED) drainRing();
+        // TESTING: push live right after each sample (whichever transport is up).
+        if (g_mode == MODE_TESTING && (bridgeUp() || WiFi.status() == WL_CONNECTED)) drainRing();
     }
 
     // --- decide whether to run a sync session ---
@@ -1066,8 +1198,10 @@ void loop() {
     // POWER_SAVING: with the radio off between syncs, light-sleep the inter-capture
     // gap so idle current drops from ~tens of mA to ~mA. Skip while WiFi must stay up
     // (boot window / mid-sync) — light sleep would suspend the modem and stall the
-    // drain. Other modes keep the original tiny busy-delay.
-    if (g_mode == MODE_POWER_SAVING && !wifiShouldStayOn()
+    // drain — and while the USB bridge is up: UART RX is lost during light sleep, so
+    // napping would drop heartbeats and flap the transport. Other modes keep the
+    // original tiny busy-delay.
+    if (g_mode == MODE_POWER_SAVING && !wifiShouldStayOn() && !bridgeUp()
         && WiFi.status() != WL_CONNECTED && POWER_SAVE_CAPTURE_GAP_MS > 0) {
         powerNap(POWER_SAVE_CAPTURE_GAP_MS);
     } else {

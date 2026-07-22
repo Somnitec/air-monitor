@@ -178,6 +178,10 @@ void record_to_json(const Record& r, JsonDocument& doc, bool full_slow) {
     doc["dev"]   = DEVICE_ID;
     doc["up_ms"] = f.up_ms;
     doc["boot"]  = f.boot;
+    // Raw per-group status word (2 bits/group, RecGroup order). Without it the server
+    // can't tell FS_ABSENT from FS_UNCHANGED — both omit their keys — and forward-fills
+    // a dead sensor's last values forever (the overnight-stale-SEN66 incident).
+    doc["st2"]   = r.status2;
 
     // Slow channel: delta-encoded. FS_OK emits values; FS_UNCHANGED & FS_ABSENT omit
     // the keys (the server carries the last value forward / leaves them absent);

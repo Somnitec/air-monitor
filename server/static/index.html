@@ -119,7 +119,9 @@
     font-size:11px; line-height:1.5; color:var(--fg); box-shadow:0 2px 10px rgba(0,0,0,.5); }
   #sideInfo b { color:var(--accent); }
   #sideInfo .si-close { float:right; color:var(--mut); cursor:pointer; pointer-events:auto; margin-left:8px; }
-  #acmap { height:360px; flex:2 1 360px; min-width:260px; background:#0e1117; }
+  /* isolate: Leaflet's internal panes go up to z-index 700+ (plane markers +1000),
+     which otherwise paint over the sticky header/badges (z-index 30) when scrolling */
+  #acmap { height:360px; flex:2 1 360px; min-width:260px; background:#0e1117; isolation:isolate; }
   /* research panel */
   #researchHead { cursor:pointer; }
   #researchChev { margin-left:auto; color:var(--mut); transition:transform .2s; }
@@ -222,6 +224,10 @@
   .airbadges.stale .airbadge { background:transparent; color:var(--mut);
     outline:1.5px dashed #566078; outline-offset:-1.5px; animation:none; }
   @keyframes co2pulse { 0%,100%{ filter:brightness(1); } 50%{ filter:brightness(1.25); } }
+  /* "Xm ago" readout beside the badges — how fresh the values are. Goes amber when the
+     link is stale (matches the badges hollowing out). */
+  .dataage { font-size:11px; font-weight:600; color:var(--mut); white-space:nowrap; }
+  .dataage.stale { color:#ffce6b; }
   /* Rich hover card for the badges — a native title is too cramped to explain how a
      sensor works and how to read it. One shared fixed panel, placed under the badge. */
   #airTip { position:fixed; z-index:40; max-width:380px; background:#171a21; border:1px solid #2c3243;
@@ -266,6 +272,7 @@
   <span class="pill"><span id="livedot" class="dot"></span><span id="livetxt" class="hide-sm">connecting…</span></span>
   <span id="batwarn" class="airbadge sev-bad">🔋 Battery low</span>
   <span id="airBadges" class="airbadges"></span>
+  <span id="dataAge" class="dataage" title="Time since the station's last reading"></span>
   <span class="grow"></span>
   <span class="pill hide-sm" id="stats"></span>
 </header>
@@ -491,11 +498,65 @@ const WEATHER_META = {
   wind_direction_10m:   { g:'Wind', n:'Wind dir', a:2 },
   pm10:                 { g:'Particulates', n:'Public PM10' },
   pm2_5:                { g:'Particulates', n:'Public PM2.5' },
+  // Sensornet Amstelveen municipal noise posts, on our noise chart for live
+  // cross-checking. CC = Catharina van Clevepark, 1.16 km due W on the flight
+  // path (same latitude as us); JA = Jeanne d'Arclaan, 0.62 km S.
+  laeq_cc:              { g:'Noise & Vibration', n:'CC LAeq' },
+  lamax_cc:             { g:'Noise & Vibration', n:'CC LAmax' },
+  laeq_ja:              { g:'Noise & Vibration', n:'JA LAeq' },
+  lamax_ja:             { g:'Noise & Vibration', n:'JA LAmax' },
   european_aqi:         { g:'Air Quality Index', n:'EU AQI' },
   no2:                  { g:'Air Quality Index', n:'NO₂' },
   o3:                   { g:'Air Quality Index', n:'O₃' },
   uv_index:             { g:'Air Quality Index', n:'UV index', a:2 },
 };
+
+// Reference noise posts drawn on the aircraft map. `key` links a post to its
+// weather-payload metrics (laeq_<key>/lamax_<key>); posts without a key have no
+// public live feed and get a static tooltip.
+const NOISE_POSTS = [
+  { key:'cc', name:'Sensornet CC — Catharina van Clevepark', sub:'municipal post UT035 · 1.16 km W, on the flight path',
+    lat:52.32012, lon:4.86243, color:'#2ecc71' },
+  { key:'ja', name:'Sensornet JA — Jeanne d\'Arclaan', sub:'municipal post UT005 · 0.62 km S',
+    lat:52.31453, lon:4.88026, color:'#2ecc71' },
+  { key:null, name:'NOMOS — Zwaansvliet', sub:'Schiphol official post · 1.1 km NW · no public live feed (events: nomos.schiphol.nl)',
+    lat:52.32559, lon:4.86595, color:'#ffce6b' },
+];
+// Home marker hover: our own station's latest noise readings, same shape as the
+// reference posts' tooltips so the map reads as one comparable set of mics.
+function _homeTip() {
+  for (let i = dataCache.length - 1; i >= 0; i--) {
+    const r = dataCache[i];
+    if (r.noise_dba != null) {
+      const age = Math.round((Date.now()/1000 - r.ts) / 60);
+      const lcla = (r.lc_minus_la != null) ? ` · LC−LA <b>${r.lc_minus_la.toFixed(1)}</b>` : '';
+      return `<b>Home — air monitor</b><br><span style="opacity:.8">INMP441 · uncalibrated</span>` +
+             `<br>LAeq <b>${r.noise_dba.toFixed(1)}</b> dB(A)` +
+             (r.lamax != null ? ` · LAmax <b>${r.lamax.toFixed(1)}</b>` : '') + lcla +
+             ` <span style="opacity:.7">(${age < 1 ? '<1' : age} min ago)</span>`;
+    }
+  }
+  return `<b>Home — air monitor</b><br><span style="opacity:.7">no data yet</span>`;
+}
+
+function _noisePostTip(p) {
+  let live = '';
+  if (p.key) {
+    for (let i = weatherCache.length - 1; i >= 0; i--) {
+      const r = weatherCache[i];
+      if (r['laeq_' + p.key] != null) {
+        const age = Math.round((Date.now()/1000 - r.valid_ts) / 60);
+        const lam = r['lamax_' + p.key];
+        live = `<br>LAeq <b>${r['laeq_' + p.key].toFixed(1)}</b> dB(A)` +
+               (lam != null ? ` · LAmax <b>${lam.toFixed(1)}</b>` : '') +
+               ` <span style="opacity:.7">(${age} min ago)</span>`;
+        break;
+      }
+    }
+    if (!live) live = '<br><span style="opacity:.7">no data yet</span>';
+  }
+  return `<b>${p.name}</b><br><span style="opacity:.8">${p.sub}</span>${live}`;
+}
 
 // Units per metric — appended to the legend value, e.g. "CO₂ = 1020 ppm".
 const UNITS = {
@@ -511,6 +572,7 @@ const UNITS = {
   precipitation:'mm', rain:'mm', rain_live:'mm', cloud_cover:'%', shortwave_radiation:'W/m²',
   global_radiation:'W/m²', direct_radiation:'W/m²', wind_speed_10m:'m/s', wind_gusts_10m:'m/s',
   wind_direction_10m:'°', european_aqi:'', no2:'µg/m³', o3:'µg/m³', uv_index:'',
+  laeq_cc:'dB(A)', lamax_cc:'dB(A)', laeq_ja:'dB(A)', lamax_ja:'dB(A)',
 };
 // Which physical sensor produces each metric (shown in the hover explanation).
 const METRIC_SENSOR = {
@@ -532,6 +594,10 @@ const METRIC_SENSOR = {
   wind_speed_10m:'outdoor weather feed', wind_direction_10m:'outdoor weather feed',
   precipitation:'outdoor weather feed', european_aqi:'outdoor air-quality feed',
   pm2_5:'outdoor air-quality feed', no2:'outdoor air-quality feed', o3:'outdoor air-quality feed',
+  laeq_cc:'Sensornet post UT035, Catharina van Clevepark (1.16 km W, on-path)',
+  lamax_cc:'Sensornet post UT035, Catharina van Clevepark (1.16 km W, on-path)',
+  laeq_ja:'Sensornet post UT005, Jeanne d\'Arclaan (0.62 km S)',
+  lamax_ja:'Sensornet post UT005, Jeanne d\'Arclaan (0.62 km S)',
 };
 // How each metric relates to health / comfort norms.
 const METRIC_NORM = {
@@ -547,6 +613,10 @@ const METRIC_NORM = {
   lux:'dark <1 · dim room 50–200 · office 300–500 · daylight >1000',
   noise_dba:'WHO night <40 dB(A); >65 annoying; >85 hearing risk', lamax:'peak level; NL counts events >65/>70 dB(A)',
   lceq:'C-weighted; LC−LA >6 dB flags low-frequency (aircraft) noise',
+  laeq_cc:'municipal reference mic; same flights pass here seconds apart — compare against our LAeq for calibration',
+  lamax_cc:'municipal reference LAmax (1-min bucket max of 5 s samples)',
+  laeq_ja:'municipal reference mic 0.62 km south of us',
+  lamax_ja:'municipal reference LAmax (1-min bucket max of 5 s samples)',
   co_ppm:'CO estimate (qualitative; ±order-of-magnitude); outdoor <10 ppm, smoky >50 ppm', hcho_ppm:'HCHO estimate (qualitative); WHO 30-min limit 0.08 ppm; off-gassing from furniture',
   co_mv:'higher mV = more CO; ventilate if rising fast', hcho_mv:'formaldehyde proxy; off-gassing from furniture/paint',
   soil_pct:'0% dry → 100% saturated', bat_v:'Li-ion 3.0 empty → 4.2 full', bat_pct:'charge remaining',
@@ -610,14 +680,19 @@ const METRIC_DESC = {
 };
 
 // Latest numeric value for a metric (sensor: newest non-null in dataCache;
-// weather: from the merged latest, falling back to the cache).
+// weather: from the merged latest, falling back to the cache). A sensor value
+// older than the sensor-staleness window (vs the newest data) returns null —
+// a dead sensor's last reading must not keep showing as "the current value".
 function _latestValue(m, isWeather) {
   if (isWeather) {
     if (_weatherLatest[m] != null) return _weatherLatest[m];
     for (let i = weatherCache.length - 1; i >= 0; i--) if (weatherCache[i][m] != null) return weatherCache[i][m];
     return null;
   }
-  for (let i = dataCache.length - 1; i >= 0; i--) if (dataCache[i][m] != null) return dataCache[i][m];
+  for (let i = dataCache.length - 1; i >= 0; i--) {
+    const r = dataCache[i];
+    if (r[m] != null) return (newestDataTs() - r.ts <= sensorStaleS()) ? r[m] : null;
+  }
   return null;
 }
 
@@ -756,10 +831,36 @@ function render() {
       const cache = isWeather ? weatherCache : dataCache;
       const tsKey = isWeather ? 'valid_ts' : 'ts';
       const color = colorOf(i);
-      // Keep only real (non-null) samples so the line connects them — fixes public
-      // weather showing isolated dots (rows interleave sources with null fields).
       const xs = [], ys = [];
-      for (const r of cache) { const v = r[m]; if (v != null) { xs.push(r[tsKey]*1000); ys.push(v); } }
+      if (isWeather) {
+        // Keep only real (non-null) samples so the line connects them — fixes public
+        // weather showing isolated dots (rows interleave sources with null fields).
+        for (const r of cache) { const v = r[m]; if (v != null) { xs.push(r[tsKey]*1000); ys.push(v); } }
+      } else {
+        // Sparse delta storage: a MISSING key = not re-read that record (connect the
+        // line through); an explicit NULL = a real gap — failed/absent sensor — so
+        // break the line (NaN survives min/max decimation as a gap, null wouldn't).
+        for (const r of cache) {
+          if (!(m in r)) continue;
+          const v = r[m];
+          if (v == null) {
+            if (ys.length && !Number.isNaN(ys[ys.length - 1])) { xs.push(r.ts*1000); ys.push(NaN); }
+          } else { xs.push(r.ts*1000); ys.push(v); }
+        }
+        // Far-right "carried" dot: with sparse storage a slow trace's newest point can
+        // sit minutes left of the axis edge (or out of a narrow window entirely).
+        // Float the last live value at now — detached by a NaN so no line is drawn —
+        // but only while the sensor (and station) are actually alive, so a dead
+        // sensor's value is never resurrected to the present.
+        const nLast = ys.length - 1;
+        if (nLast >= 0 && !Number.isNaN(ys[nLast]) && !stationStale()) {
+          const lastMs = xs[nLast], lastV = ys[nLast], nowMs = xNow.getTime();
+          if (nowMs - lastMs > 30000 && nowMs - lastMs < sensorStaleS() * 1000) {
+            xs.push(lastMs + 1); ys.push(NaN);
+            xs.push(nowMs);      ys.push(lastV);
+          }
+        }
+      }
       const dec = _decimate(xs, ys, MAX_TRACE_POINTS);
       return {
         x: dec.xs.map(t => new Date(t)),
@@ -1238,11 +1339,22 @@ function hideAirTip() { if (_airTipHost) _airTipHost.style.display = 'none'; _ai
 // stale once the silence is ≳3× the station's own send cadence.
 let _stationLastSeen = 0;                          // unix s, newest evidence of life
 let _stationMode = null, _stationPollMs = null;    // for the expected cadence
+let _stationSlowMs = null;                         // slow-channel re-read interval
 function noteStationSeen(st) {
   if (!st) return;
   if (st.last_seen) _stationLastSeen = Math.max(_stationLastSeen, st.last_seen);
   if (st.mode) _stationMode = st.mode;
   if (st.poll_interval_ms) _stationPollMs = st.poll_interval_ms;
+  if (st.slow_interval_ms) _stationSlowMs = st.slow_interval_ms;
+}
+// Per-SENSOR staleness (vs the station-level stationStale() above): a slow value
+// older than this against the newest data is "sensor down", not "current value".
+// 3× the slow re-read interval absorbs a couple of missed reads; the 10-min floor
+// covers POWER_SAVING's sparse syncs.
+function sensorStaleS() { return Math.max(3 * ((_stationSlowMs || 180000) / 1000), 600); }
+function newestDataTs() {
+  if (dataCache.length) return dataCache[dataCache.length - 1].ts;
+  return _dbTail.length ? _dbTail[_dbTail.length - 1].ts : 0;
 }
 function stationSilentMs() { return _stationLastSeen ? Date.now() - _stationLastSeen * 1000 : 0; }
 function stationStale() {
@@ -1282,10 +1394,26 @@ async function loadDbTail() {
 function updateAirBadges() {
   const host = $('#airBadges'); if (!host) return;
   host.classList.toggle('stale', stationStale());
+  const age = $('#dataAge');
+  if (age) {
+    const nt = newestDataTs();
+    age.textContent = nt ? `updated ${_fmtAgo(Date.now() - nt * 1000)} ago` : '';
+    age.classList.toggle('stale', stationStale());
+  }
+  // Newest non-null value AND its age. A value older than the sensor-staleness
+  // window is withheld (v:null) but its timestamp is kept for the "silent since"
+  // message — a dead sensor must show as dead, not as its last living value
+  // (the SEN66 read 2.4 µg/m³ all night with a loose wire before this).
+  const newest = newestDataTs(), staleWin = sensorStaleS();
   const latest = (f) => {
-    for (let i = dataCache.length - 1; i >= 0; i--) { if (dataCache[i][f] != null) return dataCache[i][f]; }
-    for (let i = _dbTail.length - 1; i >= 0; i--) { if (_dbTail[i][f] != null) return _dbTail[i][f]; }
-    return null;
+    const scan = (arr) => {
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (arr[i][f] != null)
+          return { v: (newest - arr[i].ts <= staleWin) ? arr[i][f] : null, ts: arr[i].ts };
+      }
+      return null;
+    };
+    return scan(dataCache) || scan(_dbTail);
   };
   for (const spec of AIR_BADGES) {
     let el = host.querySelector(`#badge_${spec.key}`);
@@ -1295,8 +1423,16 @@ function updateAirBadges() {
       el.addEventListener('mouseleave', hideAirTip);
       el.addEventListener('click', e => { e.stopPropagation(); showAirTip(el, spec); });  // touch
     }
-    const r = spec.fn(...spec.fields.map(latest))
-           || { sev:'dead', text:`${spec.key.toUpperCase()} —`, title:'no data yet' };
+    const got = spec.fields.map(latest);
+    const liveVals = got.map(g => g ? g.v : null);
+    let r = liveVals.some(v => v != null) ? spec.fn(...liveVals) : null;
+    if (!r) {
+      const lastTs = Math.max(0, ...got.filter(Boolean).map(g => g.ts));
+      const title = lastTs && newest - lastTs > staleWin
+        ? `sensor down? no reading for ${_fmtAgo((newest - lastTs) * 1000)} while the station kept reporting`
+        : 'no data yet';
+      r = { sev:'dead', text:`${spec.key.toUpperCase()} —`, title };
+    }
     el.className = `airbadge sev-${r.sev}`;
     el.textContent = r.text;
     el._tipline = r.title;
@@ -1707,9 +1843,19 @@ async function initAircraft() {
       ? { maxZoom:18, minNativeZoom:10, maxNativeZoom:14, attribution:'&copy; OpenStreetMap, &copy; CARTO' }
       : { maxZoom:18, attribution:'&copy; OpenStreetMap, &copy; CARTO' }
   ).addTo(acMap);
-  L.circleMarker(acHome, { radius:5, color:'#4ea1ff', fillColor:'#4ea1ff', fillOpacity:1 })
-    .addTo(acMap).bindPopup('Home');
+  L.marker(acHome, { icon: L.divIcon({
+      className:'', iconSize:[22,22], iconAnchor:[11,11],
+      html:'<div style="font-size:18px;line-height:22px;text-align:center;filter:drop-shadow(0 0 2px rgba(0,0,0,.8))">🏠</div>' }) })
+    .addTo(acMap).bindTooltip(() => _homeTip(), { direction:'top', sticky:true });
   acRing = L.circle(acHome, { radius: acRange*1000, color:'#4ea1ff', weight:1, fill:false, dashArray:'4 4' }).addTo(acMap);
+
+  // Reference noise posts (municipal Sensornet + Schiphol NOMOS). Tooltip content is
+  // built at hover time from weatherCache, so it always shows the latest polled value.
+  NOISE_POSTS.forEach(p => {
+    L.circleMarker([p.lat, p.lon], {
+      radius:6, color:p.color, fillColor:p.color, fillOpacity:0.55, weight:2,
+    }).addTo(acMap).bindTooltip(() => _noisePostTip(p), { direction:'top', sticky:true });
+  });
 
   // Weather overlay control — content filled by renderWeather()
   const WeatherCtrl = L.Control.extend({

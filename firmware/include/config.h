@@ -133,7 +133,7 @@
 // Fan control (ventilation experiment — extraction fan in the south floor
 // vent hole). 4-wire PC/server fan: PWM drives speed. Tach (green) unwired.
 // =========================================================================
-#define PIN_FAN_PWM             14   // blue wire. GPIO14 is not a strapping pin.
+#define PIN_FAN_PWM             19   // blue wire. GPIO19 is not a strapping pin.
 #define FAN_PWM_FREQ_HZ       25000  // standard 4-wire fan PWM spec (Intel)
 #define FAN_PWM_RESOLUTION_BITS   8  // 0-255 duty steps; plenty at 25 kHz
 
@@ -160,10 +160,18 @@
 // tight (700-800) so it goes full force well before CO2 drifts up toward
 // where it was hanging (~900) -- widen the gap if full force triggers too
 // eagerly/too often once you're actually sleeping.
-#define FAN_CO2_FLOOR_PPM        700
-#define FAN_CO2_CEILING_PPM      900
+#define FAN_CO2_FLOOR_PPM        600
+#define FAN_CO2_CEILING_PPM      1000
 #define FAN_DUTY_FLOOR_PCT     20.0f
 #define FAN_DUTY_CEILING_PCT   100.0f
+
+// Each new CO2-driven target is reached via an LEDC hardware fade over this
+// many ms: the peripheral walks every intermediate PWM count itself, so the
+// ramp is as smooth as the duty resolution allows and independent of loop()
+// cadence (the old software slew ticked once per ~1.3s mic capture — audible
+// stair-steps). Keep it shorter than slow_interval_ms: starting a fade while
+// one is still running blocks in the IDF fade lock until the old one ends.
+#define FAN_DUTY_GLIDE_MS     9000
 
 // =========================================================================
 // Sample cadence (ms) — tune later, these are reasonable defaults.
@@ -261,6 +269,11 @@
 #define POWER_SAVE_SLOW_INTERVAL_MS (60UL * 1000UL)           // slow sensors re-read every 1 min on battery
 #define NOISE_DENSIFY_DELTA_DBA   6.0f                        // |Δ LAeq| between captures that arms densify
 #define DENSIFY_HOLD_MS           (30UL * 1000UL)             // densified window length after each trigger
+// Absolute trigger: LAeq at/above this stores every capture. The delta test alone
+// missed flyovers entirely (they ramp ~0.5 dB per 1.3 s capture — measured 2026-07-14:
+// median close flyover stored 9 records in 90 s, i.e. pure baseline). 50 dB(A) sits
+// well above outdoor ambient here (~36 median) and below flyover plateaus (55–70).
+#define NOISE_DENSIFY_ABS_DBA     50.0f
 
 // --- POWER_SAVING mode (battery operation) ---------------------------------
 // A third operating mode alongside NORMAL/TESTING, selected from the dashboard and
@@ -306,6 +319,22 @@
 // reads; before each read it is restarted and given this long to spin up + stabilise
 // the PM measurement. Datasheet warm-up for stable PM is several seconds.
 #define SEN66_WARMUP_MS       (10UL * 1000UL)
+
+// --- USB serial bridge (sync over USB instead of WiFi) -----------------------
+// When a host bridge (server/usb_bridge.py) is heartbeating on the USB serial
+// console, the station syncs its batches over serial ("#SYNC# <json>" lines, acked
+// by the bridge) and keeps the WiFi radio OFF entirely. No heartbeat => assume an
+// unattended battery/standalone deployment: auto POWER_SAVING, radio duty-cycled
+// up every POWER_SAVE_SYNC_INTERVAL_MS. A dashboard set_mode overrides the auto
+// choice until the next reboot.
+// Timeout note: in POWER_SAVING the loop light-sleeps ~5 s between captures and
+// UART RX is lost during light sleep, so the timeout must span several loop
+// iterations of 2-second heartbeats only partially landing.
+#define BRIDGE_HEARTBEAT_EVERY_MS (2UL * 1000UL)   // host side (documentation only)
+#define BRIDGE_TIMEOUT_MS         (20UL * 1000UL)  // heartbeat silence -> bridge gone
+#define BRIDGE_REPLY_TIMEOUT_MS   (6UL * 1000UL)   // wait for the host ack per batch
+#define BRIDGE_PROBE_MS           (15UL * 1000UL)  // boot grace before "no bridge" verdict
+#define SERIAL_RX_BUF_BYTES       2048             // ack lines exceed the 256 B default
 
 // --- Time ---
 #define NTP_SERVER_1         "pool.ntp.org"

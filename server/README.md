@@ -154,6 +154,47 @@ Put those `xset` lines in `~/.xprofile` (or the autostart) so they apply on logi
 If a tap doesn't wake it, your panel may need `xserver-xorg-input-libinput` and a
 quick check that the touch device shows up in `xinput list`.
 
+## Syncing over USB (preferred when the station is plugged into the server)
+
+If the station is connected by USB, it doesn't need WiFi at all: `usb_bridge.py`
+sits on the serial port, heartbeats every ~2 s, and relays the firmware's
+`#SYNC# <json>` batch lines to `POST /ingest` (the reply — including
+`server_time`, so no NTP needed — goes back over the same wire). While the
+firmware hears the heartbeat it keeps its **WiFi radio off entirely**.
+
+If the heartbeat goes silent for ~20 s (cable pulled, bridge stopped) — or never
+appears within ~15 s of boot — the station assumes it's running unattended:
+it switches itself to **power-saving mode** and tries WiFi every ~5 min instead.
+Plug the USB back in (with the bridge running) and it returns to normal mode with
+the radio off. A mode set from the dashboard overrides this automatic choice
+until the next reboot.
+
+Run it as a systemd user service so it's always on (unit file in this directory):
+
+```bash
+cp air-monitor-bridge.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now air-monitor-bridge
+loginctl enable-linger $USER          # if not already done for air-monitor
+```
+
+Or one-off in a terminal: `./.venv/bin/python usb_bridge.py`
+(`--port /dev/ttyUSB0 --server http://127.0.0.1:8000` to override the defaults).
+
+Things to know:
+
+- **The bridge IS the serial monitor.** It echoes every normal firmware log line,
+  so `journalctl --user -u air-monitor-bridge -f` shows the station's live output.
+  Don't open `pio device monitor` while the service runs — the port is exclusive,
+  and whichever loses it breaks (the station falls back to power-saving ~20 s
+  after its heartbeats stop).
+- **Flashing still works.** `pio run -e esp32_phase1 -t upload` pauses the service
+  automatically (`firmware/pause_bridge_on_upload.py` stops it before esptool
+  opens the port and restarts it after; a dead-man timer restarts it within
+  ~3 min even if the upload crashes mid-way).
+- If records stop arriving, check `systemctl --user status air-monitor-bridge`
+  first — a dead bridge looks like a station that went quiet.
+
 ## How the ESP32 finds this server (no static IP needed)
 
 The server advertises itself on the LAN over **mDNS/zeroconf** as

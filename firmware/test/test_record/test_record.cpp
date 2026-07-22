@@ -240,6 +240,20 @@ void test_to_json_omits_absent_sensor_keys() {
     TEST_ASSERT_FALSE(doc["noise_bands"].is<JsonArray>());
 }
 
+// st2 rides every record so the server can tell FS_ABSENT (sensor gone — don't
+// forward-fill) from FS_UNCHANGED (carry forward). Both omit their value keys.
+void test_to_json_emits_status_word() {
+    RecordFields in = sample();
+    in.status[GRP_SEN66] = FS_ABSENT;      // e.g. failed the boot probe (loose wire)
+    in.status[GRP_BME]   = FS_UNCHANGED;
+    Record r = record_pack(in);
+    JsonDocument doc; record_to_json(r, doc);
+    TEST_ASSERT_TRUE(doc["st2"].is<uint32_t>());
+    uint32_t st2 = doc["st2"].as<uint32_t>();
+    TEST_ASSERT_EQUAL_UINT8(FS_ABSENT,    (st2 >> (2 * GRP_SEN66)) & 0x3);
+    TEST_ASSERT_EQUAL_UINT8(FS_UNCHANGED, (st2 >> (2 * GRP_BME))   & 0x3);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_size_is_102);
@@ -258,5 +272,6 @@ int main(int, char**) {
     RUN_TEST(test_to_json_has_expected_keys_and_derived);
     RUN_TEST(test_to_json_lc_minus_la_value);
     RUN_TEST(test_to_json_omits_absent_sensor_keys);
+    RUN_TEST(test_to_json_emits_status_word);
     return UNITY_END();
 }

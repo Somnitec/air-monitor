@@ -22,6 +22,9 @@ WEATHER_METRIC_COLS = [
     "pressure_msl", "precipitation", "rain", "cloud_cover", "shortwave_radiation",
     "wind_speed_10m", "wind_gusts_10m", "wind_direction_10m",
     "pm10", "pm2_5", "european_aqi", "no2", "o3", "uv_index",
+    # Sensornet Amstelveen noise posts (1-min downsample; keys namespaced per post
+    # because the dashboard flattens all weather rows into one series per key)
+    "laeq_cc", "lamax_cc", "laeq_ja", "lamax_ja",
 ]
 
 

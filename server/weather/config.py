@@ -14,6 +14,7 @@ from .base import Provider
 from .open_meteo import OpenMeteoWeather, OpenMeteoAirQuality
 from .luchtmeetnet import Luchtmeetnet
 from .sensor_community import SensorCommunity
+from .sensornet import Sensornet
 from .knmi import Knmi
 from .netatmo import Netatmo
 from .wu import WeatherUnderground
@@ -44,6 +45,11 @@ def settings() -> dict:
         "radius_km": _f("WEATHER_RADIUS_KM", 10.0),
         "poll_sec": int(os.environ.get("WEATHER_POLL_SEC", 600)),
         "enabled": os.environ.get("WEATHER_ENABLED", "1") not in ("0", "false", "False", "no"),
+        # Gap backfill (ERA5 archive). Default cap raised for offline deployments that
+        # can be down for days — a run may be internet-less for a while, then catch up.
+        # NB: ERA5 archive lags ~5 days, so the most-recent tail of a long gap fills late.
+        "backfill_max_days": int(os.environ.get("WEATHER_BACKFILL_MAX_DAYS", 45)),
+        "backfill_threshold_s": int(os.environ.get("WEATHER_BACKFILL_THRESHOLD_S", 7200)),
     }
 
 
@@ -55,6 +61,7 @@ def build_providers() -> list[Provider]:
         OpenMeteoAirQuality(lat, lon),
         Luchtmeetnet(lat, lon, radius),
         SensorCommunity(lat, lon, radius),
+        Sensornet(lat, lon),   # Amstelveen municipal noise posts; self-disables >15 km away
     ]
     if os.environ.get("KNMI_API_KEY"):
         providers.append(Knmi(os.environ["KNMI_API_KEY"], lat, lon))
@@ -86,4 +93,5 @@ UNITS = {
     "sulphur_dioxide": "µg/m³", "so2": "µg/m³", "ozone": "µg/m³", "o3": "µg/m³",
     "aerosol_optical_depth": "", "dust": "µg/m³", "uv_index": "", "uv": "",
     "european_aqi": "EAQI",
+    "laeq_cc": "dB(A)", "lamax_cc": "dB(A)", "laeq_ja": "dB(A)", "lamax_ja": "dB(A)",
 }

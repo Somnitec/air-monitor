@@ -59,6 +59,7 @@ AIRMON_DB=:memory: ./.venv/bin/python -m pytest tests/test_aircraft_base.py::Tes
 ./.venv/bin/python server.py                                   # run server + dashboard on :8000
 AIRMON_DB=/media/usb/air-monitor.db ./.venv/bin/python server.py  # db on a USB stick
 python simulate.py --backfill 24                               # fake data, no hardware
+./.venv/bin/python usb_bridge.py                               # sync the station over USB (radio off)
 ```
 
 `esp32_phase1` is the real firmware; `esp32_tester` / `esp32_sensor_test` are bring-up
@@ -73,6 +74,29 @@ survives reboots. It flushes batches to the server `POST /ingest`. NORMAL mode s
 ~10 s; TESTING mode streams after every sample. The server pushes a `config`/`command` back
 in each `/ingest` reply — that's how the dashboard changes `poll_interval_ms` and flips
 NORMAL/TESTING (no separate control channel).
+
+**Transport: USB bridge preferred, WiFi fallback.** `server/usb_bridge.py` heartbeats on
+the serial console; while the firmware hears it, batches go out as `#SYNC# <json>` lines
+(acked with the relayed `/ingest` reply, which also carries `server_time` — no NTP needed)
+and the WiFi radio stays **off**. No heartbeat for ~20 s (or none within ~15 s of boot) →
+the station assumes an unattended deployment: auto-`POWER_SAVING`, radio duty-cycled up per
+sync. A dashboard `set_mode` pins the mode over this auto-choice until reboot. The bridge
+echoes all non-`#SYNC#` output, so it doubles as `pio device monitor` (the port is
+exclusive — you can't run both). It runs as the `air-monitor-bridge` systemd user service
+(unit in `server/`, live firmware log via `journalctl --user -u air-monitor-bridge -f`);
+serial `pio ... -t upload` still works because `firmware/pause_bridge_on_upload.py`
+(an `extra_scripts` hook) stops the unit before esptool takes the port and restarts it
+after, with a ~3-min dead-man timer if the upload dies mid-way.
+
+**Storage is sparse (delta); each record carries `st2`.** A slow-channel metric lands in
+the DB only when the device actually re-read it (`slow_interval_ms`, ~3 min); in-between
+records omit those keys entirely — the dashboard connects the sparse points. `st2` is the
+firmware's raw per-group status word (2 bits/group, `record.h` `RecGroup` order):
+`FS_UNCHANGED` values on the wire are batch-seed re-transmissions and get stripped before
+storage; `FS_INVALID` arrives as explicit JSON `null` (a real gap → NULL column, line
+break in charts); `FS_ABSENT` (sensor failed its boot probe — the loose-wire incident)
+writes one null at the transition and then stays silent, so a dead sensor can never be
+forward-filled into looking alive. Data before 2026-07-14 is dense (pre-cutover fill).
 
 **Timestamps are reconstructed server-side (critical).** The ESP32 clock is unreliable, so
 device timestamps are often wrong (seen as far-past dates). `server.py` derives an

@@ -3,10 +3,13 @@
 
 CadenceDecision cadence_decide(CadenceState& st, const CadenceParams& p,
                                bool has_noise, float noise_dba, uint32_t now_ms) {
-    // Arm densification when the level moves faster than the threshold between two
-    // captures. Onset *and* decay of a flyover both produce a large delta, and the
-    // hold window bridges the loud plateau in between.
-    if (has_noise && st.have_last && fabsf(noise_dba - st.last_noise) >= p.densify_delta_dba) {
+    // Arm densification on either trigger:
+    //  - delta: the level moved fast between two captures (impulsive onset/decay);
+    //  - absolute: the level is simply loud (a flyover ramps too slowly per-capture
+    //    to ever trip the delta). Each loud capture re-arms, so the hold window
+    //    rides through the plateau and covers the decay tail after it drops.
+    if (has_noise && ((st.have_last && fabsf(noise_dba - st.last_noise) >= p.densify_delta_dba)
+                      || noise_dba >= p.densify_abs_dba)) {
         st.densify_until_ms = now_ms + p.densify_hold_ms;
     }
     const bool densified = (int32_t)(st.densify_until_ms - now_ms) > 0;

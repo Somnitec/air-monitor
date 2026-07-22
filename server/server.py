@@ -553,12 +553,12 @@ hub = Hub()
 DEVICE_STATE: dict[str, dict] = {}     # dev -> {mode,last_seen,buffered,boot,fw}
 PENDING_CMD: dict[str, str] = {}       # dev -> "testing" | "normal"
 
-# Delta-sync forward-fill (firmware Phase 3). The device sends slow-channel values
-# only when freshly read; in between it OMITS those keys (carry the last value
-# forward) and on a failed read it sends an explicit null (a real gap — keep it).
-# We reconstruct full payloads here so the generated metric columns stay populated.
-# Cache is per-device and per-process: after a server restart it's cold, so a few
-# minutes of slow-channel NULLs are expected until the next fresh read repopulates it.
+# Delta-sync decoding (firmware Phase 3). The device sends slow-channel values only
+# when freshly read; in between it OMITS those keys and on a failed read it sends an
+# explicit null (a real gap). Storage stays SPARSE — a slow metric lands in the DB
+# only when the device actually measured it (charts connect the sparse points). The
+# per-device cache below no longer back-fills payloads; it feeds the ingest headline
+# log, the health scan, and the batch-seed stripping in _delta_decode.
 SLOW_FILL_KEYS: tuple[str, ...] = (
     "pm1", "pm25", "pm4", "pm10", "co2", "voc", "nox", "temp", "rh",   # SEN66
     "pc05", "pc1", "pc25", "pc4", "pc10", "voc_raw", "nox_raw",        # SEN66 v4 extras
@@ -570,6 +570,35 @@ SLOW_FILL_KEYS: tuple[str, ...] = (
 )
 _LAST_VALUES: dict[str, dict[str, Any]] = {}   # dev -> {key: last good value}
 
+# Records also carry `st2`: the firmware's raw per-group status word (2 bits per
+# group, record.h RecGroup order). It disambiguates the two cases that both omit
+# their keys: FS_UNCHANGED (carry the last value forward) vs FS_ABSENT (sensor not
+# present this boot — e.g. a loose wire failed the boot probe — a real gap, do NOT
+# fill). Before st2, an absent SEN66 was forward-filled all night as if alive.
+FS_ABSENT, FS_OK, FS_UNCHANGED, FS_INVALID = 0, 1, 2, 3
+SLOW_GROUP_KEYS: dict[int, tuple[str, ...]] = {
+    0: ("pm1", "pm25", "pm4", "pm10", "co2", "voc", "nox", "temp", "rh",
+        "pc05", "pc1", "pc25", "pc4", "pc10", "voc_raw", "nox_raw"),   # GRP_SEN66
+    1: ("lux",),                                                       # GRP_BH1750
+    2: ("pressure_hpa", "bme_temp", "bme_rh"),                         # GRP_BME
+    4: ("co_mv", "co_rs"),                                             # GRP_CO
+    5: ("hcho_mv", "hcho_rs"),                                         # GRP_HCHO
+    6: ("soil_mv", "soil_pct"),                                        # GRP_SOIL
+    7: ("bat_raw_mv", "bat_cal", "bat_v", "bat_pct"),                  # GRP_BATTERY
+}
+
+
+def _keys_with_status(st2: Any, status: int) -> frozenset[str]:
+    """Slow-channel keys whose sensor group reports `status` in a record's st2 word.
+    Empty for legacy records without st2 (pre-v5 firmware)."""
+    if not isinstance(st2, int):
+        return frozenset()
+    hit: set[str] = set()
+    for g, keys in SLOW_GROUP_KEYS.items():
+        if (st2 >> (2 * g)) & 0x3 == status:
+            hit.update(keys)
+    return frozenset(hit)
+
 
 # --------------------------------------------------------------------------- #
 # Ingest logging + sensor-health warnings. Prints a one-line snapshot of every
@@ -579,19 +608,20 @@ _LAST_VALUES: dict[str, dict[str, Any]] = {}   # dev -> {key: last good value}
 # --------------------------------------------------------------------------- #
 LOG_INGEST = os.environ.get("AIRMON_LOG_INGEST", "1") not in ("0", "false", "no", "")
 
-# (label, representative key, channel). "fast" keys (mic/accel) are captured every
-# record, so their ABSENCE is a failed read; "slow" keys are delta-encoded, so
-# absence just means carried-forward (normal) and only an explicit null is a failure.
-_HEALTH_SENSORS: tuple[tuple[str, str, str], ...] = (
-    ("mic",     "noise_dba",    "fast"),
-    ("accel",   "rumble",       "fast"),
-    ("SEN66",   "pm25",         "slow"),
-    ("BME280",  "pressure_hpa", "slow"),
-    ("BH1750",  "lux",          "slow"),
-    ("CO",      "co_mv",        "slow"),
-    ("HCHO",    "hcho_mv",      "slow"),
-    ("soil",    "soil_mv",      "slow"),
-    ("battery", "bat_raw_mv",   "slow"),
+# (label, representative key, channel, st2 group). "fast" keys (mic/accel) are
+# captured every record, so their ABSENCE is a failed read; "slow" keys are
+# delta-encoded, so a missing key means carried-forward (normal) — a failure is an
+# explicit null OR the record's st2 word marking the group FS_ABSENT.
+_HEALTH_SENSORS: tuple[tuple[str, str, str, int], ...] = (
+    ("mic",     "noise_dba",    "fast", 8),
+    ("accel",   "rumble",       "fast", 3),
+    ("SEN66",   "pm25",         "slow", 0),
+    ("BME280",  "pressure_hpa", "slow", 2),
+    ("BH1750",  "lux",          "slow", 1),
+    ("CO",      "co_mv",        "slow", 4),
+    ("HCHO",    "hcho_mv",      "slow", 5),
+    ("soil",    "soil_mv",      "slow", 6),
+    ("battery", "bat_raw_mv",   "slow", 7),
 )
 _HEALTH_WARN_AT: dict[tuple, int] = {}   # (dev,label) -> last warn epoch (rate-limit)
 _HEALTH_WARN_EVERY_S = 120               # re-warn a still-broken sensor at most this often
@@ -602,39 +632,51 @@ def _is_num(v: Any) -> bool:
 
 
 def _scan_health(dev: Any, records: list, now: int) -> list[str]:
-    """Inspect RAW records (call BEFORE _forward_fill) and return warning strings for
+    """Inspect RAW records (call BEFORE _delta_decode) and return warning strings for
     sensors that are malfunctioning in this batch. A sensor counts as failing when it
-    sends an explicit null (a real gap, any channel) or when a fast-channel sensor
-    (mic/accel — read every record) sends nothing all batch. Slow sensors that merely
-    OMIT their keys are carried-forward, not failures. Warnings are rate-limited per
-    sensor so TESTING mode's ~2 s cadence doesn't flood the log."""
+    sends an explicit null (a real gap, any channel), when a fast-channel sensor
+    (mic/accel — read every record) sends nothing all batch, or when st2 marks its
+    group FS_ABSENT while we've previously seen values from it (a sensor that dropped
+    off — e.g. loose wire at boot; never-installed sensors stay quiet). Slow sensors
+    that merely OMIT their keys are carried-forward, not failures. Warnings are
+    rate-limited per sensor so TESTING mode's ~2 s cadence doesn't flood the log."""
     n = sum(1 for r in records if isinstance(r, dict))
+    seen_before = _LAST_VALUES.get(dev) or {}
     good: set[str] = set()
     failed: dict[str, int] = {}
+    absent: dict[str, int] = {}
     for rec in records:
         if not isinstance(rec, dict):
             continue
-        for label, key, channel in _HEALTH_SENSORS:
+        st2 = rec.get("st2")
+        for label, key, channel, grp in _HEALTH_SENSORS:
             if key in rec:
                 if rec[key] is None:
                     failed[label] = failed.get(label, 0) + 1   # explicit null → real gap
                 elif _is_num(rec[key]):
                     good.add(label)
+            elif isinstance(st2, int) and (st2 >> (2 * grp)) & 0x3 == FS_ABSENT \
+                    and key in seen_before:
+                absent[label] = absent.get(label, 0) + 1        # was alive, now gone
             elif channel == "fast":
                 failed[label] = failed.get(label, 0) + 1        # should be read every record
     warnings: list[str] = []
-    for label, _key, _channel in _HEALTH_SENSORS:
-        if label in good or label not in failed:
+    for label, _key, _channel, _grp in _HEALTH_SENSORS:
+        if label in good or (label not in failed and label not in absent):
             continue
         k = (dev, label)
         if now - _HEALTH_WARN_AT.get(k, 0) >= _HEALTH_WARN_EVERY_S:
             _HEALTH_WARN_AT[k] = now
-            warnings.append(f"{label} not reporting ({failed[label]}/{n} records)")
+            if label in absent:
+                warnings.append(f"{label} absent — not detected by the station "
+                                f"({absent[label]}/{n} records); check wiring")
+            else:
+                warnings.append(f"{label} not reporting ({failed[label]}/{n} records)")
     return warnings
 
 
 def _headline(dev: Any, mode: str, rec: dict) -> str:
-    """One-line snapshot of a record's headline metrics (forward-filled values). The
+    """One-line snapshot of a record's headline metrics (cache-overlaid values). The
     mic is the primary instrument, so its slot is always shown — `noise --` when the
     reading is missing — rather than silently dropped."""
     # noise is special-cased so a silent mic is visible rather than just absent.
@@ -651,23 +693,32 @@ def _headline(dev: Any, mode: str, rec: dict) -> str:
     return f"[ingest] {dev or '?'} {mode}: " + "  ".join(parts)
 
 
+# Refuse to seed the fill cache from a reading older than this: after a long outage
+# the last stored row is history, not "the current value" — resurrecting it would
+# repeat the stale-SEN66 incident from the server side. Each batch's first record is
+# a full slow snapshot anyway, so a refused seed self-heals within one batch.
+SEED_MAX_AGE_S = 15 * 60
+
+
 def _seed_fill_cache(dev: Any) -> dict[str, Any]:
-    """Warm a device's forward-fill cache from its most recent stored reading. The
-    cache is per-process, so a server restart (or moving to a fresh DB) starts it cold
-    and the first delta-encoded records — the ones that OMIT unchanged slow values —
-    would land with NULL PM/CO2/temp/… until the next fresh read minutes later. Seeding
-    from the last row (whose payload was already forward-filled before storage) closes
-    that gap. Returns the seeded cache (also stored in _LAST_VALUES)."""
+    """Warm a device's last-values cache from its recent stored readings (the cache
+    is per-process, so a restart starts cold). Storage is sparse, so the newest row
+    alone rarely holds every slow key — scan back through the seed window and keep
+    the newest non-null per key. Rows older than SEED_MAX_AGE_S are ignored: after a
+    long outage the last stored values are history, not "the current value", and
+    resurrecting them would repeat the stale-SEN66 incident from the server side.
+    Returns the seeded cache (also stored in _LAST_VALUES)."""
     cache: dict[str, Any] = {}
     try:
-        row = _conn.execute(
-            "SELECT payload FROM readings WHERE device IS ? ORDER BY ts DESC LIMIT 1",
-            (dev,),
-        ).fetchone()
-        if row:
+        rows = _conn.execute(
+            "SELECT payload FROM readings WHERE device IS ? AND ts >= ? "
+            "ORDER BY ts DESC LIMIT 500",
+            (dev, int(time.time()) - SEED_MAX_AGE_S),
+        ).fetchall()
+        for row in rows:                       # newest first — first hit per key wins
             payload = json.loads(row["payload"])
             for k in SLOW_FILL_KEYS:
-                if payload.get(k) is not None:
+                if k not in cache and payload.get(k) is not None:
                     cache[k] = payload[k]
     except Exception:
         pass
@@ -675,13 +726,26 @@ def _seed_fill_cache(dev: Any) -> dict[str, Any]:
     return cache
 
 
-def _forward_fill(records: list, default_dev: Any) -> None:
-    """Reconstruct delta-encoded slow fields across a batch, in place and in order.
-    Per slow key of each record: present & non-null -> a fresh value (remember it);
-    present & null -> an explicit gap from a failed read (leave null, keep the last
-    good value cached); absent -> carried forward from cache if we've ever seen it
-    for that device (else left absent -> column NULL). Records carry their own `dev`;
-    `default_dev` covers bare records from the envelope."""
+def _delta_decode(records: list, default_dev: Any) -> None:
+    """Decode the delta-encoded slow channel in place, keeping storage sparse.
+
+    We used to reconstruct FULL payloads here (forward-fill every omitted slow key
+    from cache), which stored each ~3-min sensor read ~18× over as fake fresh
+    samples — and, worse, kept filling from cache after a sensor silently vanished
+    (the overnight-stale-SEN66 incident). Now a slow metric is stored only when the
+    device actually measured it; the dashboard connects the sparse points.
+
+    Per slow key of each record:
+      * fresh value (non-null) -> refresh the per-device cache; if its st2 group is
+        FS_UNCHANGED it's a re-transmission (each batch's first record carries a full
+        slow snapshot to warm a cold server), so cache it but strip it from storage;
+      * explicit null (FS_INVALID, failed read) -> keep: a real gap (NULL column);
+      * omitted + st2 FS_ABSENT -> sensor vanished: write one explicit null at the
+        transition (cache still had a value) so charts/badges see a hard gap, then
+        drop it from the cache and stay quiet;
+      * omitted otherwise (FS_UNCHANGED / legacy) -> leave omitted (NULL column).
+
+    Records carry their own `dev`; `default_dev` covers bare envelope records."""
     for rec in records:
         if not isinstance(rec, dict):
             continue
@@ -691,13 +755,18 @@ def _forward_fill(records: list, default_dev: Any) -> None:
         cache = _LAST_VALUES.get(dev)
         if cache is None:                    # first sight this process — warm from DB
             cache = _seed_fill_cache(dev)
+        st2 = rec.get("st2")
+        unchanged = _keys_with_status(st2, FS_UNCHANGED)
+        absent = _keys_with_status(st2, FS_ABSENT)
         for k in SLOW_FILL_KEYS:
             if k in rec:
                 if rec[k] is not None:
-                    cache[k] = rec[k]      # fresh read — update the carry-forward value
-                # else: explicit null (FS_INVALID) — leave as a gap, don't touch cache
-            elif k in cache:
-                rec[k] = cache[k]          # omitted (FS_UNCHANGED) — carry last value forward
+                    cache[k] = rec[k]
+                    if k in unchanged:       # batch-seed re-transmission, not a fresh read
+                        del rec[k]
+            elif k in absent and k in cache:
+                rec[k] = None                # sensor vanished — one hard gap in the series
+                del cache[k]
 
 
 # Config keys a device reports (and the dashboard can override). Whitelisted so a
@@ -982,6 +1051,8 @@ async def lifespan(app: FastAPI):
         weather_task = asyncio.create_task(weather_scheduler.run_loop(
             providers, _conn, _db_lock,
             poll_sec=wsettings["poll_sec"], on_stored=_broadcast_weather,
+            backfill_threshold_s=wsettings["backfill_threshold_s"],
+            backfill_max_days=wsettings["backfill_max_days"],
         ))
 
     # Aircraft (ADS-B via readsb): its own background poll loop.
@@ -1233,14 +1304,15 @@ async def ingest(request: Request):
             b = rec.get("boot")
             anchor_up[b] = max(anchor_up.get(b, 0), int(rec["up_ms"]))
 
-    # Sensor-health scan on the RAW records (before forward-fill masks omitted keys).
+    # Sensor-health scan on the RAW records (before _delta_decode strips seed keys).
     health_warnings = _scan_health(dev, records, received_at) if LOG_INGEST else []
 
     stored = []
     corrected = 0
     async with _db_lock:
-        # Delta-decode: carry forward omitted slow values, null = real gap (schema v3).
-        _forward_fill(records, dev)
+        # Delta-decode: sparse storage — strip batch-seed re-transmissions, null =
+        # real gap, absent sensor = one explicit null then silence (schema v3/v5).
+        _delta_decode(records, dev)
         boots: set[tuple] = set()   # (device, boot) pairs that arrived with a good clock
         for rec in records:
             if not isinstance(rec, dict):
@@ -1259,11 +1331,15 @@ async def ingest(request: Request):
         print(f"[time] back-filled {corrected} record(s) with a corrected timestamp")
 
     if LOG_INGEST:
-        # Snapshot the latest record (forward-filled) so slow values show even when
-        # carried; then shout about any sensor that's malfunctioning this batch.
+        # Snapshot the latest record overlaid on the device cache so slow values show
+        # even between reads (storage is sparse now); then shout about any sensor
+        # that's malfunctioning this batch.
         last = next((r for r in reversed(records) if isinstance(r, dict)), None)
         if last is not None:
-            print(_headline(dev, mode, last)
+            snap_dev = last.get("dev") or last.get("device") or dev
+            snap = {**(_LAST_VALUES.get(snap_dev) or {}),
+                    **{k: v for k, v in last.items() if v is not None}}
+            print(_headline(dev, mode, snap)
                   + (f"  [{len(records)} rec]" if len(records) > 1 else ""))
         for w in health_warnings:
             print(f"[sensor] ⚠ {dev or '?'}: {w}")

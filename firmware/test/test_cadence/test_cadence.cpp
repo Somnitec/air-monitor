@@ -2,8 +2,9 @@
 #include "cadence.h"
 
 // Baseline params used across tests: densify on a 6 dB jump, hold 30 s, quiet
-// baseline store every 60 s.
-static CadenceParams P() { return CadenceParams{ 6.0f, 30000, 60000 }; }
+// baseline store every 60 s. The absolute trigger is parked above every level these
+// delta-oriented tests use (55 dB) so they exercise the delta path in isolation.
+static CadenceParams P() { return CadenceParams{ 6.0f, 30000, 60000, 55.0f }; }
 
 void setUp() {}
 void tearDown() {}
@@ -56,6 +57,39 @@ void test_missing_noise_skips_delta() {
     TEST_ASSERT_FALSE(d.densified);
 }
 
+// A flyover-shaped slow ramp (~0.5 dB per 1.3 s capture) never trips the delta test,
+// but must densify the moment it crosses the absolute threshold.
+void test_slow_ramp_densifies_at_abs_threshold() {
+    CadenceParams p{ 6.0f, 30000, 60000, 50.0f };
+    CadenceState st;
+    uint32_t t = 0;
+    float level = 36.0f;
+    CadenceDecision d{};
+    while (level < 49.5f) {                     // approach: below threshold, tiny deltas
+        d = cadence_decide(st, p, true, level, t);
+        TEST_ASSERT_FALSE(d.densified);
+        level += 0.5f; t += 1300;
+    }
+    d = cadence_decide(st, p, true, 50.0f, t);  // crosses the threshold
+    TEST_ASSERT_TRUE(d.densified);
+    TEST_ASSERT_TRUE(d.store);
+}
+
+// Each loud capture re-arms the hold, so densification rides the plateau and covers
+// the decay tail for one hold window after the level drops back under the threshold.
+void test_abs_plateau_rearms_then_expires() {
+    CadenceParams p{ 6.0f, 30000, 60000, 50.0f };
+    CadenceState st;
+    cadence_decide(st, p, true, 36.0f, 0);                              // quiet prime
+    for (uint32_t t = 1300; t <= 60000; t += 1300)                      // long 62 dB plateau
+        TEST_ASSERT_TRUE(cadence_decide(st, p, true, 62.0f, t).densified);
+    // drops to quiet (delta also re-arms once on the way down — that's fine);
+    // 48 dB is under the threshold and within 6 dB of the previous quiet capture.
+    cadence_decide(st, p, true, 48.0f, 61300);
+    TEST_ASSERT_TRUE(cadence_decide(st, p, true, 47.0f, 70000).densified);   // tail covered
+    TEST_ASSERT_FALSE(cadence_decide(st, p, true, 47.0f, 130000).densified); // hold expired
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_first_capture_always_stored);
@@ -63,5 +97,7 @@ int main(int, char**) {
     RUN_TEST(test_jump_densifies_and_stores_every_capture);
     RUN_TEST(test_densify_expires_after_hold);
     RUN_TEST(test_missing_noise_skips_delta);
+    RUN_TEST(test_slow_ramp_densifies_at_abs_threshold);
+    RUN_TEST(test_abs_plateau_rearms_then_expires);
     return UNITY_END();
 }

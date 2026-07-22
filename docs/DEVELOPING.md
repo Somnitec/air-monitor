@@ -131,17 +131,23 @@ round-trip, and mode validation.
    ```bash
    cd firmware
    pio run -e esp32_phase1 -t upload
-   pio device monitor            # 115200 baud
    ```
+   If the `air-monitor-bridge` service is running (USB sync — see
+   `server/README.md` "Syncing over USB"), the upload pauses and resumes it
+   automatically via `pause_bridge_on_upload.py`, and the serial log is
+   `journalctl --user -u air-monitor-bridge -f` — do **not** open
+   `pio device monitor` alongside the service (the port is exclusive). Without
+   the service, `pio device monitor` (115200 baud) works as usual.
 3. Or flash over WiFi (OTA) — set the device IP in the `[env:esp32_phase1_ota]`
    `upload_port` in `platformio.ini`, then:
    ```bash
    pio run -e esp32_phase1_ota -t upload
    ```
 
-On the serial monitor you should see, on first boot, `[ring] preallocated ...`
+On the serial log you should see, on first boot, `[ring] preallocated ...`
 (then `[ring] resumed ...` on later boots) and a `[rec] seq=… buffered=… mode=normal`
-line every 60 s.
+line every 60 s — plus, with the bridge attached, `[bridge] syncing over USB` and
+`[sync] N acked via USB bridge`.
 
 ---
 
